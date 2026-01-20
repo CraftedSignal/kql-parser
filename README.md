@@ -140,9 +140,9 @@ Benchmarks on a corpus of 1,031 real-world KQL queries:
 
 | Metric | Value |
 |--------|-------|
-| Success Rate | 82% |
+| Success Rate | 75% |
 | Avg Parse Time | <1ms |
-| Queries/Second | >10,000 |
+| Queries/Second | >1,000 |
 
 ## Grammar
 
