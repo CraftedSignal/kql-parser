@@ -81,6 +81,10 @@ func normalizeQuery(query string) string {
 	// This handles queries extracted from YAML/JSON where \r\n became literal characters
 	normalized = normalizeEscapeSequences(normalized)
 
+	// Strip documentation preambles like "Description:...Query:..."
+	// These are common in documentation templates where the actual query follows "Query:"
+	normalized = stripDocumentationPreamble(normalized)
+
 	// Strip leading comments to get to the actual query
 	normalized = stripLeadingComments(normalized)
 
@@ -144,10 +148,22 @@ func normalizeQuery(query string) string {
 	// The lexer expects space or recognizes combined form only for certain patterns
 	normalized = normalizeTimespanLiterals(normalized)
 
+	// Normalize trailing decimals: 1000. -> 1000.0
+	// The grammar requires at least one digit after the decimal point
+	normalized = normalizeTrailingDecimals(normalized)
+
+	// Normalize \0 escape sequences to \x00 (null character)
+	// The grammar only supports \x hex escapes, not bare \0
+	normalized = normalizeNullEscapes(normalized)
+
 	// Convert operator aliases to standard forms
 	normalized = strings.ReplaceAll(normalized, "| mvexpand ", "| mv-expand ")
 	normalized = strings.ReplaceAll(normalized, "\nmvexpand ", "\nmv-expand ")
 	normalized = strings.ReplaceAll(normalized, "| mvapply ", "| mv-apply ")
+
+	// Convert "filter" to "where" (filter is a legacy alias)
+	normalized = strings.ReplaceAll(normalized, "| filter ", "| where ")
+	normalized = strings.ReplaceAll(normalized, "\nfilter ", "\nwhere ")
 
 	// Strip kind= from lookup operator (grammar doesn't support it)
 	normalized = strings.ReplaceAll(normalized, "lookup kind=leftouter ", "lookup ")
@@ -173,6 +189,10 @@ func normalizeQuery(query string) string {
 	// on $left.A == $right.B and $left.C == $right.D -> on $left.A == $right.B, $left.C == $right.D
 	normalized = strings.ReplaceAll(normalized, " and $left.", ", $left.")
 	normalized = strings.ReplaceAll(normalized, " and $right.", ", $right.")
+
+	// Strip all hint.xxx=value patterns (hint.strategy=broadcast, hint.shufflekey=x, etc.)
+	// The grammar doesn't support these join hints
+	normalized = stripJoinHints(normalized)
 
 	// Strip mv-apply subqueries: mv-apply x on (subquery) -> mv-apply x
 	// The subquery isn't needed for condition extraction
@@ -211,10 +231,20 @@ func normalizeQuery(query string) string {
 		normalized = "DummyTable " + normalized
 	}
 
-	// Handle Azure Resource Graph queries that start with "where" (no table name)
+	// Handle queries that start with operators but no table name
+	// Azure Resource Graph queries can start with "where", workbook queries with "extend", etc.
 	lowerNorm := strings.ToLower(normalized)
-	if strings.HasPrefix(lowerNorm, "where ") || strings.HasPrefix(lowerNorm, "where\t") || strings.HasPrefix(lowerNorm, "where\n") {
-		normalized = "Resources | " + normalized
+	operatorPrefixes := []string{
+		"where ", "where\t", "where\n",
+		"extend ", "extend\t", "extend\n",
+		"project ", "project\t", "project\n",
+		"summarize ", "summarize\t", "summarize\n",
+	}
+	for _, prefix := range operatorPrefixes {
+		if strings.HasPrefix(lowerNorm, prefix) {
+			normalized = "DummyTable | " + normalized
+			break
+		}
 	}
 
 	// Strip function parameters in union statements (grammar doesn't support them)
@@ -232,6 +262,10 @@ func normalizeQuery(query string) string {
 		normalized = "DummyTable | " + normalized
 	}
 
+	// Handle union inside join parentheses: join (union ...) -> join (DummyTable | union ...)
+	// The grammar requires a tabularSource before union, even inside join
+	normalized = normalizeJoinUnion(normalized)
+
 	// Handle find operator: find in (Table1, Table2, ...) where ... -> extract conditions from where clause
 	// The find operator isn't in the grammar, so convert to table + where
 	normalized = normalizeFindOperator(normalized)
@@ -239,6 +273,10 @@ func normalizeQuery(query string) string {
 	// Handle search operator: search in (Table1, Table2) "pattern" -> simplified form
 	// The search operator needs special handling
 	normalized = normalizeSearchOperator(normalized)
+
+	// Normalize top-nested operator: top-nested N of X by count() -> summarize count() by X
+	// The grammar doesn't support the "of" keyword in top-nested
+	normalized = normalizeTopNested(normalized)
 
 	// Strip named parameters from function calls: func(param=value) -> func()
 	// These are common in user-defined function calls like parser(pack=true)
@@ -1638,7 +1676,7 @@ func normalizeDistinctColumnList(columns string) string {
 				}
 				firstArg = strings.TrimSpace(firstArg)
 
-				// Check if first arg is a simple identifier
+				// Check if first arg is a simple identifier (optionally with dots)
 				isSimple := len(firstArg) > 0
 				for _, c := range firstArg {
 					if !isIdentChar(byte(c)) && c != '.' {
@@ -1647,6 +1685,11 @@ func normalizeDistinctColumnList(columns string) string {
 					}
 				}
 				if isSimple {
+					// If there's a dot (property access), use only the last part
+					// distinct doesn't support property access like x.y
+					if dotIdx := strings.LastIndex(firstArg, "."); dotIdx != -1 {
+						firstArg = firstArg[dotIdx+1:]
+					}
 					result.WriteString(firstArg)
 				} else {
 					// First arg is complex, use placeholder
@@ -1844,6 +1887,141 @@ func normalizeTimespanLiterals(query string) string {
 	return result
 }
 
+// normalizeTrailingDecimals adds a zero after trailing decimal points
+// The grammar requires at least one digit after the decimal: 1000. -> 1000.0
+func normalizeTrailingDecimals(query string) string {
+	var result strings.Builder
+	result.Grow(len(query))
+	inString := false
+	stringChar := byte(0)
+
+	for i := 0; i < len(query); i++ {
+		c := query[i]
+
+		// Track strings to avoid modifying decimals inside string literals
+		if !inString && (c == '"' || c == '\'') {
+			inString = true
+			stringChar = c
+			result.WriteByte(c)
+			continue
+		}
+		if inString {
+			if c == stringChar && (i == 0 || query[i-1] != '\\') {
+				inString = false
+			}
+			result.WriteByte(c)
+			continue
+		}
+
+		// Check for pattern: digit followed by . not followed by digit
+		if c == '.' && i > 0 && isDigit(query[i-1]) {
+			// Check what follows the dot
+			nextIdx := i + 1
+			if nextIdx >= len(query) || !isDigit(query[nextIdx]) {
+				// Trailing decimal point - add .0
+				result.WriteByte('.')
+				result.WriteByte('0')
+				continue
+			}
+		}
+
+		result.WriteByte(c)
+	}
+
+	return result.String()
+}
+
+// normalizeNullEscapes converts \0 to \x00 in regular strings
+// The KQL grammar only supports \x hex escapes, not bare \0
+func normalizeNullEscapes(query string) string {
+	var result strings.Builder
+	result.Grow(len(query) + 50) // Extra space for expanded escapes
+
+	inSingleQuote := false
+	inDoubleQuote := false
+	inVerbatim := false // @"..." or @'...'
+
+	for i := 0; i < len(query); i++ {
+		c := query[i]
+
+		// Check for verbatim string start
+		if !inSingleQuote && !inDoubleQuote && !inVerbatim && c == '@' && i+1 < len(query) {
+			if query[i+1] == '"' || query[i+1] == '\'' {
+				result.WriteByte(c)
+				result.WriteByte(query[i+1])
+				inVerbatim = true
+				if query[i+1] == '"' {
+					inDoubleQuote = true
+				} else {
+					inSingleQuote = true
+				}
+				i++
+				continue
+			}
+		}
+
+		// Track string state
+		if c == '"' && !inSingleQuote {
+			if inVerbatim && inDoubleQuote {
+				// Check for doubled quote (escape in verbatim)
+				if i+1 < len(query) && query[i+1] == '"' {
+					result.WriteByte(c)
+					result.WriteByte(query[i+1])
+					i++
+					continue
+				}
+				inDoubleQuote = false
+				inVerbatim = false
+			} else if !inVerbatim {
+				inDoubleQuote = !inDoubleQuote
+			}
+		} else if c == '\'' && !inDoubleQuote {
+			if inVerbatim && inSingleQuote {
+				// Check for doubled quote (escape in verbatim)
+				if i+1 < len(query) && query[i+1] == '\'' {
+					result.WriteByte(c)
+					result.WriteByte(query[i+1])
+					i++
+					continue
+				}
+				inSingleQuote = false
+				inVerbatim = false
+			} else if !inVerbatim {
+				inSingleQuote = !inSingleQuote
+			}
+		}
+
+		// Check for \0 in regular strings (not verbatim)
+		if (inSingleQuote || inDoubleQuote) && !inVerbatim && c == '\\' && i+1 < len(query) && query[i+1] == '0' {
+			// Check that it's not followed by more digits (like \012 octal) or x (like \0x...)
+			nextAfter := i + 2
+			if nextAfter >= len(query) || (!isDigit(query[nextAfter]) && query[nextAfter] != 'x') {
+				// Convert \0 to \x00
+				result.WriteString("\\x00")
+				i++ // Skip the '0'
+				continue
+			}
+		}
+
+		// Handle regular escapes - skip past the escaped character
+		if (inSingleQuote || inDoubleQuote) && !inVerbatim && c == '\\' && i+1 < len(query) {
+			result.WriteByte(c)
+			i++
+			result.WriteByte(query[i])
+			continue
+		}
+
+		result.WriteByte(c)
+	}
+
+	return result.String()
+}
+
+// isDigit checks if a byte is a digit
+func isDigit(c byte) bool {
+	return c >= '0' && c <= '9'
+}
+
 // isIdentChar checks if a byte can be part of an identifier
 func isIdentChar(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
@@ -1962,6 +2140,162 @@ func normalizeUnionParameters(query string) string {
 	// This handles patterns like: union *, union withsource=T *
 	result = replaceUnionWildcard(result)
 
+	// Strip * suffixes from table name patterns like Device*, Table_*
+	// "union Device*" -> "union Device"
+	result = stripTableWildcards(result)
+
+	return result
+}
+
+// normalizeJoinUnion handles union inside join parentheses
+// join (union T1, T2) -> join (DummyTable | union T1, T2)
+// The grammar requires a tabularSource before union
+func normalizeJoinUnion(query string) string {
+	result := query
+	lowerResult := strings.ToLower(result)
+
+	// Find all join operators
+	idx := 0
+	for {
+		joinIdx := strings.Index(lowerResult[idx:], "join")
+		if joinIdx == -1 {
+			break
+		}
+		joinIdx += idx
+		idx = joinIdx + 4
+
+		// Skip to find the opening paren after join and optional kind=... hint=...
+		i := joinIdx + 4 // after "join"
+		for i < len(result) && (result[i] == ' ' || result[i] == '\t' || result[i] == '\n' || result[i] == '\r') {
+			i++
+		}
+
+		// Skip kind=... and hint=... clauses
+		for i < len(result) {
+			// Check for kind=
+			if i+5 < len(result) && strings.ToLower(result[i:i+5]) == "kind=" {
+				i += 5
+				// Skip the kind value
+				for i < len(result) && result[i] != ' ' && result[i] != '\t' && result[i] != '\n' && result[i] != '(' {
+					i++
+				}
+				// Skip whitespace
+				for i < len(result) && (result[i] == ' ' || result[i] == '\t' || result[i] == '\n' || result[i] == '\r') {
+					i++
+				}
+				continue
+			}
+			// Check for hint.xxx=
+			if i+5 < len(result) && strings.ToLower(result[i:i+5]) == "hint." {
+				// Skip hint.xxx=value
+				for i < len(result) && result[i] != ' ' && result[i] != '\t' && result[i] != '\n' && result[i] != '(' {
+					i++
+				}
+				// Skip whitespace
+				for i < len(result) && (result[i] == ' ' || result[i] == '\t' || result[i] == '\n' || result[i] == '\r') {
+					i++
+				}
+				continue
+			}
+			break
+		}
+
+		// Now we should be at the opening paren
+		if i >= len(result) || result[i] != '(' {
+			continue
+		}
+		parenStart := i
+
+		// Check if content after ( starts with union (skip whitespace)
+		j := i + 1
+		for j < len(result) && (result[j] == ' ' || result[j] == '\t' || result[j] == '\n' || result[j] == '\r') {
+			j++
+		}
+
+		// Handle double parens: ((union ...)) - find the innermost paren before union
+		innerParenStart := -1
+		for j < len(result) && result[j] == '(' {
+			innerParenStart = j
+			j++ // skip inner paren
+			for j < len(result) && (result[j] == ' ' || result[j] == '\t' || result[j] == '\n' || result[j] == '\r') {
+				j++
+			}
+		}
+
+		if j+5 < len(result) && strings.ToLower(result[j:j+5]) == "union" {
+			// Check it's a word boundary
+			if j+5 < len(result) && !isIdentChar(result[j+5]) {
+				// Insert DummyTable | after the innermost opening paren (or the main one if no inner)
+				insertPoint := parenStart + 1
+				if innerParenStart != -1 {
+					insertPoint = innerParenStart + 1
+				}
+				result = result[:insertPoint] + "DummyTable | " + result[insertPoint:]
+				lowerResult = strings.ToLower(result)
+				idx = insertPoint + 13 // skip past inserted text
+			}
+		}
+	}
+
+	return result
+}
+
+// stripJoinHints removes hint.xxx=value patterns from join statements
+// Common hints: hint.strategy=broadcast, hint.shufflekey=x, hint.remote=auto
+func stripJoinHints(query string) string {
+	result := query
+
+	for {
+		lowerResult := strings.ToLower(result)
+		hintIdx := strings.Index(lowerResult, "hint.")
+		if hintIdx == -1 {
+			break
+		}
+
+		// Find the end of hint.xxx=value
+		// First find the = sign
+		eqIdx := strings.Index(result[hintIdx:], "=")
+		if eqIdx == -1 {
+			break // No = found, malformed
+		}
+		eqIdx += hintIdx
+
+		// Find end of value - can be simple identifier or a function call with parens
+		endIdx := eqIdx + 1
+		// Skip whitespace after =
+		for endIdx < len(result) && (result[endIdx] == ' ' || result[endIdx] == '\t') {
+			endIdx++
+		}
+
+		// Check if value is a parenthesized expression
+		if endIdx < len(result) && result[endIdx] == '(' {
+			// Find matching close paren
+			depth := 1
+			endIdx++
+			for endIdx < len(result) && depth > 0 {
+				if result[endIdx] == '(' {
+					depth++
+				} else if result[endIdx] == ')' {
+					depth--
+				}
+				endIdx++
+			}
+		} else {
+			// Simple value - read until whitespace, comma, or open paren
+			for endIdx < len(result) && result[endIdx] != ' ' && result[endIdx] != '\t' && result[endIdx] != '\n' && result[endIdx] != '(' && result[endIdx] != ')' && result[endIdx] != ',' {
+				endIdx++
+			}
+		}
+
+		// Remove the hint and any trailing whitespace
+		trailing := endIdx
+		for trailing < len(result) && (result[trailing] == ' ' || result[trailing] == '\t') {
+			trailing++
+		}
+
+		result = result[:hintIdx] + result[trailing:]
+	}
+
 	return result
 }
 
@@ -1987,10 +2321,56 @@ func replaceUnionWildcard(query string) string {
 					result[afterIdx] == ' ' || result[afterIdx] == '\t' || result[afterIdx] == '\n' || result[afterIdx] == '\r' ||
 					result[afterIdx] == '|' || result[afterIdx] == ',' ||
 					(afterIdx+1 < len(result) && result[afterIdx] == '/' && result[afterIdx+1] == '/')
+
+				// Also reject if followed by a digit (multiplication like * 1.0)
+				if afterOk && afterIdx < len(result) && isDigit(result[afterIdx]) {
+					afterOk = false
+				}
+				// Reject if preceded by a digit (like 7 * something)
+				if prevOk && i > 0 && isDigit(result[i-1]) {
+					prevOk = false
+				}
+
 				if prevOk && afterOk {
-					// Verify it's in a union context
-					beforeStar := strings.ToLower(result[:i])
-					if strings.Contains(beforeStar, "union") {
+					// Verify it's in a union context - look backwards for "union" keyword
+					// without any closing parens or arithmetic operators between
+					inUnionContext := false
+					beforeStar := result[:i]
+					lowerBefore := strings.ToLower(beforeStar)
+
+					// Find the last occurrence of "union"
+					lastUnionIdx := strings.LastIndex(lowerBefore, "union")
+					if lastUnionIdx != -1 {
+						// Check what's between "union" and the star
+						// Should only be: whitespace, table names, commas, maybe some params
+						// Should NOT have: closing parens without matching opens (arithmetic context)
+						// Should NOT have: pipe operator | (which ends the union context)
+						between := beforeStar[lastUnionIdx+5:]
+						depth := 0
+						validContext := true
+						for _, ch := range between {
+							if ch == '(' {
+								depth++
+							} else if ch == ')' {
+								depth--
+								if depth < 0 {
+									// More closing parens than opening - we're in a different context
+									validContext = false
+									break
+								}
+							} else if ch == '|' && depth == 0 {
+								// Pipe at depth 0 means we've left the union context
+								validContext = false
+								break
+							}
+						}
+						// Also check we're not in a deep nesting
+						if validContext && depth == 0 {
+							inUnionContext = true
+						}
+					}
+
+					if inUnionContext {
 						starIdx = i
 						break
 					}
@@ -2004,6 +2384,56 @@ func replaceUnionWildcard(query string) string {
 
 		// Replace this * with AllTables
 		result = result[:starIdx] + "AllTables" + result[starIdx+1:]
+	}
+
+	return result
+}
+
+// stripTableWildcards removes * from table name patterns like Device*, *_CL, Table_*
+// These are valid KQL but the grammar doesn't support them
+func stripTableWildcards(query string) string {
+	result := query
+
+	// Look for patterns like "union TableName*", "union *_CL", or "union TableName*, OtherTable"
+	// The * is attached to an identifier (no space on one side)
+	for {
+		changed := false
+		for i := 0; i < len(result); i++ {
+			if result[i] == '*' {
+				// Case 1: Suffix wildcard (Device*)
+				// Check if preceded by an identifier character (letter, digit, underscore)
+				if i > 0 && isIdentChar(result[i-1]) {
+					// Check if followed by whitespace, comma, pipe, end, or closing paren
+					afterOk := i+1 >= len(result) ||
+						result[i+1] == ' ' || result[i+1] == '\t' || result[i+1] == '\n' ||
+						result[i+1] == ',' || result[i+1] == '|' || result[i+1] == ')'
+					if afterOk {
+						// This looks like a table wildcard - remove the *
+						result = result[:i] + result[i+1:]
+						changed = true
+						break
+					}
+				}
+
+				// Case 2: Prefix wildcard (*_CL)
+				// Check if followed by an identifier character
+				if i+1 < len(result) && (isIdentChar(result[i+1]) || result[i+1] == '_') {
+					// Check if preceded by whitespace, comma, or start
+					prevOk := i == 0 ||
+						result[i-1] == ' ' || result[i-1] == '\t' || result[i-1] == '\n' ||
+						result[i-1] == ','
+					if prevOk {
+						// This looks like a prefix wildcard - remove the *
+						result = result[:i] + result[i+1:]
+						changed = true
+						break
+					}
+				}
+			}
+		}
+		if !changed {
+			break
+		}
 	}
 
 	return result
@@ -2213,17 +2643,27 @@ func stripUnionFunctionParams(query string) string {
 	result := query
 	lowerResult := strings.ToLower(result)
 
-	// Find "union " keyword
-	idx := strings.Index(lowerResult, "union ")
+	// Find "union" keyword followed by any whitespace (space, tab, newline)
+	idx := strings.Index(lowerResult, "union")
 	if idx == -1 {
 		return result
 	}
 
-	// Start scanning after "union "
-	var newResult strings.Builder
-	newResult.WriteString(result[:idx+6]) // "union "
+	// Check that union is followed by whitespace
+	afterUnion := idx + 5
+	if afterUnion >= len(result) {
+		return result
+	}
+	ws := result[afterUnion]
+	if ws != ' ' && ws != '\t' && ws != '\n' && ws != '\r' {
+		return result
+	}
 
-	i := idx + 6
+	// Start scanning after "union" + whitespace
+	var newResult strings.Builder
+	newResult.WriteString(result[:afterUnion+1]) // "union" + whitespace char
+
+	i := afterUnion + 1
 	inString := false
 	stringChar := byte(0)
 	afterEquals := false // Track if we just processed an = (next identifier is a value, not a function)
@@ -2688,6 +3128,166 @@ func replaceExternalData(query string) string {
 	return result
 }
 
+// stripDocumentationPreamble removes documentation wrappers from queries
+// Some queries are wrapped with "Description:...Query:..." headers
+func stripDocumentationPreamble(query string) string {
+	// Look for "Query:" or "Query:\n" pattern that separates description from actual query
+	lowerQuery := strings.ToLower(query)
+
+	// Check for common patterns like "Query:" or "KQL Query:" that precede the actual query
+	patterns := []string{"query:", "kql query:", "kql:"}
+	for _, pattern := range patterns {
+		idx := strings.Index(lowerQuery, pattern)
+		if idx != -1 {
+			// Return everything after the pattern marker
+			afterPattern := strings.TrimSpace(query[idx+len(pattern):])
+			if len(afterPattern) > 0 {
+				return afterPattern
+			}
+		}
+	}
+
+	// Process line by line, skipping documentation and finding where KQL starts
+	lines := strings.Split(query, "\n")
+	for i, line := range lines {
+		lineTrimmed := strings.TrimSpace(line)
+		lowerLine := strings.ToLower(lineTrimmed)
+
+		// Skip empty lines
+		if lineTrimmed == "" {
+			continue
+		}
+
+		// Skip comment lines (// or #)
+		if strings.HasPrefix(lineTrimmed, "//") || strings.HasPrefix(lineTrimmed, "#") {
+			continue
+		}
+
+		// Skip documentation-style lines (Key: Value pattern)
+		firstColonIdx := strings.Index(lineTrimmed, ":")
+		if firstColonIdx > 0 {
+			before := lineTrimmed[:firstColonIdx]
+			// If the part before the FIRST colon is a simple word, it's likely documentation
+			// This catches "Link: https://..." and "Description: some text" patterns
+			if !strings.ContainsAny(before, " |()=<>\"'") {
+				continue
+			}
+		}
+
+		// Check if this line looks like natural language (multiple words that form a sentence)
+		// Natural language sentences typically have many words and don't look like KQL
+		isNaturalLanguage := false
+		wordCount := strings.Count(lineTrimmed, " ") + 1
+
+		// Lines with many words (>6) that don't start with | are likely natural language
+		if wordCount > 6 && !strings.HasPrefix(lineTrimmed, "|") {
+			// Check it doesn't look like KQL with lots of conditions
+			// KQL lines with many words typically have operators like ==, contains, in, etc.
+			hasKQLOperator := strings.Contains(lineTrimmed, "==") ||
+				strings.Contains(lineTrimmed, "!=") ||
+				strings.Contains(lowerLine, " contains ") ||
+				strings.Contains(lowerLine, " in ") ||
+				strings.Contains(lowerLine, " startswith ") ||
+				strings.Contains(lowerLine, " endswith ")
+			if !hasKQLOperator {
+				isNaturalLanguage = true
+			}
+		}
+
+		// Also check for lines ending with punctuation that suggests natural language
+		lastChar := lineTrimmed[len(lineTrimmed)-1]
+		if (lastChar == ':' || lastChar == '.') && wordCount >= 4 {
+			isNaturalLanguage = true
+		}
+
+		if isNaturalLanguage {
+			continue
+		}
+
+		// Check if this could be the start of KQL
+		isLikelyKQL := false
+
+		// Lines starting with | are definitely KQL pipeline operators
+		if strings.HasPrefix(lineTrimmed, "|") || strings.HasPrefix(lineTrimmed, "| ") {
+			isLikelyKQL = true
+		}
+
+		// Direct KQL keyword starters
+		kqlStarters := []string{"let ", "union ", "where ", "search ", "find ", "range ", "print ", "datatable"}
+		for _, starter := range kqlStarters {
+			if strings.HasPrefix(lowerLine, starter) {
+				isLikelyKQL = true
+				break
+			}
+		}
+
+		// Table name pattern: identifier possibly followed by | or newline
+		// Table names are typically PascalCase or snake_case with no spaces before special chars
+		if !isLikelyKQL && len(lineTrimmed) > 0 {
+			firstChar := lineTrimmed[0]
+			if (firstChar >= 'A' && firstChar <= 'Z') || (firstChar >= 'a' && firstChar <= 'z') || firstChar == '_' {
+				// Check for table name pattern: identifier followed by whitespace/pipe/newline
+				// and NOT followed by common English words that indicate it's a sentence
+				words := strings.Fields(lineTrimmed)
+				if len(words) >= 1 {
+					// If first word looks like a table name (PascalCase, camelCase, contains underscore, or ends with common patterns)
+					firstWord := words[0]
+					looksLikeTable := false
+
+					// Camel/Pascal case pattern (has at least one capital anywhere)
+					hasCapital := false
+					for _, c := range firstWord {
+						if c >= 'A' && c <= 'Z' {
+							hasCapital = true
+							break
+						}
+					}
+					if hasCapital && !strings.Contains(firstWord, " ") && len(firstWord) >= 3 {
+						looksLikeTable = true
+					}
+
+					// Contains underscore (common in table names)
+					if strings.Contains(firstWord, "_") {
+						looksLikeTable = true
+					}
+
+					// Ends with common table name patterns
+					tableSuffixes := []string{"Events", "Logs", "Data", "Table", "CL", "Info", "Records"}
+					for _, suffix := range tableSuffixes {
+						if strings.HasSuffix(firstWord, suffix) {
+							looksLikeTable = true
+							break
+						}
+					}
+
+					// Check that the second word (if exists) isn't a common English word
+					if looksLikeTable && len(words) >= 2 {
+						commonEnglishStarters := []string{"using", "can", "to", "the", "is", "are", "for", "in", "on", "with", "and", "or", "but", "if", "this", "that", "these", "those", "will", "should", "could", "would", "may", "might"}
+						secondWord := strings.ToLower(words[1])
+						for _, eng := range commonEnglishStarters {
+							if secondWord == eng {
+								looksLikeTable = false
+								break
+							}
+						}
+					}
+
+					if looksLikeTable {
+						isLikelyKQL = true
+					}
+				}
+			}
+		}
+
+		if isLikelyKQL {
+			// Return from this line onwards
+			return strings.Join(lines[i:], "\n")
+		}
+	}
+
+	return query
+}
+
 // stripDeclareStatements removes declare query_parameters(...) statements
 // These define query parameters but aren't part of the actual query
 func stripDeclareStatements(query string) string {
@@ -2742,7 +3342,7 @@ func stripDeclareStatements(query string) string {
 	return strings.TrimLeft(result, " \t\n\r")
 }
 
-// stripLeadingComments removes leading // comments from a query
+// stripLeadingComments removes leading // and # comments and URLs from a query
 func stripLeadingComments(query string) string {
 	lines := strings.Split(query, "\n")
 	var result []string
@@ -2750,13 +3350,27 @@ func stripLeadingComments(query string) string {
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		// Skip empty lines and comment lines at the start
+		// Skip empty lines, comment lines (// and #), and URL lines at the start
 		if !foundCode {
-			if trimmed == "" || strings.HasPrefix(trimmed, "//") {
+			if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			// Skip lines that are URLs (http:// or https://)
+			lowerTrimmed := strings.ToLower(trimmed)
+			if strings.HasPrefix(lowerTrimmed, "http://") || strings.HasPrefix(lowerTrimmed, "https://") {
 				continue
 			}
 			foundCode = true
 		}
+
+		// After we've found code, also strip commented-out code lines
+		// that start with /| (common mistake: / instead of // to comment out a pipe statement)
+		trimmedLine := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmedLine, "/|") {
+			// This is a commented-out pipe statement, skip it
+			continue
+		}
+
 		result = append(result, line)
 	}
 
@@ -2774,6 +3388,23 @@ func replaceParameters(query string) string {
 	}
 
 	result := query
+
+	// Handle double curly braces {{param}} (Jinja2/Sentinel/Logic Apps style)
+	// Convert to single curly braces first, then let regular handling take over
+	for {
+		start := strings.Index(result, "{{")
+		if start == -1 {
+			break
+		}
+		end := strings.Index(result[start+2:], "}}")
+		if end == -1 {
+			break
+		}
+		end += start + 2
+		// Replace {{param}} with {param}
+		result = result[:start] + "{" + result[start+2:end] + "}" + result[end+2:]
+	}
+
 	for param, value := range replacements {
 		result = strings.ReplaceAll(result, param, value)
 	}
@@ -2927,6 +3558,7 @@ func getLastWord(s string) string {
 // normalizeFindOperator converts find statements to standard where clauses
 // find in (T1, T2, ...) where condition | ... -> DummyTable | where condition | ...
 // find in (T1, T2) where SHA1 == "x" -> DummyTable | where SHA1 == "x"
+// find in (T1) where x project a, b -> DummyTable | where x | project a, b
 func normalizeFindOperator(query string) string {
 	lowerQuery := strings.ToLower(strings.TrimSpace(query))
 
@@ -2952,7 +3584,143 @@ func normalizeFindOperator(query string) string {
 
 	// Extract everything from "where" onwards
 	afterWhere := query[whereIdx+1:]
+
+	// Handle "project" clause in find operator (no pipe needed in original)
+	// find ... where condition project columns -> ... where condition | project columns
+	afterWhereLower := strings.ToLower(afterWhere)
+	projectIdx := strings.Index(afterWhereLower, " project ")
+	if projectIdx == -1 {
+		projectIdx = strings.Index(afterWhereLower, "\nproject ")
+	}
+	if projectIdx == -1 {
+		projectIdx = strings.Index(afterWhereLower, "\tproject ")
+	}
+
+	// Check that project is not already preceded by a pipe
+	if projectIdx != -1 {
+		// Look back from projectIdx to see if there's a pipe
+		hasPipe := false
+		for i := projectIdx - 1; i >= 0; i-- {
+			if afterWhere[i] == '|' {
+				hasPipe = true
+				break
+			}
+			if afterWhere[i] != ' ' && afterWhere[i] != '\t' && afterWhere[i] != '\n' {
+				break
+			}
+		}
+		if !hasPipe {
+			// Insert a pipe before project
+			afterWhere = afterWhere[:projectIdx] + " |" + afterWhere[projectIdx:]
+		}
+	}
+
 	return "DummyTable | " + afterWhere
+}
+
+// normalizeTopNested converts top-nested clauses to simpler summarize form
+// The top-nested operator has complex hierarchical semantics that aren't needed for condition extraction
+// We simplify: find the entire top-nested chain and replace with summarize count()
+func normalizeTopNested(query string) string {
+	result := query
+
+	// Keep processing until no more top-nested clauses with "of"
+	for {
+		lowerResult := strings.ToLower(result)
+		idx := strings.Index(lowerResult, "top-nested")
+		if idx == -1 {
+			break
+		}
+
+		// Check if this has "of" keyword (the syntax we need to normalize)
+		afterTopNested := lowerResult[idx+10:] // skip "top-nested"
+
+		// Skip optional number and whitespace between "top-nested" and "of"
+		j := 0
+		for j < len(afterTopNested) && (afterTopNested[j] == ' ' || afterTopNested[j] == '\t' ||
+			(afterTopNested[j] >= '0' && afterTopNested[j] <= '9')) {
+			j++
+		}
+
+		if !strings.HasPrefix(afterTopNested[j:], "of ") {
+			// No "of" found, this might be standard top-nested syntax - leave as is
+			break
+		}
+
+		// Find the end of the entire top-nested chain
+		// A top-nested chain ends at a pipe (|) that's followed by something other than top-nested
+		// or at EOF
+		endIdx := idx + 10 // start after "top-nested"
+		depth := 0
+		inComment := false
+
+		for endIdx < len(result) {
+			// Check for comment start
+			if endIdx+1 < len(result) && result[endIdx] == '/' && result[endIdx+1] == '/' {
+				// Skip to end of line
+				for endIdx < len(result) && result[endIdx] != '\n' {
+					endIdx++
+				}
+				continue
+			}
+
+			ch := result[endIdx]
+			if ch == '(' {
+				depth++
+			} else if ch == ')' {
+				depth--
+			} else if ch == '|' && depth == 0 && !inComment {
+				// Check if this pipe is followed by another top-nested
+				afterPipe := strings.TrimSpace(result[endIdx+1:])
+				lowerAfterPipe := strings.ToLower(afterPipe)
+
+				// Skip comments at the start of the next part
+				for strings.HasPrefix(lowerAfterPipe, "//") {
+					nlIdx := strings.Index(afterPipe, "\n")
+					if nlIdx == -1 {
+						break
+					}
+					afterPipe = strings.TrimSpace(afterPipe[nlIdx+1:])
+					lowerAfterPipe = strings.ToLower(afterPipe)
+				}
+
+				if !strings.HasPrefix(lowerAfterPipe, "top-nested") {
+					// This pipe ends the top-nested chain
+					break
+				}
+			}
+			endIdx++
+		}
+
+		// Extract what's after the top-nested chain (including the pipe if present)
+		afterChain := ""
+		if endIdx < len(result) {
+			afterChain = result[endIdx:]
+		}
+
+		// Check if the pipe was the end marker
+		if len(afterChain) > 0 && afterChain[0] == '|' {
+			// Keep the pipe and what follows
+		} else {
+			// No pipe found, nothing after
+			afterChain = ""
+		}
+
+		// Build replacement: summarize count()
+		// This is a simplified replacement that allows the query to parse
+		replacement := "summarize count()"
+
+		// Construct new result
+		newResult := result[:idx] + replacement + afterChain
+
+		// Verify we made progress to avoid infinite loop
+		if newResult == result {
+			break
+		}
+		result = newResult
+	}
+
+	return result
 }
 
 // normalizeSearchOperator converts search statements to standard where clauses
