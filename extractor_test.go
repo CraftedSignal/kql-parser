@@ -259,20 +259,30 @@ func TestExtractConditions_ExtendedFields(t *testing.T) {
 
 	result := ExtractConditions(query)
 
-	// ComputedField should be excluded, OriginalField should be included
+	// ComputedField should be included but marked as IsComputed=true, OriginalField should be included but not marked as computed
 	foundComputed := false
+	foundComputedMarked := false
 	foundOriginal := false
 	for _, cond := range result.Conditions {
 		if cond.Field == "ComputedField" {
 			foundComputed = true
+			if cond.IsComputed {
+				foundComputedMarked = true
+			}
 		}
 		if cond.Field == "OriginalField" {
 			foundOriginal = true
+			if cond.IsComputed {
+				t.Error("OriginalField should not be marked as IsComputed")
+			}
 		}
 	}
 
-	if foundComputed {
-		t.Error("ComputedField should be excluded as it's a computed field")
+	if !foundComputed {
+		t.Error("ComputedField should be included in conditions")
+	}
+	if !foundComputedMarked {
+		t.Error("ComputedField should be marked with IsComputed=true")
 	}
 	if !foundOriginal {
 		t.Error("OriginalField should be included")
@@ -529,5 +539,155 @@ func TestExtractValue(t *testing.T) {
 				t.Errorf("extractValue(%q) = %q, expected %q", tt.input, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestJoinExtraction_SimpleInner(t *testing.T) {
+	query := `SecurityEvent
+| where EventID == 4625
+| join kind=inner (
+    SecurityEvent
+    | where EventID == 4624
+    | project TargetUserName, LogonType
+) on TargetUserName`
+
+	result := ExtractConditions(query)
+
+	if len(result.Joins) != 1 {
+		t.Fatalf("Expected 1 join, got %d", len(result.Joins))
+	}
+
+	j := result.Joins[0]
+	if j.Type != "inner" {
+		t.Errorf("Expected join type 'inner', got %q", j.Type)
+	}
+	if len(j.JoinFields) != 1 || j.JoinFields[0] != "TargetUserName" {
+		t.Errorf("Expected join fields [TargetUserName], got %v", j.JoinFields)
+	}
+	if j.Subsearch == nil {
+		t.Fatal("Expected subsearch ParseResult, got nil")
+	}
+}
+
+func TestJoinExtraction_LeftOuter(t *testing.T) {
+	query := `SigninLogs
+| where ResultType != "0"
+| join kind=leftouter (
+    SigninLogs
+    | where ResultType == "0"
+    | project UserPrincipalName, IPAddress
+) on UserPrincipalName`
+
+	result := ExtractConditions(query)
+
+	if len(result.Joins) == 0 {
+		t.Fatal("Expected at least 1 join")
+	}
+
+	j := result.Joins[0]
+	if j.Type != "leftouter" {
+		t.Errorf("Expected join type 'leftouter', got %q", j.Type)
+	}
+}
+
+func TestJoinExtraction_TableReference(t *testing.T) {
+	query := `SecurityEvent
+| where EventID == 4688
+| join kind=inner IdentityInfo on AccountObjectId`
+
+	result := ExtractConditions(query)
+
+	if len(result.Joins) == 0 {
+		t.Fatal("Expected at least 1 join")
+	}
+
+	j := result.Joins[0]
+	if j.RightTable != "IdentityInfo" {
+		t.Errorf("Expected right table 'IdentityInfo', got %q", j.RightTable)
+	}
+	if j.Subsearch != nil {
+		t.Error("Expected no subsearch for table reference join")
+	}
+}
+
+func TestJoinExtraction_LeftRightSyntax(t *testing.T) {
+	query := `T1
+| where Status == "Failed"
+| join kind=inner (T2 | where Active == true) on $left.UserID == $right.ID`
+
+	result := ExtractConditions(query)
+
+	if len(result.Joins) == 0 {
+		t.Fatal("Expected at least 1 join")
+	}
+
+	j := result.Joins[0]
+	if len(j.LeftFields) != 1 || j.LeftFields[0] != "UserID" {
+		t.Errorf("Expected left fields [UserID], got %v", j.LeftFields)
+	}
+	if len(j.RightFields) != 1 || j.RightFields[0] != "ID" {
+		t.Errorf("Expected right fields [ID], got %v", j.RightFields)
+	}
+}
+
+func TestJoinExtraction_FieldProvenance(t *testing.T) {
+	query := `SecurityEvent
+| where EventID == 4625
+| join kind=inner (
+    SecurityEvent
+    | where EventID == 4624
+    | project TargetUserName, LogonType, IpAddress
+) on TargetUserName
+| where LogonType == 10`
+
+	result := ExtractConditions(query)
+
+	if len(result.Joins) == 0 {
+		t.Fatal("Expected at least 1 join")
+	}
+
+	tests := []struct {
+		field    string
+		expected FieldProvenance
+	}{
+		{"TargetUserName", ProvenanceJoinKey},
+		{"LogonType", ProvenanceJoined},
+		{"IpAddress", ProvenanceJoined},
+		{"EventID", ProvenanceMain},
+	}
+
+	for _, tc := range tests {
+		actual := ClassifyFieldProvenance(result, tc.field)
+		if actual != tc.expected {
+			t.Errorf("Field %q: expected provenance %q, got %q", tc.field, tc.expected, actual)
+		}
+	}
+}
+
+func TestJoinExtraction_BackwardCompatibility(t *testing.T) {
+	// Verify that join right-side conditions don't leak into main conditions
+	query := `T1
+| where Status == "Failed"
+| join kind=inner (T2 | where Active == true) on UserName`
+
+	result := ExtractConditions(query)
+
+	for _, c := range result.Conditions {
+		if c.Field == "Active" {
+			t.Error("Join right-side conditions should not appear in main conditions")
+		}
+	}
+
+	// But they should be accessible via Joins
+	if len(result.Joins) == 1 && result.Joins[0].Subsearch != nil {
+		hasActive := false
+		for _, c := range result.Joins[0].Subsearch.Conditions {
+			if c.Field == "Active" {
+				hasActive = true
+			}
+		}
+		if !hasActive {
+			t.Error("Expected Active condition in subsearch")
+		}
 	}
 }

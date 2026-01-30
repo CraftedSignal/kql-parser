@@ -1,10 +1,16 @@
 package kql
 
 import (
+	"fmt"
 	"strings"
+	"time"
 
 	"github.com/antlr4-go/antlr/v4"
 )
+
+// MaxParseTime is the maximum time allowed for parsing a single query.
+// Queries that exceed this are returned with an error.
+var MaxParseTime = 5 * time.Second
 
 // Condition represents a field condition extracted from a KQL query
 type Condition struct {
@@ -13,14 +19,42 @@ type Condition struct {
 	Value        string   `json:"value"`
 	Negated      bool     `json:"negated"`
 	PipeStage    int      `json:"pipe_stage"`
-	LogicalOp    string   `json:"logical_op"` // "AND" or "OR" connecting to previous condition
-	Alternatives []string `json:"alternatives,omitempty"` // For OR conditions on same field
+	LogicalOp    string   `json:"logical_op"`              // "AND" or "OR" connecting to previous condition
+	Alternatives []string `json:"alternatives,omitempty"`  // For OR conditions on same field
+	IsComputed   bool     `json:"is_computed,omitempty"`   // True if field was created by extend/project
+	SourceField  string   `json:"source_field,omitempty"`  // Original field before transformation (for computed fields)
 }
 
 // ParseResult contains all conditions extracted from the query
 type ParseResult struct {
-	Conditions []Condition `json:"conditions"`
-	Errors     []string    `json:"errors,omitempty"`
+	Conditions      []Condition       `json:"conditions"`
+	ComputedFields  map[string]string `json:"computed_fields,omitempty"`  // Map of computed field name -> source field (from extend)
+	Commands        []string          `json:"commands,omitempty"`         // List of commands used in the query (summarize, extend, etc.)
+	ProjectedFields []string          `json:"projected_fields,omitempty"` // Fields selected by project operators
+	Joins           []JoinInfo        `json:"joins,omitempty"`
+	Errors          []string          `json:"errors,omitempty"`
+}
+
+// FieldProvenance indicates where a field originates relative to a join
+type FieldProvenance string
+
+const (
+	ProvenanceMain      FieldProvenance = "main"
+	ProvenanceJoined    FieldProvenance = "joined"
+	ProvenanceJoinKey   FieldProvenance = "join_key"
+	ProvenanceAmbiguous FieldProvenance = "ambiguous"
+)
+
+// JoinInfo captures the structured decomposition of a JOIN operator
+type JoinInfo struct {
+	Type          string       `json:"type"`                     // "inner", "leftouter", "leftanti", etc. (default: "innerunique")
+	JoinFields    []string     `json:"join_fields,omitempty"`    // Fields from ON clause (simple identifiers)
+	LeftFields    []string     `json:"left_fields,omitempty"`    // Left side of $left.X == $right.Y conditions
+	RightFields   []string     `json:"right_fields,omitempty"`   // Right side of $left.X == $right.Y conditions
+	RightTable    string       `json:"right_table,omitempty"`    // Table name if right side is a simple table reference
+	Subsearch     *ParseResult `json:"subsearch,omitempty"`      // Recursively parsed right-side expression (if subquery)
+	PipeStage     int          `json:"pipe_stage"`               // Pipeline stage where join appears
+	ExposedFields []string     `json:"exposed_fields,omitempty"` // Fields the right side makes available
 }
 
 // KQL keywords that should be excluded from conditions
@@ -48,13 +82,17 @@ var kqlKeywords = map[string]bool{
 type conditionExtractor struct {
 	*BaseKQLParserListener
 	conditions     []Condition
-	computedFields map[string]bool // Fields created by extend/project
+	computedFields map[string]string // Fields created by extend/project: computed field -> source field
+	commands        []string          // Commands used in the query
+	projectedFields []string          // Fields selected by project operators
+	joins           []JoinInfo
 	currentStage   int
 	inSubquery     int // depth of subquery nesting
 	inFunctionCall int // depth of function call nesting (countif, sumif, etc.)
 	negated        bool
 	lastLogicalOp  string
 	errors         []string
+	originalQuery  string // normalized query text for extracting subexpressions
 }
 
 // errorListener collects parse errors
@@ -3812,8 +3850,38 @@ func NormalizeQueryForDebug(query string) string {
 	return normalizeQuery(query)
 }
 
-// ExtractConditions parses a KQL query and extracts all field conditions
+// ExtractConditions parses a KQL query and extracts all field conditions.
+// Uses a timeout (MaxParseTime) to abort queries that cause the parser to hang
+// on deeply nested expressions. Recovers from panics.
 func ExtractConditions(query string) *ParseResult {
+	ch := make(chan *ParseResult, 1)
+	go func() {
+		ch <- extractConditionsInternal(query)
+	}()
+
+	select {
+	case result := <-ch:
+		return result
+	case <-time.After(MaxParseTime):
+		return &ParseResult{
+			Conditions: []Condition{},
+			Commands:   []string{},
+			Errors:     []string{fmt.Sprintf("parser timeout: query took longer than %s to parse", MaxParseTime)},
+		}
+	}
+}
+
+func extractConditionsInternal(query string) (result *ParseResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			result = &ParseResult{
+				Conditions: []Condition{},
+				Commands:   []string{},
+				Errors:     []string{fmt.Sprintf("parser panic: %v", r)},
+			}
+		}
+	}()
+
 	// Normalize the query to handle operators the parser doesn't fully support
 	normalizedQuery := normalizeQuery(query)
 	input := antlr.NewInputStream(normalizedQuery)
@@ -3838,8 +3906,11 @@ func ExtractConditions(query string) *ParseResult {
 	// Walk the tree to extract conditions
 	extractor := &conditionExtractor{
 		conditions:     make([]Condition, 0),
-		computedFields: make(map[string]bool),
+		computedFields: make(map[string]string), // computed field -> source field
+		commands:       make([]string, 0),
+		joins:          make([]JoinInfo, 0),
 		lastLogicalOp:  "AND", // default
+		originalQuery:  normalizedQuery,
 	}
 	antlr.ParseTreeWalkerDefault.Walk(extractor, tree)
 
@@ -3851,9 +3922,190 @@ func ExtractConditions(query string) *ParseResult {
 	conditions := groupORConditions(extractor.conditions)
 
 	return &ParseResult{
-		Conditions: conditions,
-		Errors:     allErrors,
+		Conditions:      conditions,
+		ComputedFields:  extractor.computedFields,
+		Commands:        extractor.commands,
+		ProjectedFields: extractor.projectedFields,
+		Joins:           extractor.joins,
+		Errors:          allErrors,
 	}
+}
+
+// EnterJoinOperator extracts join metadata and recursively parses the right side
+func (e *conditionExtractor) EnterJoinOperator(ctx *JoinOperatorContext) {
+	e.commands = append(e.commands, "join")
+
+	info := JoinInfo{
+		Type:      "innerunique", // KQL default
+		PipeStage: e.currentStage,
+	}
+
+	// Extract join kind (e.g., kind=inner, kind=leftouter)
+	if ctx.JoinKind() != nil {
+		kindCtx := ctx.JoinKind()
+		if kindCtx.JoinFlavor() != nil {
+			info.Type = strings.ToLower(kindCtx.JoinFlavor().GetText())
+		}
+	}
+
+	// Extract join condition fields from ON clause
+	if ctx.JoinCondition() != nil {
+		condCtx := ctx.JoinCondition()
+		for _, attr := range condCtx.AllJoinAttribute() {
+			identifiers := attr.AllIdentifier()
+			// $left.fieldA == $right.fieldB form: has DOLLAR tokens and 2 identifiers
+			if len(attr.AllDOLLAR()) >= 2 && len(identifiers) >= 2 {
+				info.LeftFields = append(info.LeftFields, identifiers[0].GetText())
+				info.RightFields = append(info.RightFields, identifiers[1].GetText())
+			} else if len(identifiers) == 1 {
+				// Simple field name (same on both sides)
+				info.JoinFields = append(info.JoinFields, identifiers[0].GetText())
+			}
+		}
+	}
+
+	// Extract right-side table or subquery
+	if ctx.TableName() != nil && ctx.LPAREN() == nil {
+		// Simple table reference: join kind=inner TableName on field
+		info.RightTable = ctx.TableName().GetText()
+	} else if ctx.TabularExpression() != nil {
+		// Subquery: join kind=inner (SubQuery | where ...) on field
+		subText := e.extractTabularExpressionText(ctx.TabularExpression())
+		if subText != "" {
+			info.Subsearch = ExtractConditions(subText)
+			allJoinFields := append(info.JoinFields, info.LeftFields...)
+			info.ExposedFields = deriveExposedFields(info.Subsearch, allJoinFields)
+		}
+	}
+
+	e.joins = append(e.joins, info)
+
+	// Increment inSubquery so the tree walker skips conditions inside the join's right side
+	// (they are already captured via recursive ExtractConditions in the Subsearch field)
+	if ctx.TabularExpression() != nil {
+		e.inSubquery++
+	}
+}
+
+// ExitJoinOperator decrements subquery depth when leaving a join with a subquery
+func (e *conditionExtractor) ExitJoinOperator(ctx *JoinOperatorContext) {
+	if ctx.TabularExpression() != nil {
+		e.inSubquery--
+	}
+}
+
+// extractTabularExpressionText extracts the original query text for a tabular expression
+func (e *conditionExtractor) extractTabularExpressionText(ctx ITabularExpressionContext) string {
+	if ctx == nil {
+		return ""
+	}
+	start := ctx.GetStart()
+	stop := ctx.GetStop()
+	if start == nil || stop == nil {
+		return ctx.GetText()
+	}
+	startPos := start.GetStart()
+	stopPos := stop.GetStop()
+	if startPos >= 0 && stopPos >= startPos && stopPos < len(e.originalQuery) {
+		return e.originalQuery[startPos : stopPos+1]
+	}
+	return ctx.GetText()
+}
+
+// deriveExposedFields determines what fields the right side of a join makes available
+func deriveExposedFields(subResult *ParseResult, joinFields []string) []string {
+	if subResult == nil {
+		return nil
+	}
+
+	fieldSet := make(map[string]bool)
+
+	// Projected fields from project operators (most specific)
+	for _, f := range subResult.ProjectedFields {
+		fieldSet[f] = true
+	}
+
+	// Condition fields from the right side
+	for _, c := range subResult.Conditions {
+		if !kqlKeywords[strings.ToLower(c.Field)] {
+			fieldSet[c.Field] = true
+		}
+	}
+
+	// Computed fields from extend/project
+	for computed := range subResult.ComputedFields {
+		fieldSet[computed] = true
+	}
+
+	// Join fields exist on both sides
+	for _, f := range joinFields {
+		fieldSet[f] = true
+	}
+
+	result := make([]string, 0, len(fieldSet))
+	for f := range fieldSet {
+		result = append(result, f)
+	}
+	return result
+}
+
+// ClassifyFieldProvenance determines where a field originates relative to joins in the result
+func ClassifyFieldProvenance(result *ParseResult, field string) FieldProvenance {
+	if result == nil || len(result.Joins) == 0 {
+		return ProvenanceAmbiguous
+	}
+
+	fieldLower := strings.ToLower(field)
+
+	// Check join keys first (simple fields that exist on both sides)
+	for _, j := range result.Joins {
+		for _, jf := range j.JoinFields {
+			if strings.ToLower(jf) == fieldLower {
+				return ProvenanceJoinKey
+			}
+		}
+		for _, lf := range j.LeftFields {
+			if strings.ToLower(lf) == fieldLower {
+				return ProvenanceJoinKey
+			}
+		}
+		for _, rf := range j.RightFields {
+			if strings.ToLower(rf) == fieldLower {
+				return ProvenanceJoinKey
+			}
+		}
+	}
+
+	// Determine the first join stage
+	firstJoinStage := -1
+	for _, j := range result.Joins {
+		if firstJoinStage == -1 || j.PipeStage < firstJoinStage {
+			firstJoinStage = j.PipeStage
+		}
+	}
+
+	// Check if field appears in main query conditions (before any join)
+	// This takes priority over joined fields since the field was established in the main pipeline
+	for _, c := range result.Conditions {
+		if strings.ToLower(c.Field) == fieldLower && c.PipeStage < firstJoinStage {
+			return ProvenanceMain
+		}
+	}
+
+	if _, ok := result.ComputedFields[fieldLower]; ok {
+		return ProvenanceMain
+	}
+
+	// Check if field is in exposed fields from any join's right side
+	for _, j := range result.Joins {
+		for _, ef := range j.ExposedFields {
+			if strings.ToLower(ef) == fieldLower {
+				return ProvenanceJoined
+			}
+		}
+	}
+
+	return ProvenanceAmbiguous
 }
 
 // ExitTabularOperator increments the stage counter after processing each operator
@@ -3876,25 +4128,82 @@ func (e *conditionExtractor) ExitFunctionCall(ctx *FunctionCallContext) {
 func (e *conditionExtractor) EnterLetStatement(ctx *LetStatementContext) {
 	if ctx.Identifier() != nil {
 		field := ctx.Identifier().GetText()
-		e.computedFields[strings.ToLower(field)] = true
+		// Let statements can have complex expressions, so we don't track source field
+		e.computedFields[strings.ToLower(field)] = ""
 	}
 }
 
 // EnterExtendItem tracks computed fields from extend
 func (e *conditionExtractor) EnterExtendItem(ctx *ExtendItemContext) {
-	// Track field assignments in extend
+	// Track field assignments in extend with source field extraction
 	if ctx.Identifier() != nil {
 		field := ctx.Identifier().GetText()
-		e.computedFields[strings.ToLower(field)] = true
+		sourceField := ""
+
+		// Try to extract the source field from the expression
+		if ctx.Expression() != nil {
+			sourceField = extractFirstFieldFromExpression(ctx.Expression())
+		}
+
+		e.computedFields[strings.ToLower(field)] = sourceField
 	}
+}
+
+// extractFirstFieldFromExpression tries to extract the first field name from an expression
+// This handles patterns like: tolower(CommandLine), coalesce(field1, field2), etc.
+func extractFirstFieldFromExpression(ctx IExpressionContext) string {
+	if ctx == nil {
+		return ""
+	}
+
+	// Get the text and look for function call pattern: functionName(fieldName, ...)
+	text := ctx.GetText()
+
+	// Find the first identifier after an opening paren
+	inParen := false
+	start := -1
+	for i, ch := range text {
+		if ch == '(' {
+			inParen = true
+			start = i + 1
+		} else if inParen && start == i {
+			// Check if this is a valid field name character
+			if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' {
+				// Find the end of the field name
+				end := i
+				for j := i; j < len(text); j++ {
+					ch := text[j]
+					if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+						(ch >= '0' && ch <= '9') || ch == '_' || ch == '.' {
+						end = j + 1
+					} else {
+						break
+					}
+				}
+				return text[i:end]
+			}
+		}
+	}
+	return ""
 }
 
 // EnterProjectItem tracks renamed fields from project
 func (e *conditionExtractor) EnterProjectItem(ctx *ProjectItemContext) {
-	// Track field assignments in project (when there's an alias with = or AS)
+	if e.inSubquery > 0 {
+		return
+	}
 	if ctx.Identifier() != nil && (ctx.ASSIGN() != nil || ctx.AS() != nil) {
+		// Aliased project item: project NewName = expr or project expr AS NewName
 		field := ctx.Identifier().GetText()
-		e.computedFields[strings.ToLower(field)] = true
+		e.computedFields[strings.ToLower(field)] = ""
+		e.projectedFields = append(e.projectedFields, field)
+	} else if ctx.Expression() != nil {
+		// Simple project item: project FieldName
+		// The field name is the expression text (for simple identifiers)
+		text := ctx.Expression().GetText()
+		if isValidFieldName(text) {
+			e.projectedFields = append(e.projectedFields, text)
+		}
 	}
 }
 
@@ -3989,10 +4298,8 @@ func (e *conditionExtractor) handleComparison(left, op, right string) {
 		return
 	}
 
-	// Skip computed fields
-	if e.computedFields[fieldLower] {
-		return
-	}
+	// Mark if this is a computed field (created by extend/project)
+	sourceField, isComputed := e.computedFields[fieldLower]
 
 	// Normalize the operator
 	normalizedOp := normalizeOperator(op)
@@ -4001,12 +4308,14 @@ func (e *conditionExtractor) handleComparison(left, op, right string) {
 	value := extractValue(right)
 
 	cond := Condition{
-		Field:     left,
-		Operator:  normalizedOp,
-		Value:     value,
-		Negated:   e.negated,
-		PipeStage: e.currentStage,
-		LogicalOp: e.lastLogicalOp,
+		Field:       left,
+		Operator:    normalizedOp,
+		Value:       value,
+		Negated:     e.negated,
+		PipeStage:   e.currentStage,
+		LogicalOp:   e.lastLogicalOp,
+		IsComputed:  isComputed,
+		SourceField: sourceField,
 	}
 	e.conditions = append(e.conditions, cond)
 	e.lastLogicalOp = "AND" // reset to default
@@ -4022,9 +4331,9 @@ func (e *conditionExtractor) handleInOperator(field string, exprList IExpression
 	if kqlKeywords[fieldLower] {
 		return
 	}
-	if e.computedFields[fieldLower] {
-		return
-	}
+
+	// Mark if this is a computed field (created by extend/project)
+	sourceField, isComputed := e.computedFields[fieldLower]
 
 	values := extractExpressionListValues(exprList)
 	for i, value := range values {
@@ -4033,12 +4342,14 @@ func (e *conditionExtractor) handleInOperator(field string, exprList IExpression
 			logOp = "OR"
 		}
 		cond := Condition{
-			Field:     field,
-			Operator:  "==",
-			Value:     value,
-			Negated:   negated,
-			PipeStage: e.currentStage,
-			LogicalOp: logOp,
+			Field:       field,
+			Operator:    "==",
+			Value:       value,
+			Negated:     negated,
+			PipeStage:   e.currentStage,
+			LogicalOp:   logOp,
+			IsComputed:  isComputed,
+			SourceField: sourceField,
 		}
 		e.conditions = append(e.conditions, cond)
 	}
@@ -4055,29 +4366,33 @@ func (e *conditionExtractor) handleBetweenOperator(field, lowValue, highValue st
 	if kqlKeywords[fieldLower] {
 		return
 	}
-	if e.computedFields[fieldLower] {
-		return
-	}
+
+	// Mark if this is a computed field (created by extend/project)
+	sourceField, isComputed := e.computedFields[fieldLower]
 
 	// Add lower bound condition
 	cond1 := Condition{
-		Field:     field,
-		Operator:  ">=",
-		Value:     extractValue(lowValue),
-		Negated:   negated,
-		PipeStage: e.currentStage,
-		LogicalOp: e.lastLogicalOp,
+		Field:       field,
+		Operator:    ">=",
+		Value:       extractValue(lowValue),
+		Negated:     negated,
+		PipeStage:   e.currentStage,
+		LogicalOp:   e.lastLogicalOp,
+		IsComputed:  isComputed,
+		SourceField: sourceField,
 	}
 	e.conditions = append(e.conditions, cond1)
 
 	// Add upper bound condition
 	cond2 := Condition{
-		Field:     field,
-		Operator:  "<=",
-		Value:     extractValue(highValue),
-		Negated:   negated,
-		PipeStage: e.currentStage,
-		LogicalOp: "AND",
+		Field:       field,
+		Operator:    "<=",
+		Value:       extractValue(highValue),
+		Negated:     negated,
+		PipeStage:   e.currentStage,
+		LogicalOp:   "AND",
+		IsComputed:  isComputed,
+		SourceField: sourceField,
 	}
 	e.conditions = append(e.conditions, cond2)
 	e.lastLogicalOp = "AND"
@@ -4093,9 +4408,9 @@ func (e *conditionExtractor) handleHasAnyAllOperator(field, op string, exprList 
 	if kqlKeywords[fieldLower] {
 		return
 	}
-	if e.computedFields[fieldLower] {
-		return
-	}
+
+	// Mark if this is a computed field (created by extend/project)
+	sourceField, isComputed := e.computedFields[fieldLower]
 
 	values := extractExpressionListValues(exprList)
 	logicalConnector := "OR"
@@ -4109,12 +4424,14 @@ func (e *conditionExtractor) handleHasAnyAllOperator(field, op string, exprList 
 			logOp = logicalConnector
 		}
 		cond := Condition{
-			Field:     field,
-			Operator:  "has",
-			Value:     value,
-			Negated:   e.negated,
-			PipeStage: e.currentStage,
-			LogicalOp: logOp,
+			Field:       field,
+			Operator:    "has",
+			Value:       value,
+			Negated:     e.negated,
+			PipeStage:   e.currentStage,
+			LogicalOp:   logOp,
+			IsComputed:  isComputed,
+			SourceField: sourceField,
 		}
 		e.conditions = append(e.conditions, cond)
 	}
@@ -4324,4 +4641,100 @@ func DeduplicateConditions(conditions []Condition) []Condition {
 	}
 
 	return result
+}
+
+// IsStatisticalQuery checks if the parse result contains aggregation commands
+// (summarize) that create computed fields making static analysis unreliable
+func IsStatisticalQuery(result *ParseResult) bool {
+	for _, cmd := range result.Commands {
+		if cmd == "summarize" {
+			return true
+		}
+	}
+	return false
+}
+
+// HasUnmappedComputedFields checks if any computed field used in conditions
+// could not be traced back to a source field
+func HasUnmappedComputedFields(result *ParseResult) bool {
+	for _, cond := range result.Conditions {
+		if cond.IsComputed && cond.SourceField == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// HasComplexWhereConditions checks if the query has where clauses with complex functions
+// (regex matching, CIDR matching, etc.) that can't be validated statically
+func HasComplexWhereConditions(result *ParseResult) bool {
+	// Check if "where" command is used
+	hasWhere := false
+	for _, cmd := range result.Commands {
+		if cmd == "where" {
+			hasWhere = true
+			break
+		}
+	}
+	if !hasWhere {
+		return false
+	}
+
+	// Check for conditions with complex operators
+	// KQL complex operators: matches regex, ipv4_is_in_range, etc.
+	complexOperators := map[string]bool{
+		"matches":            true, // regex matching
+		"matches_regex":      true, // explicit regex
+		"ipv4_is_in_range":   true, // CIDR matching (equivalent to SPL cidrmatch)
+		"ipv6_is_in_range":   true, // IPv6 CIDR matching
+		"has_any":            true, // dynamic list matching
+		"has_all":            true, // dynamic list matching
+	}
+
+	for _, cond := range result.Conditions {
+		if complexOperators[cond.Operator] {
+			return true
+		}
+		// Also check for negated conditions in where clauses
+		if cond.Negated && cond.PipeStage > 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// GetEventTypeFromConditions detects Windows Event types based on EventID conditions
+// Returns event type strings like "windows_4688", "sysmon_1", etc.
+func GetEventTypeFromConditions(result *ParseResult) string {
+	var eventID string
+
+	for _, cond := range result.Conditions {
+		fieldLower := strings.ToLower(cond.Field)
+
+		// Check for EventID (KQL uses EventID, not EventCode)
+		if fieldLower == "eventid" {
+			eventID = cond.Value
+		}
+	}
+
+	if eventID == "" {
+		return ""
+	}
+
+	// Map event IDs to event types
+	switch eventID {
+	case "4688":
+		return "windows_4688"
+	case "4624":
+		return "windows_4624"
+	case "4625":
+		return "windows_4625"
+	case "1":
+		return "sysmon_1"
+	case "3":
+		return "sysmon_3"
+	}
+
+	return ""
 }
