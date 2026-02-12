@@ -1,6 +1,7 @@
 // Code generated from KQLParser.g4 by ANTLR 4.13.2. DO NOT EDIT.
 
-package kql // KQLParser
+package kql
+
 import "github.com/antlr4-go/antlr/v4"
 
 // BaseKQLParserListener is a complete listener for a parse tree produced by KQLParser.

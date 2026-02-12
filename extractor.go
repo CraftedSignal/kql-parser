@@ -4133,6 +4133,37 @@ func (e *conditionExtractor) EnterLetStatement(ctx *LetStatementContext) {
 	}
 }
 
+// EnterAggregationItem tracks computed fields from summarize aggregation aliases.
+// e.g., summarize FailedAttempts=count() registers "failedattempts" as computed.
+// This prevents post-aggregation filters (| where FailedAttempts > 5) from being
+// treated as required raw data fields in test validation.
+func (e *conditionExtractor) EnterAggregationItem(ctx *AggregationItemContext) {
+	if ctx.Identifier() == nil {
+		return
+	}
+
+	alias := ctx.Identifier().GetText()
+
+	// Two grammar forms:
+	//   identifier ASSIGN aggregationFunction   (e.g., EventCount = count())
+	//   aggregationFunction AS identifier        (e.g., count() as EventCount)
+	if ctx.ASSIGN() != nil || ctx.AS() != nil {
+		sourceField := ""
+		if ctx.AggregationFunction() != nil {
+			// Try to extract source field from the aggregation function's expression
+			if ctx.AggregationFunction().FunctionCall() != nil {
+				fc := ctx.AggregationFunction().FunctionCall()
+				if fc.Identifier() != nil {
+					// The function name itself (count, sum, avg, etc.)
+					funcName := strings.ToLower(fc.Identifier().GetText())
+					sourceField = funcName
+				}
+			}
+		}
+		e.computedFields[strings.ToLower(alias)] = sourceField
+	}
+}
+
 // EnterExtendItem tracks computed fields from extend
 func (e *conditionExtractor) EnterExtendItem(ctx *ExtendItemContext) {
 	// Track field assignments in extend with source field extraction

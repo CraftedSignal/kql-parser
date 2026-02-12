@@ -1116,6 +1116,7 @@ booleanLiteral
 
 identifier
     : IDENTIFIER
+    | INT_NUMBER    // Allow numeric identifiers (e.g., Sysmon-style field names)
     // Allow keywords as identifiers in certain contexts
     | WHERE | PROJECT | EXTEND | SUMMARIZE | SORT | TOP | TAKE | JOIN
     | UNION | LOOKUP | COUNT | DISTINCT | SEARCH | PARSE | EVALUATE

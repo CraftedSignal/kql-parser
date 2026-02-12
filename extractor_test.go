@@ -1,6 +1,7 @@
 package kql
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -402,6 +403,42 @@ func TestExtractConditions_RealWorldQueries(t *testing.T) {
 				t.Logf("Errors: %v", result.Errors)
 			}
 		})
+	}
+}
+
+func TestExtractConditions_SummarizeAliasComputedFields(t *testing.T) {
+	// Test that summarize function aliases are registered as computed fields
+	// so post-aggregation filters don't get treated as required raw data fields
+	query := `SecurityEvent
+| where EventID == 4625
+| summarize FailedAttempts=count() by TargetAccount
+| where FailedAttempts > 10`
+
+	result := ExtractConditions(query)
+
+	t.Logf("Computed fields: %v", result.ComputedFields)
+	t.Logf("Found %d conditions", len(result.Conditions))
+	for _, c := range result.Conditions {
+		t.Logf("Condition: %+v", c)
+	}
+
+	// "failedattempts" should be in ComputedFields
+	if _, ok := result.ComputedFields["failedattempts"]; !ok {
+		t.Errorf("Expected 'failedattempts' to be in ComputedFields, got: %v", result.ComputedFields)
+	}
+
+	// The "FailedAttempts > 10" condition should be marked as computed
+	foundCondition := false
+	for _, c := range result.Conditions {
+		if strings.EqualFold(c.Field, "FailedAttempts") {
+			foundCondition = true
+			if !c.IsComputed {
+				t.Error("Expected 'FailedAttempts' condition to be marked IsComputed=true")
+			}
+		}
+	}
+	if !foundCondition {
+		t.Error("Expected to find 'FailedAttempts' condition from | where FailedAttempts > 10")
 	}
 }
 
