@@ -4508,6 +4508,19 @@ func isValidFieldName(s string) bool {
 		return false
 	}
 
+	// Allow purely numeric field names (e.g., Sysmon-style "1", "3", "22")
+	// The grammar supports this via INT_NUMBER in the identifier rule.
+	allDigits := true
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			allDigits = false
+			break
+		}
+	}
+	if allDigits {
+		return true
+	}
+
 	// Must start with letter or underscore
 	first := s[0]
 	if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || first == '_') {
