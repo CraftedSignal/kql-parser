@@ -30,6 +30,7 @@ type Condition struct {
 type ParseResult struct {
 	Conditions      []Condition       `json:"conditions"`
 	ComputedFields  map[string]string `json:"computed_fields,omitempty"`  // Map of computed field name -> source field (from extend)
+	GroupByFields   []string          `json:"group_by_fields,omitempty"` // Fields from summarize BY clauses
 	Commands        []string          `json:"commands,omitempty"`         // List of commands used in the query (summarize, extend, etc.)
 	ProjectedFields []string          `json:"projected_fields,omitempty"` // Fields selected by project operators
 	Joins           []JoinInfo        `json:"joins,omitempty"`
@@ -84,6 +85,7 @@ type conditionExtractor struct {
 	*BaseKQLParserListener
 	conditions     []Condition
 	computedFields map[string]string // Fields created by extend/project: computed field -> source field
+	groupByFields  []string          // Fields from summarize BY clauses
 	commands        []string          // Commands used in the query
 	projectedFields []string          // Fields selected by project operators
 	joins           []JoinInfo
@@ -4180,6 +4182,7 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 	return &ParseResult{
 		Conditions:      conditions,
 		ComputedFields:  extractor.computedFields,
+		GroupByFields:   extractor.groupByFields,
 		Commands:        extractor.commands,
 		ProjectedFields: extractor.projectedFields,
 		Joins:           extractor.joins,
@@ -4451,6 +4454,28 @@ func (e *conditionExtractor) EnterAggregationItem(ctx *AggregationItemContext) {
 			}
 		}
 		e.computedFields[strings.ToLower(alias)] = sourceField
+	}
+}
+
+// EnterGroupByItem extracts field names from summarize BY clauses.
+func (e *conditionExtractor) EnterGroupByItem(ctx *GroupByItemContext) {
+	if e.inSubquery > 0 {
+		return
+	}
+
+	// groupByItem: expression (AS identifier)? | identifier ASSIGN expression
+	// Extract the field name — for simple identifiers, take the expression text;
+	// for aliased items, take the alias (identifier) name.
+	if ctx.Identifier() != nil && (ctx.ASSIGN() != nil || ctx.AS() != nil) {
+		// Aliased: "Count = count()" or "count() AS Count" — the alias is the group-by result name
+		alias := ctx.Identifier().GetText()
+		e.groupByFields = append(e.groupByFields, alias)
+		e.computedFields[strings.ToLower(alias)] = ""
+	} else if ctx.Expression() != nil {
+		text := ctx.Expression().GetText()
+		if isValidFieldName(text) {
+			e.groupByFields = append(e.groupByFields, text)
+		}
 	}
 }
 
