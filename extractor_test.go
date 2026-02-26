@@ -728,3 +728,37 @@ func TestJoinExtraction_BackwardCompatibility(t *testing.T) {
 		}
 	}
 }
+
+func TestIsnotempty_Extraction(t *testing.T) {
+	query := `SecurityEvent | where isnotempty(InitiatingProcessFileName)`
+	result := ExtractConditions(query)
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("Unexpected errors: %v", result.Errors)
+	}
+
+	found := false
+	for _, c := range result.Conditions {
+		if c.Field == "InitiatingProcessFileName" && c.Operator == "isnotnull" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Expected isnotnull condition for InitiatingProcessFileName, got %v", result.Conditions)
+	}
+}
+
+func TestIsnull_Extraction(t *testing.T) {
+	query := `SecurityEvent | where isnull(UserName)`
+	result := ExtractConditions(query)
+
+	found := false
+	for _, c := range result.Conditions {
+		if c.Field == "UserName" && c.Operator == "isnull" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Expected isnull condition for UserName, got %v", result.Conditions)
+	}
+}

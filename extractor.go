@@ -2,6 +2,7 @@ package kql
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -1133,34 +1134,39 @@ func normalizeSummarizeBy(query string) string {
 // stripReturnTypeAnnotations removes return type annotations from evaluate statements
 // evaluate func(x) : (col:type, ...) -> evaluate func(x)
 func stripReturnTypeAnnotations(query string) string {
-	result := query
-	lowerResult := strings.ToLower(result)
+	lowerQuery := strings.ToLower(query)
+	var b strings.Builder
+	b.Grow(len(query))
+	lastCopied := 0
+	changed := false
+	searchFrom := 0
 
 	for {
 		// Find "evaluate"
-		idx := strings.Index(lowerResult, "evaluate")
-		if idx == -1 {
+		rel := strings.Index(lowerQuery[searchFrom:], "evaluate")
+		if rel == -1 {
 			break
 		}
+		idx := searchFrom + rel
 
 		// Find the closing paren of the evaluate function call
-		searchStart := idx + 8
+		evalSearchStart := idx + 8
 		parenStart := -1
-		for i := searchStart; i < len(result); i++ {
-			if result[i] == '(' {
+		for i := evalSearchStart; i < len(query); i++ {
+			if query[i] == '(' {
 				parenStart = i
 				break
 			}
-			if result[i] != ' ' && result[i] != '\t' && result[i] != '\n' &&
-				!((result[i] >= 'a' && result[i] <= 'z') ||
-					(result[i] >= 'A' && result[i] <= 'Z') ||
-					result[i] == '_') {
+			if query[i] != ' ' && query[i] != '\t' && query[i] != '\n' &&
+				!((query[i] >= 'a' && query[i] <= 'z') ||
+					(query[i] >= 'A' && query[i] <= 'Z') ||
+					query[i] == '_') {
 				break
 			}
 		}
 
 		if parenStart == -1 {
-			lowerResult = lowerResult[idx+8:]
+			searchFrom = idx + 8
 			continue
 		}
 
@@ -1169,8 +1175,8 @@ func stripReturnTypeAnnotations(query string) string {
 		parenEnd := parenStart + 1
 		inString := false
 		stringChar := byte(0)
-		for parenEnd < len(result) && depth > 0 {
-			c := result[parenEnd]
+		for parenEnd < len(query) && depth > 0 {
+			c := query[parenEnd]
 			if !inString {
 				if c == '"' || c == '\'' {
 					inString = true
@@ -1182,7 +1188,7 @@ func stripReturnTypeAnnotations(query string) string {
 				}
 			} else {
 				if c == stringChar {
-					if stringChar == '"' && parenEnd > 0 && result[parenEnd-1] == '\\' {
+					if stringChar == '"' && parenEnd > 0 && query[parenEnd-1] == '\\' {
 						// escaped
 					} else {
 						inString = false
@@ -1198,34 +1204,34 @@ func stripReturnTypeAnnotations(query string) string {
 
 		// Now look for " : (" after the closing paren
 		colonStart := parenEnd
-		for colonStart < len(result) && (result[colonStart] == ' ' || result[colonStart] == '\t' || result[colonStart] == '\n') {
+		for colonStart < len(query) && (query[colonStart] == ' ' || query[colonStart] == '\t' || query[colonStart] == '\n') {
 			colonStart++
 		}
 
-		if colonStart >= len(result) || result[colonStart] != ':' {
+		if colonStart >= len(query) || query[colonStart] != ':' {
 			// No colon after evaluate, continue
-			lowerResult = lowerResult[idx+8:]
+			searchFrom = idx + 8
 			continue
 		}
 
 		// Find the opening paren after the colon
 		typeStart := colonStart + 1
-		for typeStart < len(result) && (result[typeStart] == ' ' || result[typeStart] == '\t' || result[typeStart] == '\n') {
+		for typeStart < len(query) && (query[typeStart] == ' ' || query[typeStart] == '\t' || query[typeStart] == '\n') {
 			typeStart++
 		}
 
-		if typeStart >= len(result) || result[typeStart] != '(' {
-			lowerResult = lowerResult[idx+8:]
+		if typeStart >= len(query) || query[typeStart] != '(' {
+			searchFrom = idx + 8
 			continue
 		}
 
 		// Find the matching closing paren for the type specification
 		depth = 1
 		typeEnd := typeStart + 1
-		for typeEnd < len(result) && depth > 0 {
-			if result[typeEnd] == '(' {
+		for typeEnd < len(query) && depth > 0 {
+			if query[typeEnd] == '(' {
 				depth++
-			} else if result[typeEnd] == ')' {
+			} else if query[typeEnd] == ')' {
 				depth--
 			}
 			typeEnd++
@@ -1236,39 +1242,53 @@ func stripReturnTypeAnnotations(query string) string {
 		}
 
 		// Remove from colon to closing paren: "evaluate func(...) : (...)" -> "evaluate func(...)"
-		result = result[:parenEnd] + result[typeEnd:]
-		lowerResult = strings.ToLower(result)
+		// Copy everything up to parenEnd (keep the function call), skip parenEnd..typeEnd (the type annotation)
+		b.WriteString(query[lastCopied:parenEnd])
+		lastCopied = typeEnd
+		searchFrom = typeEnd
+		changed = true
 	}
 
-	return result
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // normalizeLookupSubquery simplifies complex expressions inside lookup subqueries
 // lookup (union T1, T2) -> lookup (LookupTable)
 // The grammar only supports simple table references inside lookup
 func normalizeLookupSubquery(query string) string {
-	result := query
-	lowerResult := strings.ToLower(result)
+	lowerQuery := strings.ToLower(query)
+	var b strings.Builder
+	b.Grow(len(query))
+	lastCopied := 0
+	changed := false
+	searchFrom := 0
 
 	for {
 		// Find "lookup " or "lookup("
-		idx := strings.Index(lowerResult, "lookup ")
-		if idx == -1 {
-			idx = strings.Index(lowerResult, "lookup(")
-		}
-		if idx == -1 {
+		idx := strings.Index(lowerQuery[searchFrom:], "lookup ")
+		idx2 := strings.Index(lowerQuery[searchFrom:], "lookup(")
+		if idx == -1 && idx2 == -1 {
 			break
 		}
+		// Pick the earliest match
+		if idx == -1 || (idx2 != -1 && idx2 < idx) {
+			idx = idx2
+		}
+		idx += searchFrom
 
 		// Find the opening paren
 		parenStart := idx + 6
-		for parenStart < len(result) && (result[parenStart] == ' ' || result[parenStart] == '\t') {
+		for parenStart < len(query) && (query[parenStart] == ' ' || query[parenStart] == '\t') {
 			parenStart++
 		}
 
-		if parenStart >= len(result) || result[parenStart] != '(' {
+		if parenStart >= len(query) || query[parenStart] != '(' {
 			// No paren, skip
-			lowerResult = lowerResult[idx+6:]
+			searchFrom = idx + 6
 			continue
 		}
 
@@ -1276,10 +1296,10 @@ func normalizeLookupSubquery(query string) string {
 		// Find content between ( and matching )
 		depth := 1
 		parenEnd := parenStart + 1
-		for parenEnd < len(result) && depth > 0 {
-			if result[parenEnd] == '(' {
+		for parenEnd < len(query) && depth > 0 {
+			if query[parenEnd] == '(' {
 				depth++
-			} else if result[parenEnd] == ')' {
+			} else if query[parenEnd] == ')' {
 				depth--
 			}
 			parenEnd++
@@ -1290,41 +1310,54 @@ func normalizeLookupSubquery(query string) string {
 		}
 
 		// Check if content contains "union"
-		content := strings.ToLower(result[parenStart+1 : parenEnd-1])
+		content := lowerQuery[parenStart+1 : parenEnd-1]
 		if strings.Contains(content, "union") {
 			// Replace entire (union ...) with (LookupTable)
-			result = result[:parenStart+1] + "LookupTable" + result[parenEnd-1:]
-			lowerResult = strings.ToLower(result)
+			// Keep the parens: copy up to parenStart+1, write "LookupTable", skip to parenEnd-1
+			b.WriteString(query[lastCopied : parenStart+1])
+			b.WriteString("LookupTable")
+			lastCopied = parenEnd - 1
+			searchFrom = parenEnd
+			changed = true
 		} else {
 			// No union, advance
-			lowerResult = lowerResult[parenEnd:]
+			searchFrom = parenEnd
 		}
 	}
 
-	return result
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // stripMvApplySubquery removes entire mv-apply statements that have on (subquery)
 // | mv-apply x = col on (subquery) -> (removed entirely)
 // The mv-apply with subquery isn't needed for condition extraction
 func stripMvApplySubquery(query string) string {
-	result := query
-	lowerResult := strings.ToLower(result)
+	lowerQuery := strings.ToLower(query)
+	var b strings.Builder
+	b.Grow(len(query))
+	lastCopied := 0
+	changed := false
+	searchFrom := 0
 
 	for {
 		// Find "| mv-apply" (the full operator with pipe)
-		idx := strings.Index(lowerResult, "| mv-apply")
-		if idx == -1 {
+		rel := strings.Index(lowerQuery[searchFrom:], "| mv-apply")
+		if rel == -1 {
 			break
 		}
+		idx := searchFrom + rel
 
 		// Find " on " or " on(" after mv-apply
-		searchStart := idx + 10
+		mvSearchStart := idx + 10
 		onIdx := -1
-		for i := searchStart; i < len(result)-3; i++ {
-			if (result[i] == ' ' || result[i] == '\n' || result[i] == '\t') &&
-				strings.ToLower(result[i+1:i+3]) == "on" &&
-				(i+3 >= len(result) || result[i+3] == ' ' || result[i+3] == '\n' || result[i+3] == '\t' || result[i+3] == '(') {
+		for i := mvSearchStart; i < len(query)-3; i++ {
+			if (query[i] == ' ' || query[i] == '\n' || query[i] == '\t') &&
+				lowerQuery[i+1:i+3] == "on" &&
+				(i+3 >= len(query) || query[i+3] == ' ' || query[i+3] == '\n' || query[i+3] == '\t' || query[i+3] == '(') {
 				onIdx = i + 1
 				break
 			}
@@ -1332,19 +1365,19 @@ func stripMvApplySubquery(query string) string {
 
 		if onIdx == -1 {
 			// No "on" found for this mv-apply, it's a simple mv-apply without subquery - keep it
-			lowerResult = lowerResult[idx+10:]
+			searchFrom = idx + 10
 			continue
 		}
 
 		// Find the opening paren after "on"
 		parenStart := onIdx + 2
-		for parenStart < len(result) && (result[parenStart] == ' ' || result[parenStart] == '\t' || result[parenStart] == '\n') {
+		for parenStart < len(query) && (query[parenStart] == ' ' || query[parenStart] == '\t' || query[parenStart] == '\n') {
 			parenStart++
 		}
 
-		if parenStart >= len(result) || result[parenStart] != '(' {
+		if parenStart >= len(query) || query[parenStart] != '(' {
 			// No paren after "on", just "on" keyword (edge case) - skip
-			lowerResult = lowerResult[idx+10:]
+			searchFrom = idx + 10
 			continue
 		}
 
@@ -1353,8 +1386,8 @@ func stripMvApplySubquery(query string) string {
 		parenEnd := parenStart + 1
 		inString := false
 		stringChar := byte(0)
-		for parenEnd < len(result) && depth > 0 {
-			c := result[parenEnd]
+		for parenEnd < len(query) && depth > 0 {
+			c := query[parenEnd]
 			if !inString {
 				if c == '"' || c == '\'' {
 					inString = true
@@ -1367,7 +1400,7 @@ func stripMvApplySubquery(query string) string {
 			} else {
 				// In KQL, only double-quoted strings have backslash escaping
 				if c == stringChar {
-					if stringChar == '"' && parenEnd > 0 && result[parenEnd-1] == '\\' {
+					if stringChar == '"' && parenEnd > 0 && query[parenEnd-1] == '\\' {
 						// Escaped quote, continue
 					} else {
 						inString = false
@@ -1383,32 +1416,43 @@ func stripMvApplySubquery(query string) string {
 		}
 
 		// Remove entire mv-apply statement from "| mv-apply" to closing paren
-		result = result[:idx] + result[parenEnd:]
-		lowerResult = strings.ToLower(result)
+		b.WriteString(query[lastCopied:idx])
+		lastCopied = parenEnd
+		searchFrom = parenEnd
+		changed = true
 	}
 
-	return result
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // stripParseStatements removes parse operator statements
 // parse field with 'pattern' var1 'pattern2' var2 -> (entire statement removed)
 // The parse operator extracts substrings but isn't needed for condition extraction
 func stripParseStatements(query string) string {
-	result := query
-	lowerResult := strings.ToLower(result)
+	lowerQuery := strings.ToLower(query)
+	var b strings.Builder
+	b.Grow(len(query))
+	lastCopied := 0
+	changed := false
+	searchFrom := 0
 
 	for {
 		// Find "| parse" or "\nparse" (parse operator at start of pipe stage)
-		idx := strings.Index(lowerResult, "| parse ")
+		idx := strings.Index(lowerQuery[searchFrom:], "| parse ")
 		if idx == -1 {
-			idx = strings.Index(lowerResult, "| parse\t")
+			idx = strings.Index(lowerQuery[searchFrom:], "| parse\t")
 		}
 		if idx == -1 {
-			idx = strings.Index(lowerResult, "| parse\n")
+			idx = strings.Index(lowerQuery[searchFrom:], "| parse\n")
 		}
 		if idx == -1 {
 			break
 		}
+		idx += searchFrom
 
 		// Find the end of this parse statement (next pipe, closing paren, or end of query)
 		parseStart := idx + 2 // skip "| "
@@ -1425,12 +1469,12 @@ func stripParseStatements(query string) string {
 		strCharInit := byte(0)
 		isVerbatimInit := false
 		for i := 0; i < idx; i++ {
-			c := result[i]
+			c := query[i]
 			if !inStrInit {
 				if c == '"' || c == '\'' {
 					inStrInit = true
 					strCharInit = c
-					isVerbatimInit = i > 0 && result[i-1] == '@'
+					isVerbatimInit = i > 0 && query[i-1] == '@'
 				} else if c == '(' {
 					parenDepth++
 				} else if c == ')' {
@@ -1443,7 +1487,7 @@ func stripParseStatements(query string) string {
 						inStrInit = false
 					} else if strCharInit == '"' {
 						// Regular double-quoted: check backslash escaping
-						if i == 0 || result[i-1] != '\\' {
+						if i == 0 || query[i-1] != '\\' {
 							inStrInit = false
 						}
 					} else {
@@ -1455,13 +1499,13 @@ func stripParseStatements(query string) string {
 		}
 		startingDepth := parenDepth
 
-		for pipeOrEnd < len(result) {
-			c := result[pipeOrEnd]
+		for pipeOrEnd < len(query) {
+			c := query[pipeOrEnd]
 			if !inString {
 				if c == '"' || c == '\'' {
 					inString = true
 					stringChar = c
-					isVerbatim = pipeOrEnd > 0 && result[pipeOrEnd-1] == '@'
+					isVerbatim = pipeOrEnd > 0 && query[pipeOrEnd-1] == '@'
 				} else if c == '|' {
 					// Found next pipe at same paren level
 					break
@@ -1481,10 +1525,10 @@ func stripParseStatements(query string) string {
 				} else if c == '\n' {
 					// Check if next non-whitespace is a new operator
 					nextNonSpace := pipeOrEnd + 1
-					for nextNonSpace < len(result) && (result[nextNonSpace] == ' ' || result[nextNonSpace] == '\t') {
+					for nextNonSpace < len(query) && (query[nextNonSpace] == ' ' || query[nextNonSpace] == '\t') {
 						nextNonSpace++
 					}
-					if nextNonSpace < len(result) && result[nextNonSpace] == '|' {
+					if nextNonSpace < len(query) && query[nextNonSpace] == '|' {
 						pipeOrEnd = nextNonSpace
 						break
 					}
@@ -1497,7 +1541,7 @@ func stripParseStatements(query string) string {
 					} else if stringChar == '"' {
 						// Regular double-quoted strings: check backslash escaping
 						backslashes := 0
-						for j := pipeOrEnd - 1; j >= 0 && result[j] == '\\'; j-- {
+						for j := pipeOrEnd - 1; j >= 0 && query[j] == '\\'; j-- {
 							backslashes++
 						}
 						if backslashes%2 == 0 {
@@ -1513,25 +1557,28 @@ func stripParseStatements(query string) string {
 		}
 
 		// Remove the parse statement (keep the delimiter for the next statement if any)
-		if pipeOrEnd < len(result) {
-			delim := result[pipeOrEnd]
-			if delim == '|' || delim == ')' {
-				// There's a following pipe or paren, keep it: "| parse ... | next" -> "| next"
-				result = result[:idx] + result[pipeOrEnd:]
-			} else if delim == ';' {
-				// Keep the semicolon as it terminates the let statement: "| parse ...;" -> ";"
-				result = result[:idx] + result[pipeOrEnd:]
+		b.WriteString(query[lastCopied:idx])
+		if pipeOrEnd < len(query) {
+			delim := query[pipeOrEnd]
+			if delim == '|' || delim == ')' || delim == ';' {
+				// Keep the delimiter: "| parse ... | next" -> "| next"
+				lastCopied = pipeOrEnd
 			} else {
-				result = result[:idx]
+				lastCopied = pipeOrEnd
 			}
 		} else {
 			// No following delimiter, just remove to end: "| parse ..." -> ""
-			result = result[:idx]
+			lastCopied = pipeOrEnd
 		}
-		lowerResult = strings.ToLower(result)
+		searchFrom = pipeOrEnd
+		changed = true
 	}
 
-	return result
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // normalizeNotEqualOperator converts SQL-style <> to KQL !=
@@ -1558,40 +1605,52 @@ func normalizeNotEqualOperator(query string) string {
 // distinct a, tostring(b), c -> distinct a, b, c
 // The grammar only supports simple column names in distinct, not expressions
 func normalizeDistinctColumns(query string) string {
-	result := query
-
 	// Find each distinct clause
-	lowerResult := strings.ToLower(result)
-	idx := 0
+	lowerQuery := strings.ToLower(query)
+	var b strings.Builder
+	b.Grow(len(query))
+	lastCopied := 0
+	changed := false
+	searchFrom := 0
+
 	for {
 		// Find "distinct " (must have space after to avoid "distinctive" etc)
-		pos := strings.Index(lowerResult[idx:], "distinct ")
+		pos := strings.Index(lowerQuery[searchFrom:], "distinct ")
 		if pos == -1 {
 			break
 		}
-		distinctStart := idx + pos + 9 // Position after "distinct "
-		idx = distinctStart
+		distinctStart := searchFrom + pos + 9 // Position after "distinct "
+		searchFrom = distinctStart
 
 		// Find the end of the distinct clause (next pipe, newline, or end)
-		endPos := len(result)
-		for i := distinctStart; i < len(result); i++ {
-			if result[i] == '|' || result[i] == '\n' {
+		endPos := len(query)
+		for i := distinctStart; i < len(query); i++ {
+			if query[i] == '|' || query[i] == '\n' {
 				endPos = i
 				break
 			}
 		}
 
 		// Process the column list
-		columnPart := result[distinctStart:endPos]
+		columnPart := query[distinctStart:endPos]
 		normalizedCols := normalizeDistinctColumnList(columnPart)
 
-		// Replace in result
-		result = result[:distinctStart] + normalizedCols + result[endPos:]
-		lowerResult = strings.ToLower(result)
-		idx = distinctStart + len(normalizedCols)
+		// Write everything up to distinctStart, then the normalized columns
+		b.WriteString(query[lastCopied:distinctStart])
+		b.WriteString(normalizedCols)
+		lastCopied = endPos
+		searchFrom = distinctStart + len(normalizedCols)
+		// Adjust searchFrom relative to what's been written vs original
+		// Since we're searching lowerQuery (original), we need to advance past endPos
+		searchFrom = endPos
+		changed = true
 	}
 
-	return result
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // normalizeDistinctColumnList processes the column list portion of a distinct clause
@@ -1898,7 +1957,11 @@ func normalizeTimespanLiterals(query string) string {
 
 	result := query
 	for longSuffix, shortSuffix := range suffixMap {
-		// Find number followed immediately by suffix
+		// Find number followed immediately by suffix — build output incrementally
+		var b strings.Builder
+		b.Grow(len(result))
+		lastCopied := 0
+		changed := false
 		for i := 0; i < len(result); i++ {
 			// Check if we're at a digit
 			if result[i] >= '0' && result[i] <= '9' {
@@ -1915,11 +1978,20 @@ func normalizeTimespanLiterals(query string) string {
 						afterSuffix := numEnd + len(longSuffix)
 						if afterSuffix >= len(result) || !isIdentChar(result[afterSuffix]) {
 							// Replace with short suffix
-							result = result[:numEnd] + shortSuffix + result[afterSuffix:]
+							b.WriteString(result[lastCopied:numEnd])
+							b.WriteString(shortSuffix)
+							lastCopied = afterSuffix
+							i = afterSuffix - 1 // -1 because the for loop increments
+							changed = true
+							continue
 						}
 					}
 				}
 			}
+		}
+		if changed {
+			b.WriteString(result[lastCopied:])
+			result = b.String()
 		}
 	}
 	return result
@@ -2065,6 +2137,50 @@ func isIdentChar(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
 }
 
+// removeUnionParam removes all occurrences of a case-insensitive parameter (e.g., "isfuzzy")
+// along with its =value and any trailing comma/whitespace, using a single-pass Builder.
+func removeUnionParam(input string, paramLower string, paramLen int) string {
+	lowerInput := strings.ToLower(input)
+	var b strings.Builder
+	b.Grow(len(input))
+	lastCopied := 0
+	changed := false
+	searchFrom := 0
+
+	for {
+		idx := strings.Index(lowerInput[searchFrom:], paramLower)
+		if idx == -1 {
+			break
+		}
+		idx += searchFrom
+
+		// Find the end of the parameter (next whitespace, comma, or newline)
+		end := idx + paramLen
+		// Skip any = and value
+		for end < len(input) && (input[end] == '=' || input[end] == ' ' || input[end] == '\t') {
+			end++
+		}
+		// Skip the value (true/false or identifier)
+		for end < len(input) && input[end] != ' ' && input[end] != '\t' && input[end] != '\n' && input[end] != ',' && input[end] != '(' {
+			end++
+		}
+		// Skip any trailing comma
+		for end < len(input) && (input[end] == ',' || input[end] == ' ' || input[end] == '\t') {
+			end++
+		}
+		b.WriteString(input[lastCopied:idx])
+		lastCopied = end
+		searchFrom = end
+		changed = true
+	}
+
+	if !changed {
+		return input
+	}
+	b.WriteString(input[lastCopied:])
+	return b.String()
+}
+
 // normalizeUnionParameters removes union parameters like isfuzzy=true, withsource=...
 // Also handles queries that start with (union ...) by stripping outer parens
 func normalizeUnionParameters(query string) string {
@@ -2101,76 +2217,53 @@ func normalizeUnionParameters(query string) string {
 	}
 
 	// Remove isfuzzy=... parameter (up to next whitespace or comma)
-	for {
-		idx := strings.Index(strings.ToLower(result), "isfuzzy")
-		if idx == -1 {
-			break
-		}
-		// Find the end of the parameter (next whitespace, comma, or newline)
-		end := idx + 7
-		// Skip any = and value
-		for end < len(result) && (result[end] == '=' || result[end] == ' ' || result[end] == '\t') {
-			end++
-		}
-		// Skip the value (true/false or identifier)
-		for end < len(result) && result[end] != ' ' && result[end] != '\t' && result[end] != '\n' && result[end] != ',' && result[end] != '(' {
-			end++
-		}
-		// Skip any trailing comma
-		for end < len(result) && (result[end] == ',' || result[end] == ' ' || result[end] == '\t') {
-			end++
-		}
-		result = result[:idx] + result[end:]
-	}
+	result = removeUnionParam(result, "isfuzzy", 7)
 
 	// Remove withsource=... parameter
-	for {
-		idx := strings.Index(strings.ToLower(result), "withsource")
-		if idx == -1 {
-			break
-		}
-		// Find the end of the parameter
-		end := idx + 10
-		// Skip any = and value
-		for end < len(result) && (result[end] == '=' || result[end] == ' ' || result[end] == '\t') {
-			end++
-		}
-		// Skip the value
-		for end < len(result) && result[end] != ' ' && result[end] != '\t' && result[end] != '\n' && result[end] != ',' && result[end] != '(' {
-			end++
-		}
-		// Skip any trailing comma
-		for end < len(result) && (result[end] == ',' || result[end] == ' ' || result[end] == '\t') {
-			end++
-		}
-		result = result[:idx] + result[end:]
-	}
+	result = removeUnionParam(result, "withsource", 10)
 
 	// Also handle kind= parameter in union
-	for {
-		idx := strings.Index(result, "union kind=")
-		if idx == -1 {
-			idx = strings.Index(result, "union  kind=")
-			if idx == -1 {
+	{
+		lowerResult := strings.ToLower(result)
+		var b strings.Builder
+		b.Grow(len(result))
+		lastCopied := 0
+		changed := false
+		searchFrom := 0
+		for {
+			// Search for "union kind=" or "union  kind=" in the remaining portion
+			rel := strings.Index(lowerResult[searchFrom:], "union kind=")
+			if rel == -1 {
+				rel = strings.Index(lowerResult[searchFrom:], "union  kind=")
+			}
+			if rel == -1 {
 				break
 			}
+			idx := searchFrom + rel
+			// Find "kind=" and skip to end of value
+			kindRel := strings.Index(lowerResult[idx:], "kind=")
+			if kindRel == -1 {
+				break
+			}
+			kindIdx := idx + kindRel
+			end := kindIdx + 5
+			// Skip the value
+			for end < len(result) && result[end] != ' ' && result[end] != '\t' && result[end] != '\n' && result[end] != ',' && result[end] != '(' {
+				end++
+			}
+			// Skip whitespace/comma after value
+			for end < len(result) && (result[end] == ' ' || result[end] == '\t' || result[end] == ',') {
+				end++
+			}
+			b.WriteString(result[lastCopied:kindIdx])
+			lastCopied = end
+			searchFrom = end
+			changed = true
 		}
-		// Find "kind=" and skip to end of value
-		kindIdx := strings.Index(result[idx:], "kind=")
-		if kindIdx == -1 {
-			break
+		if changed {
+			b.WriteString(result[lastCopied:])
+			result = b.String()
 		}
-		kindIdx += idx
-		end := kindIdx + 5
-		// Skip the value
-		for end < len(result) && result[end] != ' ' && result[end] != '\t' && result[end] != '\n' && result[end] != ',' && result[end] != '(' {
-			end++
-		}
-		// Skip whitespace/comma after value
-		for end < len(result) && (result[end] == ' ' || result[end] == '\t' || result[end] == ',') {
-			end++
-		}
-		result = result[:kindIdx] + result[end:]
 	}
 
 	// Replace wildcard * in union with dummy table name
@@ -2189,48 +2282,51 @@ func normalizeUnionParameters(query string) string {
 // join (union T1, T2) -> join (DummyTable | union T1, T2)
 // The grammar requires a tabularSource before union
 func normalizeJoinUnion(query string) string {
-	result := query
-	lowerResult := strings.ToLower(result)
+	lowerQuery := strings.ToLower(query)
+	var b strings.Builder
+	b.Grow(len(query) + 64)
+	lastCopied := 0
+	changed := false
+	searchFrom := 0
 
 	// Find all join operators
-	idx := 0
 	for {
-		joinIdx := strings.Index(lowerResult[idx:], "join")
-		if joinIdx == -1 {
+		joinRel := strings.Index(lowerQuery[searchFrom:], "join")
+		if joinRel == -1 {
 			break
 		}
-		joinIdx += idx
-		idx = joinIdx + 4
+		joinIdx := searchFrom + joinRel
+		searchFrom = joinIdx + 4
 
 		// Skip to find the opening paren after join and optional kind=... hint=...
 		i := joinIdx + 4 // after "join"
-		for i < len(result) && (result[i] == ' ' || result[i] == '\t' || result[i] == '\n' || result[i] == '\r') {
+		for i < len(query) && (query[i] == ' ' || query[i] == '\t' || query[i] == '\n' || query[i] == '\r') {
 			i++
 		}
 
 		// Skip kind=... and hint=... clauses
-		for i < len(result) {
+		for i < len(query) {
 			// Check for kind=
-			if i+5 < len(result) && strings.ToLower(result[i:i+5]) == "kind=" {
+			if i+5 < len(query) && lowerQuery[i:i+5] == "kind=" {
 				i += 5
 				// Skip the kind value
-				for i < len(result) && result[i] != ' ' && result[i] != '\t' && result[i] != '\n' && result[i] != '(' {
+				for i < len(query) && query[i] != ' ' && query[i] != '\t' && query[i] != '\n' && query[i] != '(' {
 					i++
 				}
 				// Skip whitespace
-				for i < len(result) && (result[i] == ' ' || result[i] == '\t' || result[i] == '\n' || result[i] == '\r') {
+				for i < len(query) && (query[i] == ' ' || query[i] == '\t' || query[i] == '\n' || query[i] == '\r') {
 					i++
 				}
 				continue
 			}
 			// Check for hint.xxx=
-			if i+5 < len(result) && strings.ToLower(result[i:i+5]) == "hint." {
+			if i+5 < len(query) && lowerQuery[i:i+5] == "hint." {
 				// Skip hint.xxx=value
-				for i < len(result) && result[i] != ' ' && result[i] != '\t' && result[i] != '\n' && result[i] != '(' {
+				for i < len(query) && query[i] != ' ' && query[i] != '\t' && query[i] != '\n' && query[i] != '(' {
 					i++
 				}
 				// Skip whitespace
-				for i < len(result) && (result[i] == ' ' || result[i] == '\t' || result[i] == '\n' || result[i] == '\r') {
+				for i < len(query) && (query[i] == ' ' || query[i] == '\t' || query[i] == '\n' || query[i] == '\r') {
 					i++
 				}
 				continue
@@ -2239,60 +2335,71 @@ func normalizeJoinUnion(query string) string {
 		}
 
 		// Now we should be at the opening paren
-		if i >= len(result) || result[i] != '(' {
+		if i >= len(query) || query[i] != '(' {
 			continue
 		}
 		parenStart := i
 
 		// Check if content after ( starts with union (skip whitespace)
 		j := i + 1
-		for j < len(result) && (result[j] == ' ' || result[j] == '\t' || result[j] == '\n' || result[j] == '\r') {
+		for j < len(query) && (query[j] == ' ' || query[j] == '\t' || query[j] == '\n' || query[j] == '\r') {
 			j++
 		}
 
 		// Handle double parens: ((union ...)) - find the innermost paren before union
 		innerParenStart := -1
-		for j < len(result) && result[j] == '(' {
+		for j < len(query) && query[j] == '(' {
 			innerParenStart = j
 			j++ // skip inner paren
-			for j < len(result) && (result[j] == ' ' || result[j] == '\t' || result[j] == '\n' || result[j] == '\r') {
+			for j < len(query) && (query[j] == ' ' || query[j] == '\t' || query[j] == '\n' || query[j] == '\r') {
 				j++
 			}
 		}
 
-		if j+5 < len(result) && strings.ToLower(result[j:j+5]) == "union" {
+		if j+5 < len(query) && lowerQuery[j:j+5] == "union" {
 			// Check it's a word boundary
-			if j+5 < len(result) && !isIdentChar(result[j+5]) {
+			if j+5 < len(query) && !isIdentChar(query[j+5]) {
 				// Insert DummyTable | after the innermost opening paren (or the main one if no inner)
 				insertPoint := parenStart + 1
 				if innerParenStart != -1 {
 					insertPoint = innerParenStart + 1
 				}
-				result = result[:insertPoint] + "DummyTable | " + result[insertPoint:]
-				lowerResult = strings.ToLower(result)
-				idx = insertPoint + 13 // skip past inserted text
+				b.WriteString(query[lastCopied:insertPoint])
+				b.WriteString("DummyTable | ")
+				lastCopied = insertPoint
+				searchFrom = j + 5 // skip past "union"
+				changed = true
 			}
 		}
 	}
 
-	return result
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // stripJoinHints removes hint.xxx=value patterns from join statements
 // Common hints: hint.strategy=broadcast, hint.shufflekey=x, hint.remote=auto
 func stripJoinHints(query string) string {
-	result := query
+	lowerQuery := strings.ToLower(query)
+	var b strings.Builder
+	b.Grow(len(query))
+	lastCopied := 0
+	changed := false
+	searchFrom := 0
 
 	for {
-		lowerResult := strings.ToLower(result)
-		hintIdx := strings.Index(lowerResult, "hint.")
+		hintIdx := strings.Index(lowerQuery[searchFrom:], "hint.")
 		if hintIdx == -1 {
 			break
 		}
+		hintIdx += searchFrom
 
 		// Find the end of hint.xxx=value
 		// First find the = sign
-		eqIdx := strings.Index(result[hintIdx:], "=")
+		eqIdx := strings.Index(query[hintIdx:], "=")
 		if eqIdx == -1 {
 			break // No = found, malformed
 		}
@@ -2301,180 +2408,190 @@ func stripJoinHints(query string) string {
 		// Find end of value - can be simple identifier or a function call with parens
 		endIdx := eqIdx + 1
 		// Skip whitespace after =
-		for endIdx < len(result) && (result[endIdx] == ' ' || result[endIdx] == '\t') {
+		for endIdx < len(query) && (query[endIdx] == ' ' || query[endIdx] == '\t') {
 			endIdx++
 		}
 
 		// Check if value is a parenthesized expression
-		if endIdx < len(result) && result[endIdx] == '(' {
+		if endIdx < len(query) && query[endIdx] == '(' {
 			// Find matching close paren
 			depth := 1
 			endIdx++
-			for endIdx < len(result) && depth > 0 {
-				if result[endIdx] == '(' {
+			for endIdx < len(query) && depth > 0 {
+				if query[endIdx] == '(' {
 					depth++
-				} else if result[endIdx] == ')' {
+				} else if query[endIdx] == ')' {
 					depth--
 				}
 				endIdx++
 			}
 		} else {
 			// Simple value - read until whitespace, comma, or open paren
-			for endIdx < len(result) && result[endIdx] != ' ' && result[endIdx] != '\t' && result[endIdx] != '\n' && result[endIdx] != '(' && result[endIdx] != ')' && result[endIdx] != ',' {
+			for endIdx < len(query) && query[endIdx] != ' ' && query[endIdx] != '\t' && query[endIdx] != '\n' && query[endIdx] != '(' && query[endIdx] != ')' && query[endIdx] != ',' {
 				endIdx++
 			}
 		}
 
 		// Remove the hint and any trailing whitespace
 		trailing := endIdx
-		for trailing < len(result) && (result[trailing] == ' ' || result[trailing] == '\t') {
+		for trailing < len(query) && (query[trailing] == ' ' || query[trailing] == '\t') {
 			trailing++
 		}
 
-		result = result[:hintIdx] + result[trailing:]
+		b.WriteString(query[lastCopied:hintIdx])
+		lastCopied = trailing
+		searchFrom = trailing
+		changed = true
 	}
 
-	return result
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // replaceUnionWildcard replaces the * wildcard in union statements with a dummy table
 func replaceUnionWildcard(query string) string {
-	result := query
-
 	// Look for patterns like "union *" or "union  *" (with extra spaces)
 	// Also handles after parameter stripping: "union *" from "union withsource=T *"
 
 	// Find all occurrences of standalone * that represent table wildcards
 	// Can appear as: "union *", "union Table, *", etc.
-	for {
-		// Find next standalone * that could be a table wildcard
-		starIdx := -1
-		for i := 0; i < len(result); i++ {
-			if result[i] == '*' {
-				// Check if this is a standalone * (not part of *= or ** or inside a string)
-				// It should be preceded by whitespace/comma and followed by whitespace/|/comment/end
-				prevOk := i == 0 || result[i-1] == ' ' || result[i-1] == '\t' || result[i-1] == '\n' || result[i-1] == ','
-				afterIdx := i + 1
-				afterOk := afterIdx >= len(result) ||
-					result[afterIdx] == ' ' || result[afterIdx] == '\t' || result[afterIdx] == '\n' || result[afterIdx] == '\r' ||
-					result[afterIdx] == '|' || result[afterIdx] == ',' ||
-					(afterIdx+1 < len(result) && result[afterIdx] == '/' && result[afterIdx+1] == '/')
+	// Single-pass: scan forward, collect replacement positions, then build output
+	var b strings.Builder
+	b.Grow(len(query) + 64)
+	lastCopied := 0
+	changed := false
 
-				// Also reject if followed by a digit (multiplication like * 1.0)
-				if afterOk && afterIdx < len(result) && isDigit(result[afterIdx]) {
-					afterOk = false
-				}
-				// Reject if preceded by a digit (like 7 * something)
-				if prevOk && i > 0 && isDigit(result[i-1]) {
-					prevOk = false
-				}
+	for i := 0; i < len(query); i++ {
+		if query[i] == '*' {
+			// Check if this is a standalone * (not part of *= or ** or inside a string)
+			// It should be preceded by whitespace/comma and followed by whitespace/|/comment/end
+			prevOk := i == 0 || query[i-1] == ' ' || query[i-1] == '\t' || query[i-1] == '\n' || query[i-1] == ','
+			afterIdx := i + 1
+			afterOk := afterIdx >= len(query) ||
+				query[afterIdx] == ' ' || query[afterIdx] == '\t' || query[afterIdx] == '\n' || query[afterIdx] == '\r' ||
+				query[afterIdx] == '|' || query[afterIdx] == ',' ||
+				(afterIdx+1 < len(query) && query[afterIdx] == '/' && query[afterIdx+1] == '/')
 
-				if prevOk && afterOk {
-					// Verify it's in a union context - look backwards for "union" keyword
-					// without any closing parens or arithmetic operators between
-					inUnionContext := false
-					beforeStar := result[:i]
-					lowerBefore := strings.ToLower(beforeStar)
+			// Also reject if followed by a digit (multiplication like * 1.0)
+			if afterOk && afterIdx < len(query) && isDigit(query[afterIdx]) {
+				afterOk = false
+			}
+			// Reject if preceded by a digit (like 7 * something)
+			if prevOk && i > 0 && isDigit(query[i-1]) {
+				prevOk = false
+			}
 
-					// Find the last occurrence of "union"
-					lastUnionIdx := strings.LastIndex(lowerBefore, "union")
-					if lastUnionIdx != -1 {
-						// Check what's between "union" and the star
-						// Should only be: whitespace, table names, commas, maybe some params
-						// Should NOT have: closing parens without matching opens (arithmetic context)
-						// Should NOT have: pipe operator | (which ends the union context)
-						between := beforeStar[lastUnionIdx+5:]
-						depth := 0
-						validContext := true
-						for _, ch := range between {
-							if ch == '(' {
-								depth++
-							} else if ch == ')' {
-								depth--
-								if depth < 0 {
-									// More closing parens than opening - we're in a different context
-									validContext = false
-									break
-								}
-							} else if ch == '|' && depth == 0 {
-								// Pipe at depth 0 means we've left the union context
+			if prevOk && afterOk {
+				// Verify it's in a union context - look backwards for "union" keyword
+				// without any closing parens or arithmetic operators between
+				inUnionContext := false
+				beforeStar := query[:i]
+				lowerBefore := strings.ToLower(beforeStar)
+
+				// Find the last occurrence of "union"
+				lastUnionIdx := strings.LastIndex(lowerBefore, "union")
+				if lastUnionIdx != -1 {
+					// Check what's between "union" and the star
+					// Should only be: whitespace, table names, commas, maybe some params
+					// Should NOT have: closing parens without matching opens (arithmetic context)
+					// Should NOT have: pipe operator | (which ends the union context)
+					between := beforeStar[lastUnionIdx+5:]
+					depth := 0
+					validContext := true
+					for _, ch := range between {
+						if ch == '(' {
+							depth++
+						} else if ch == ')' {
+							depth--
+							if depth < 0 {
+								// More closing parens than opening - we're in a different context
 								validContext = false
 								break
 							}
-						}
-						// Also check we're not in a deep nesting
-						if validContext && depth == 0 {
-							inUnionContext = true
+						} else if ch == '|' && depth == 0 {
+							// Pipe at depth 0 means we've left the union context
+							validContext = false
+							break
 						}
 					}
+					// Also check we're not in a deep nesting
+					if validContext && depth == 0 {
+						inUnionContext = true
+					}
+				}
 
-					if inUnionContext {
-						starIdx = i
-						break
-					}
+				if inUnionContext {
+					b.WriteString(query[lastCopied:i])
+					b.WriteString("AllTables")
+					lastCopied = i + 1
+					changed = true
 				}
 			}
 		}
-
-		if starIdx == -1 {
-			break
-		}
-
-		// Replace this * with AllTables
-		result = result[:starIdx] + "AllTables" + result[starIdx+1:]
 	}
 
-	return result
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // stripTableWildcards removes * from table name patterns like Device*, *_CL, Table_*
 // These are valid KQL but the grammar doesn't support them
 func stripTableWildcards(query string) string {
-	result := query
-
 	// Look for patterns like "union TableName*", "union *_CL", or "union TableName*, OtherTable"
 	// The * is attached to an identifier (no space on one side)
-	for {
-		changed := false
-		for i := 0; i < len(result); i++ {
-			if result[i] == '*' {
-				// Case 1: Suffix wildcard (Device*)
-				// Check if preceded by an identifier character (letter, digit, underscore)
-				if i > 0 && isIdentChar(result[i-1]) {
-					// Check if followed by whitespace, comma, pipe, end, or closing paren
-					afterOk := i+1 >= len(result) ||
-						result[i+1] == ' ' || result[i+1] == '\t' || result[i+1] == '\n' ||
-						result[i+1] == ',' || result[i+1] == '|' || result[i+1] == ')'
-					if afterOk {
-						// This looks like a table wildcard - remove the *
-						result = result[:i] + result[i+1:]
-						changed = true
-						break
-					}
-				}
+	// Single-pass: scan forward and skip * characters that are table wildcards
+	var b strings.Builder
+	b.Grow(len(query))
+	lastCopied := 0
+	changed := false
 
-				// Case 2: Prefix wildcard (*_CL)
-				// Check if followed by an identifier character
-				if i+1 < len(result) && (isIdentChar(result[i+1]) || result[i+1] == '_') {
-					// Check if preceded by whitespace, comma, or start
-					prevOk := i == 0 ||
-						result[i-1] == ' ' || result[i-1] == '\t' || result[i-1] == '\n' ||
-						result[i-1] == ','
-					if prevOk {
-						// This looks like a prefix wildcard - remove the *
-						result = result[:i] + result[i+1:]
-						changed = true
-						break
-					}
+	for i := 0; i < len(query); i++ {
+		if query[i] == '*' {
+			shouldRemove := false
+
+			// Case 1: Suffix wildcard (Device*)
+			// Check if preceded by an identifier character (letter, digit, underscore)
+			if i > 0 && isIdentChar(query[i-1]) {
+				// Check if followed by whitespace, comma, pipe, end, or closing paren
+				afterOk := i+1 >= len(query) ||
+					query[i+1] == ' ' || query[i+1] == '\t' || query[i+1] == '\n' ||
+					query[i+1] == ',' || query[i+1] == '|' || query[i+1] == ')'
+				if afterOk {
+					shouldRemove = true
 				}
 			}
-		}
-		if !changed {
-			break
+
+			// Case 2: Prefix wildcard (*_CL)
+			// Check if followed by an identifier character
+			if !shouldRemove && i+1 < len(query) && (isIdentChar(query[i+1]) || query[i+1] == '_') {
+				// Check if preceded by whitespace, comma, or start
+				prevOk := i == 0 ||
+					query[i-1] == ' ' || query[i-1] == '\t' || query[i-1] == '\n' ||
+					query[i-1] == ','
+				if prevOk {
+					shouldRemove = true
+				}
+			}
+
+			if shouldRemove {
+				b.WriteString(query[lastCopied:i])
+				lastCopied = i + 1
+				changed = true
+			}
 		}
 	}
 
-	return result
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // stripNamedFunctionParams removes named parameter assignments from function calls
@@ -2560,25 +2677,28 @@ func stripNamedFunctionParams(query string) string {
 // 1. "in range(start, end, step)" -> "from start to end step step"
 // 2. Missing step -> add "step 1h"
 func normalizeMakeSeries(query string) string {
-	result := query
-	lowerResult := strings.ToLower(result)
+	lowerQuery := strings.ToLower(query)
+	var b strings.Builder
+	b.Grow(len(query) + 64)
+	lastCopied := 0
+	changed := false
+	searchFrom := 0
 
 	// Find make-series occurrences
-	idx := 0
 	for {
-		pos := strings.Index(lowerResult[idx:], "make-series")
+		pos := strings.Index(lowerQuery[searchFrom:], "make-series")
 		if pos == -1 {
 			break
 		}
-		pos += idx
+		pos += searchFrom
 
 		// Find the end of this make-series clause (next | or end of string)
 		endPos := pos
 		inString := false
 		stringChar := byte(0)
 		parenDepth := 0
-		for endPos < len(result) {
-			c := result[endPos]
+		for endPos < len(query) {
+			c := query[endPos]
 			if !inString {
 				if c == '"' || c == '\'' {
 					inString = true
@@ -2591,14 +2711,14 @@ func normalizeMakeSeries(query string) string {
 					break
 				}
 			} else {
-				if c == stringChar && (endPos == 0 || result[endPos-1] != '\\') {
+				if c == stringChar && (endPos == 0 || query[endPos-1] != '\\') {
 					inString = false
 				}
 			}
 			endPos++
 		}
 
-		makeSeriesClause := result[pos:endPos]
+		makeSeriesClause := query[pos:endPos]
 		lowerClause := strings.ToLower(makeSeriesClause)
 
 		// Handle "in range(start, end, step)" pattern
@@ -2608,26 +2728,32 @@ func normalizeMakeSeries(query string) string {
 				// Find the range(...) parameters
 				actualRangeStart := pos + rangeIdx + 10 // after " in range("
 				// Find matching close paren
-				parenDepth := 1
+				rpDepth := 1
 				rangeEnd := actualRangeStart
-				for rangeEnd < endPos && parenDepth > 0 {
-					if result[rangeEnd] == '(' {
-						parenDepth++
-					} else if result[rangeEnd] == ')' {
-						parenDepth--
+				for rangeEnd < endPos && rpDepth > 0 {
+					if query[rangeEnd] == '(' {
+						rpDepth++
+					} else if query[rangeEnd] == ')' {
+						rpDepth--
 					}
 					rangeEnd++
 				}
-				if parenDepth == 0 {
+				if rpDepth == 0 {
 					// Extract the parameters
-					params := result[actualRangeStart : rangeEnd-1]
+					params := query[actualRangeStart : rangeEnd-1]
 					// Split by comma (simple split - may need refinement for nested expressions)
 					parts := splitByTopLevelComma(params)
 					if len(parts) == 3 {
 						// in range(start, end, step) -> from start to end step step
-						replacement := " from " + strings.TrimSpace(parts[0]) + " to " + strings.TrimSpace(parts[1]) + " step " + strings.TrimSpace(parts[2])
-						result = result[:pos+rangeIdx] + replacement + result[rangeEnd:]
-						lowerResult = strings.ToLower(result)
+						b.WriteString(query[lastCopied : pos+rangeIdx])
+						b.WriteString(" from ")
+						b.WriteString(strings.TrimSpace(parts[0]))
+						b.WriteString(" to ")
+						b.WriteString(strings.TrimSpace(parts[1]))
+						b.WriteString(" step ")
+						b.WriteString(strings.TrimSpace(parts[2]))
+						lastCopied = rangeEnd
+						changed = true
 					}
 				}
 			}
@@ -2641,14 +2767,20 @@ func normalizeMakeSeries(query string) string {
 			if byIdx != -1 {
 				insertPos = pos + byIdx
 			}
-			result = result[:insertPos] + " step 1h" + result[insertPos:]
-			lowerResult = strings.ToLower(result)
+			b.WriteString(query[lastCopied:insertPos])
+			b.WriteString(" step 1h")
+			lastCopied = insertPos
+			changed = true
 		}
 
-		idx = pos + 11 // move past "make-series"
+		searchFrom = pos + 11 // move past "make-series"
 	}
 
-	return result
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // splitByTopLevelComma splits a string by commas that are not inside parentheses
@@ -2828,9 +2960,18 @@ func stripUnionFunctionParams(query string) string {
 	return newResult.String()
 }
 
-// replaceASIMFunctions replaces ASIM function calls with dummy table references
-// Handles both simple calls (imAuthentication) and parameterized calls (_Im_Dns(param=value))
-func replaceASIMFunctions(query string) string {
+// asimEntry holds a pre-computed lowercase ASIM function name and its length.
+type asimEntry struct {
+	lower string
+	len   int
+}
+
+// asimByFirstByte groups ASIM function names by their lowercase first byte for
+// O(1) lookup at each query position. Within each group entries are sorted
+// longest-first so the greedy match is always correct.
+var asimByFirstByte [256][]asimEntry
+
+func init() {
 	asimFunctions := []string{
 		"imAuthentication", "imProcess", "imNetworkSession", "imDns",
 		"imWebSession", "imFileEvent", "imProcessCreate", "imProcessTerminate",
@@ -2842,140 +2983,155 @@ func replaceASIMFunctions(query string) string {
 		"_GetWatchlist", "_GetWatchlistAlias",
 	}
 
-	result := query
 	for _, fn := range asimFunctions {
-		// Replace function calls with parameters: _Im_Dns(params...) -> ASIMResult
-		result = replaceASIMFunctionCall(result, fn)
-
-		// Replace simple usages (no parentheses) - use replaceASIMSimple for proper word boundary checking
-		result = replaceASIMSimple(result, fn)
+		lower := strings.ToLower(fn)
+		fb := lower[0]
+		asimByFirstByte[fb] = append(asimByFirstByte[fb], asimEntry{lower: lower, len: len(lower)})
 	}
-	return result
+	// Sort each bucket longest-first so greedy matching picks the longest name.
+	for i := range asimByFirstByte {
+		bucket := asimByFirstByte[i]
+		if len(bucket) > 1 {
+			sort.Slice(bucket, func(a, b int) bool {
+				return bucket[a].len > bucket[b].len
+			})
+		}
+	}
 }
 
-// replaceASIMSimple replaces a simple ASIM function (no parentheses) with ASIMResult
-// It properly checks word boundaries to avoid partial matches
-func replaceASIMSimple(query string, funcName string) string {
-	var result strings.Builder
-	lowerFunc := strings.ToLower(funcName)
-	i := 0
+// replaceASIMFunctions replaces ASIM function calls with dummy table references.
+// Handles both simple calls (imAuthentication) and parameterised calls
+// (_Im_Dns(param=value)) in a single pass over the query.
+func replaceASIMFunctions(query string) string {
+	lowerQuery := strings.ToLower(query)
+	qLen := len(query)
 
-	for i < len(query) {
-		// Check if we have a match at this position
-		if i+len(funcName) <= len(query) {
-			candidate := strings.ToLower(query[i : i+len(funcName)])
-			if candidate == lowerFunc {
-				// Check word boundary before
-				validBefore := i == 0 || !isIdentChar(query[i-1])
-				// Check word boundary after
-				afterIdx := i + len(funcName)
-				validAfter := afterIdx >= len(query) ||
-					(!isIdentChar(query[afterIdx]) && query[afterIdx] != '(')
+	var b strings.Builder
+	b.Grow(qLen)
+	lastCopied := 0
+	changed := false
 
-				if validBefore && validAfter {
-					// Replace this occurrence
-					result.WriteString("ASIMResult")
-					i = afterIdx
-					continue
-				}
-			}
+	for i := 0; i < qLen; {
+		// Word-boundary check before: the character preceding this position
+		// must not be an identifier character.
+		if i > 0 && isIdentChar(query[i-1]) {
+			i++
+			continue
 		}
-		result.WriteByte(query[i])
-		i++
+
+		// Look up candidate ASIM names by the lowercase byte at position i.
+		bucket := asimByFirstByte[lowerQuery[i]]
+		if len(bucket) == 0 {
+			i++
+			continue
+		}
+
+		matched := false
+		for _, entry := range bucket {
+			end := i + entry.len
+			if end > qLen {
+				continue
+			}
+			if lowerQuery[i:end] != entry.lower {
+				continue
+			}
+
+			// We have a case-insensitive match.  Decide whether this is a
+			// function-call form  func(...)  or a simple (bare) usage.
+
+			// Skip optional whitespace after the function name to look for '('.
+			parenPos := end
+			for parenPos < qLen && (query[parenPos] == ' ' || query[parenPos] == '\t' || query[parenPos] == '\n') {
+				parenPos++
+			}
+
+			if parenPos < qLen && query[parenPos] == '(' {
+				// ── function-call form: replace func(...) ──
+				depth := 1
+				closeParen := parenPos + 1
+				for closeParen < qLen && depth > 0 {
+					if query[closeParen] == '(' {
+						depth++
+					} else if query[closeParen] == ')' {
+						depth--
+					}
+					closeParen++
+				}
+				if depth != 0 {
+					// Unbalanced parens — skip this match entirely.
+					i = end
+					matched = true
+					break
+				}
+
+				b.WriteString(query[lastCopied:i])
+				b.WriteString("ASIMResult")
+				lastCopied = closeParen
+				i = closeParen
+				changed = true
+				matched = true
+				break
+			}
+
+			// ── simple (bare) form ──
+			// Word-boundary check after: next char must not be an ident char
+			// (and must not be '(' which was already handled above).
+			if end < qLen && isIdentChar(query[end]) {
+				continue // partial match of a longer identifier — try next entry
+			}
+
+			b.WriteString(query[lastCopied:i])
+			b.WriteString("ASIMResult")
+			lastCopied = end
+			i = end
+			changed = true
+			matched = true
+			break
+		}
+
+		if !matched {
+			i++
+		}
 	}
 
-	return result.String()
-}
-
-// replaceASIMFunctionCall replaces a specific ASIM function call with parameters
-func replaceASIMFunctionCall(query string, funcName string) string {
-	result := query
-	lowerFunc := strings.ToLower(funcName)
-
-	for {
-		lowerResult := strings.ToLower(result)
-		idx := strings.Index(lowerResult, lowerFunc)
-		if idx == -1 {
-			break
-		}
-
-		// Verify this is a word boundary (not part of a larger identifier)
-		if idx > 0 {
-			prevChar := result[idx-1]
-			if isIdentChar(prevChar) {
-				// Not a word boundary, try to find another occurrence
-				searchStart := idx + len(funcName)
-				if searchStart >= len(result) {
-					break
-				}
-				remaining := strings.Index(lowerResult[searchStart:], lowerFunc)
-				if remaining == -1 {
-					break
-				}
-				idx = searchStart + remaining
-				// Re-check boundary
-				if idx > 0 && isIdentChar(result[idx-1]) {
-					break
-				}
-			}
-		}
-
-		// Skip whitespace after function name to find (
-		parenPos := idx + len(funcName)
-		for parenPos < len(result) && (result[parenPos] == ' ' || result[parenPos] == '\t' || result[parenPos] == '\n') {
-			parenPos++
-		}
-
-		// Check if we have an opening paren
-		if parenPos >= len(result) || result[parenPos] != '(' {
-			// No paren, handled by replaceASIMSimple
-			break
-		}
-
-		// Find the matching closing paren
-		depth := 1
-		closeParen := parenPos + 1
-		for closeParen < len(result) && depth > 0 {
-			if result[closeParen] == '(' {
-				depth++
-			} else if result[closeParen] == ')' {
-				depth--
-			}
-			closeParen++
-		}
-		if depth != 0 {
-			break
-		}
-
-		// Replace the function call with ASIMResult
-		result = result[:idx] + "ASIMResult" + result[closeParen:]
+	if !changed {
+		return query
 	}
-	return result
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // replaceDatatableWithData replaces datatable(...) [ data ] with a dummy table reference
 // This handles inline data definitions that conflict with the lexer's QUOTED_IDENTIFIER rule
 func replaceDatatableWithData(query string) string {
-	result := query
+	lowerQuery := strings.ToLower(query)
+	var b strings.Builder
+	b.Grow(len(query))
+	lastCopied := 0
+	changed := false
+	searchFrom := 0
+
 	for {
-		idx := strings.Index(strings.ToLower(result), "datatable")
+		idx := strings.Index(lowerQuery[searchFrom:], "datatable")
 		if idx == -1 {
 			break
 		}
+		idx += searchFrom
+
 		// Find the opening paren
-		openParen := strings.Index(result[idx:], "(")
-		if openParen == -1 {
+		openParenRel := strings.Index(query[idx:], "(")
+		if openParenRel == -1 {
 			break
 		}
-		openParen += idx
+		openParen := idx + openParenRel
 
 		// Find the matching closing paren for the column definition
 		depth := 1
 		closeParen := openParen + 1
-		for closeParen < len(result) && depth > 0 {
-			if result[closeParen] == '(' {
+		for closeParen < len(query) && depth > 0 {
+			if query[closeParen] == '(' {
 				depth++
-			} else if result[closeParen] == ')' {
+			} else if query[closeParen] == ')' {
 				depth--
 			}
 			closeParen++
@@ -2987,19 +3143,19 @@ func replaceDatatableWithData(query string) string {
 		// Now look for the data block: [ ... ]
 		// Skip whitespace after closing paren
 		dataStart := closeParen
-		for dataStart < len(result) && (result[dataStart] == ' ' || result[dataStart] == '\t' || result[dataStart] == '\n' || result[dataStart] == '\r') {
+		for dataStart < len(query) && (query[dataStart] == ' ' || query[dataStart] == '\t' || query[dataStart] == '\n' || query[dataStart] == '\r') {
 			dataStart++
 		}
 
 		// Check if there's a bracket data block
-		if dataStart < len(result) && result[dataStart] == '[' {
+		if dataStart < len(query) && query[dataStart] == '[' {
 			// Find the closing bracket
 			bracketDepth := 1
 			dataEnd := dataStart + 1
 			inString := false
 			stringChar := byte(0)
-			for dataEnd < len(result) && bracketDepth > 0 {
-				c := result[dataEnd]
+			for dataEnd < len(query) && bracketDepth > 0 {
+				c := query[dataEnd]
 				if !inString {
 					if c == '"' || c == '\'' {
 						inString = true
@@ -3010,7 +3166,7 @@ func replaceDatatableWithData(query string) string {
 						bracketDepth--
 					}
 				} else {
-					if c == stringChar && (dataEnd == 0 || result[dataEnd-1] != '\\') {
+					if c == stringChar && (dataEnd == 0 || query[dataEnd-1] != '\\') {
 						inString = false
 					}
 				}
@@ -3019,7 +3175,11 @@ func replaceDatatableWithData(query string) string {
 
 			if bracketDepth == 0 {
 				// Replace datatable(...) [ data ] with DatatableResult
-				result = result[:idx] + "DatatableResult" + result[dataEnd:]
+				b.WriteString(query[lastCopied:idx])
+				b.WriteString("DatatableResult")
+				lastCopied = dataEnd
+				searchFrom = dataEnd
+				changed = true
 				continue
 			}
 		}
@@ -3027,24 +3187,40 @@ func replaceDatatableWithData(query string) string {
 		// No bracket data, just move past this datatable
 		break
 	}
-	return result
+
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // replaceArgFunction replaces arg("...").Table patterns with just Table
 // Azure Resource Graph uses arg("subscription-id").Resources for cross-workspace queries
 func replaceArgFunction(query string) string {
-	result := query
+	lowerQuery := strings.ToLower(query)
+	var b strings.Builder
+	b.Grow(len(query))
+	lastCopied := 0
+	changed := false
+	searchFrom := 0
+
 	for {
 		// Find arg( at word boundary
-		idx := strings.Index(strings.ToLower(result), "arg(")
+		idx := strings.Index(lowerQuery[searchFrom:], "arg(")
 		if idx == -1 {
 			break
 		}
+		idx += searchFrom
 
 		// Check it's at word boundary
-		if idx > 0 && isIdentChar(result[idx-1]) {
-			// Not at word boundary, skip this occurrence
-			result = result[:idx] + "___" + result[idx+3:]
+		if idx > 0 && isIdentChar(query[idx-1]) {
+			// Not at word boundary, skip this occurrence — replace "arg" with "___" in output
+			b.WriteString(query[lastCopied:idx])
+			b.WriteString("___")
+			lastCopied = idx + 3
+			searchFrom = idx + 4
+			changed = true
 			continue
 		}
 
@@ -3052,16 +3228,16 @@ func replaceArgFunction(query string) string {
 		openParen := idx + 3 // position of (
 		depth := 1
 		closeParen := openParen + 1
-		for closeParen < len(result) && depth > 0 {
-			if result[closeParen] == '(' {
+		for closeParen < len(query) && depth > 0 {
+			if query[closeParen] == '(' {
 				depth++
-			} else if result[closeParen] == ')' {
+			} else if query[closeParen] == ')' {
 				depth--
-			} else if result[closeParen] == '"' {
+			} else if query[closeParen] == '"' {
 				// Skip string
 				closeParen++
-				for closeParen < len(result) && result[closeParen] != '"' {
-					if result[closeParen] == '\\' {
+				for closeParen < len(query) && query[closeParen] != '"' {
+					if query[closeParen] == '\\' {
 						closeParen++
 					}
 					closeParen++
@@ -3074,39 +3250,58 @@ func replaceArgFunction(query string) string {
 		}
 
 		// Check if followed by .
-		if closeParen < len(result) && result[closeParen] == '.' {
-			// Remove the entire arg(...). prefix
-			result = result[:idx] + result[closeParen+1:]
+		if closeParen < len(query) && query[closeParen] == '.' {
+			// Remove the entire arg(...). prefix — keep what's after the dot
+			b.WriteString(query[lastCopied:idx])
+			lastCopied = closeParen + 1
+			searchFrom = closeParen + 1
 		} else {
-			// No dot after, just skip
-			result = result[:idx] + "ArgResult" + result[closeParen:]
+			// No dot after, replace with ArgResult
+			b.WriteString(query[lastCopied:idx])
+			b.WriteString("ArgResult")
+			lastCopied = closeParen
+			searchFrom = closeParen
 		}
+		changed = true
 	}
-	return result
+
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // replaceExternalData replaces externaldata(...) [...] with (...) with a dummy table reference
 // Full syntax: externaldata (Column:Type, ...) [ @"url" ] with (option=value)
 func replaceExternalData(query string) string {
-	result := query
+	lowerQuery := strings.ToLower(query)
+	var b strings.Builder
+	b.Grow(len(query))
+	lastCopied := 0
+	changed := false
+	searchFrom := 0
+
 	for {
-		idx := strings.Index(strings.ToLower(result), "externaldata")
+		idx := strings.Index(lowerQuery[searchFrom:], "externaldata")
 		if idx == -1 {
 			break
 		}
+		idx += searchFrom
+
 		// Find the matching closing parenthesis after externaldata(
-		openParen := strings.Index(result[idx:], "(")
-		if openParen == -1 {
+		openParenRel := strings.Index(query[idx:], "(")
+		if openParenRel == -1 {
 			break
 		}
-		openParen += idx
+		openParen := idx + openParenRel
 
 		depth := 1
 		closeParen := openParen + 1
-		for closeParen < len(result) && depth > 0 {
-			if result[closeParen] == '(' {
+		for closeParen < len(query) && depth > 0 {
+			if query[closeParen] == '(' {
 				depth++
-			} else if result[closeParen] == ')' {
+			} else if query[closeParen] == ')' {
 				depth--
 			}
 			closeParen++
@@ -3118,40 +3313,40 @@ func replaceExternalData(query string) string {
 		// Now look for the data source block: [ ... ]
 		end := closeParen
 		// Skip whitespace
-		for end < len(result) && (result[end] == ' ' || result[end] == '\t' || result[end] == '\n' || result[end] == '\r') {
+		for end < len(query) && (query[end] == ' ' || query[end] == '\t' || query[end] == '\n' || query[end] == '\r') {
 			end++
 		}
 		// Check for [ ... ] data source
-		if end < len(result) && result[end] == '[' {
+		if end < len(query) && query[end] == '[' {
 			bracketDepth := 1
 			end++
-			for end < len(result) && bracketDepth > 0 {
-				if result[end] == '[' {
+			for end < len(query) && bracketDepth > 0 {
+				if query[end] == '[' {
 					bracketDepth++
-				} else if result[end] == ']' {
+				} else if query[end] == ']' {
 					bracketDepth--
 				}
 				end++
 			}
 			// Skip whitespace after ]
-			for end < len(result) && (result[end] == ' ' || result[end] == '\t' || result[end] == '\n' || result[end] == '\r') {
+			for end < len(query) && (query[end] == ' ' || query[end] == '\t' || query[end] == '\n' || query[end] == '\r') {
 				end++
 			}
 			// Check for 'with' clause: with (...)
-			if end+4 < len(result) && strings.ToLower(result[end:end+4]) == "with" {
+			if end+4 < len(query) && lowerQuery[end:end+4] == "with" {
 				end += 4
 				// Skip whitespace
-				for end < len(result) && (result[end] == ' ' || result[end] == '\t' || result[end] == '\n' || result[end] == '\r') {
+				for end < len(query) && (query[end] == ' ' || query[end] == '\t' || query[end] == '\n' || query[end] == '\r') {
 					end++
 				}
 				// Find ( ... )
-				if end < len(result) && result[end] == '(' {
+				if end < len(query) && query[end] == '(' {
 					withDepth := 1
 					end++
-					for end < len(result) && withDepth > 0 {
-						if result[end] == '(' {
+					for end < len(query) && withDepth > 0 {
+						if query[end] == '(' {
 							withDepth++
-						} else if result[end] == ')' {
+						} else if query[end] == ')' {
 							withDepth--
 						}
 						end++
@@ -3161,9 +3356,18 @@ func replaceExternalData(query string) string {
 		}
 
 		// Replace entire externaldata expression with ExtDataResult
-		result = result[:idx] + "ExtDataResult" + result[end:]
+		b.WriteString(query[lastCopied:idx])
+		b.WriteString("ExtDataResult")
+		lastCopied = end
+		searchFrom = end
+		changed = true
 	}
-	return result
+
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // stripDocumentationPreamble removes documentation wrappers from queries
@@ -3329,35 +3533,37 @@ func stripDocumentationPreamble(query string) string {
 // stripDeclareStatements removes declare query_parameters(...) statements
 // These define query parameters but aren't part of the actual query
 func stripDeclareStatements(query string) string {
-	result := query
-	lowerResult := strings.ToLower(result)
+	lowerQuery := strings.ToLower(query)
+	var b strings.Builder
+	b.Grow(len(query))
+	lastCopied := 0
+	changed := false
+	searchFrom := 0
 
 	// Find "declare query_parameters"
 	for {
-		idx := strings.Index(lowerResult, "declare query_parameters")
-		if idx == -1 {
-			idx = strings.Index(lowerResult, "declare query_parameters")
-		}
+		idx := strings.Index(lowerQuery[searchFrom:], "declare query_parameters")
 		if idx == -1 {
 			break
 		}
+		idx += searchFrom
 
 		// Find the opening paren
 		parenStart := idx + 24
-		for parenStart < len(result) && result[parenStart] != '(' {
+		for parenStart < len(query) && query[parenStart] != '(' {
 			parenStart++
 		}
-		if parenStart >= len(result) {
+		if parenStart >= len(query) {
 			break
 		}
 
 		// Find matching closing paren
 		depth := 1
 		parenEnd := parenStart + 1
-		for parenEnd < len(result) && depth > 0 {
-			if result[parenEnd] == '(' {
+		for parenEnd < len(query) && depth > 0 {
+			if query[parenEnd] == '(' {
 				depth++
-			} else if result[parenEnd] == ')' {
+			} else if query[parenEnd] == ')' {
 				depth--
 			}
 			parenEnd++
@@ -3365,19 +3571,25 @@ func stripDeclareStatements(query string) string {
 
 		// Find semicolon after close paren
 		end := parenEnd
-		for end < len(result) && (result[end] == ' ' || result[end] == '\t' || result[end] == '\n' || result[end] == '\r') {
+		for end < len(query) && (query[end] == ' ' || query[end] == '\t' || query[end] == '\n' || query[end] == '\r') {
 			end++
 		}
-		if end < len(result) && result[end] == ';' {
+		if end < len(query) && query[end] == ';' {
 			end++
 		}
 
 		// Remove the entire declare statement
-		result = result[:idx] + result[end:]
-		lowerResult = strings.ToLower(result)
+		b.WriteString(query[lastCopied:idx])
+		lastCopied = end
+		searchFrom = end
+		changed = true
 	}
 
-	return strings.TrimLeft(result, " \t\n\r")
+	if !changed {
+		return strings.TrimLeft(query, " \t\n\r")
+	}
+	b.WriteString(query[lastCopied:])
+	return strings.TrimLeft(b.String(), " \t\n\r")
 }
 
 // stripLeadingComments removes leading // and # comments and URLs from a query
@@ -3429,18 +3641,36 @@ func replaceParameters(query string) string {
 
 	// Handle double curly braces {{param}} (Jinja2/Sentinel/Logic Apps style)
 	// Convert to single curly braces first, then let regular handling take over
-	for {
-		start := strings.Index(result, "{{")
-		if start == -1 {
-			break
+	{
+		var b strings.Builder
+		b.Grow(len(result))
+		lastCopied := 0
+		dcChanged := false
+		searchFrom := 0
+		for {
+			start := strings.Index(result[searchFrom:], "{{")
+			if start == -1 {
+				break
+			}
+			start += searchFrom
+			end := strings.Index(result[start+2:], "}}")
+			if end == -1 {
+				break
+			}
+			end += start + 2
+			// Replace {{param}} with {param}
+			b.WriteString(result[lastCopied:start])
+			b.WriteByte('{')
+			b.WriteString(result[start+2 : end])
+			b.WriteByte('}')
+			lastCopied = end + 2
+			searchFrom = lastCopied
+			dcChanged = true
 		}
-		end := strings.Index(result[start+2:], "}}")
-		if end == -1 {
-			break
+		if dcChanged {
+			b.WriteString(result[lastCopied:])
+			result = b.String()
 		}
-		end += start + 2
-		// Replace {{param}} with {param}
-		result = result[:start] + "{" + result[start+2:end] + "}" + result[end+2:]
 	}
 
 	for param, value := range replacements {
@@ -3499,11 +3729,18 @@ func replaceTimeRangeParams(query string) string {
 	timeParams := []string{"{TimeRange}", "{timerange}", "{Timerange}", "{timeRange}"}
 
 	for _, param := range timeParams {
+		var b strings.Builder
+		b.Grow(len(result))
+		lastCopied := 0
+		changed := false
+		searchFrom := 0
+
 		for {
-			idx := strings.Index(result, param)
+			idx := strings.Index(result[searchFrom:], param)
 			if idx == -1 {
 				break
 			}
+			idx += searchFrom
 
 			// Check context - what's before the parameter?
 			beforeParam := strings.TrimSpace(result[:idx])
@@ -3522,7 +3759,16 @@ func replaceTimeRangeParams(query string) string {
 				replacement = "1d"
 			}
 
-			result = result[:idx] + replacement + result[idx+len(param):]
+			b.WriteString(result[lastCopied:idx])
+			b.WriteString(replacement)
+			lastCopied = idx + len(param)
+			searchFrom = lastCopied
+			changed = true
+		}
+
+		if changed {
+			b.WriteString(result[lastCopied:])
+			result = b.String()
 		}
 	}
 
@@ -3547,35 +3793,45 @@ func renameReservedFieldNames(query string) string {
 
 // renameFieldWord replaces a word when used as a field name (not as a keyword)
 func renameFieldWord(query, word, replacement string) string {
-	result := query
 	wordLen := len(word)
+	var b strings.Builder
+	b.Grow(len(query) + 32) // allow some growth for replacements
+	lastCopied := 0
+	changed := false
 
 	// Scan through the query looking for the word
 	i := 0
-	for i < len(result)-wordLen {
+	for i < len(query)-wordLen {
 		// Check if we have the word at position i (case-insensitive)
-		if strings.EqualFold(result[i:i+wordLen], word) {
+		if strings.EqualFold(query[i:i+wordLen], word) {
 			// Check preceding character - should be whitespace, comma, or operator
-			prevOk := i == 0 || result[i-1] == ' ' || result[i-1] == '\t' || result[i-1] == '\n' ||
-				result[i-1] == ',' || result[i-1] == '(' || result[i-1] == '|'
+			prevOk := i == 0 || query[i-1] == ' ' || query[i-1] == '\t' || query[i-1] == '\n' ||
+				query[i-1] == ',' || query[i-1] == '(' || query[i-1] == '|'
 
 			// Check following character - should be whitespace or operator (not alphanumeric)
 			afterIdx := i + wordLen
-			afterOk := afterIdx >= len(result) ||
-				result[afterIdx] == ' ' || result[afterIdx] == '\t' || result[afterIdx] == '\n' ||
-				result[afterIdx] == '!' || result[afterIdx] == '=' || result[afterIdx] == ',' ||
-				result[afterIdx] == ')' || result[afterIdx] == '|' || result[afterIdx] == '.' ||
-				result[afterIdx] == '[' || result[afterIdx] == '<' || result[afterIdx] == '>'
+			afterOk := afterIdx >= len(query) ||
+				query[afterIdx] == ' ' || query[afterIdx] == '\t' || query[afterIdx] == '\n' ||
+				query[afterIdx] == '!' || query[afterIdx] == '=' || query[afterIdx] == ',' ||
+				query[afterIdx] == ')' || query[afterIdx] == '|' || query[afterIdx] == '.' ||
+				query[afterIdx] == '[' || query[afterIdx] == '<' || query[afterIdx] == '>'
 
 			if prevOk && afterOk {
-				result = result[:i] + replacement + result[afterIdx:]
-				i += len(replacement)
+				b.WriteString(query[lastCopied:i])
+				b.WriteString(replacement)
+				lastCopied = afterIdx
+				i = afterIdx
+				changed = true
 				continue
 			}
 		}
 		i++
 	}
-	return result
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // getLastWord extracts the last identifier/word from a string
@@ -4114,8 +4370,42 @@ func (e *conditionExtractor) ExitTabularOperator(ctx *TabularOperatorContext) {
 }
 
 // EnterFunctionCall tracks when we enter a function call (countif, sumif, etc.)
-// Conditions inside function calls are aggregation expressions, not filter conditions
+// Conditions inside function calls are aggregation expressions, not filter conditions.
+// Special handling for existence-check functions: isnotempty, isnotnull, isnull, isempty.
 func (e *conditionExtractor) EnterFunctionCall(ctx *FunctionCallContext) {
+	if ctx.Identifier() != nil {
+		funcName := strings.ToLower(ctx.Identifier().GetText())
+		switch funcName {
+		case "isnotempty", "isnotnull":
+			if ctx.ArgumentList() != nil {
+				args := ctx.ArgumentList().AllArgument()
+				if len(args) >= 1 {
+					field := args[0].GetText()
+					e.conditions = append(e.conditions, Condition{
+						Field:    field,
+						Operator: "isnotnull",
+						Value:    "",
+						Negated:  e.negated,
+					})
+				}
+			}
+			return // Don't increment inFunctionCall
+		case "isnull", "isempty":
+			if ctx.ArgumentList() != nil {
+				args := ctx.ArgumentList().AllArgument()
+				if len(args) >= 1 {
+					field := args[0].GetText()
+					e.conditions = append(e.conditions, Condition{
+						Field:    field,
+						Operator: "isnull",
+						Value:    "",
+						Negated:  e.negated,
+					})
+				}
+			}
+			return // Don't increment inFunctionCall
+		}
+	}
 	e.inFunctionCall++
 }
 
