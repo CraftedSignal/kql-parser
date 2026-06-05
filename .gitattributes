@@ -1,0 +1,2 @@
+testdata/generated/*.json filter=lfs diff=lfs merge=lfs -text
+testdata/generated/*.jsonl filter=lfs diff=lfs merge=lfs -text

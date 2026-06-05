@@ -20,17 +20,17 @@ type Condition struct {
 	Value        string   `json:"value"`
 	Negated      bool     `json:"negated"`
 	PipeStage    int      `json:"pipe_stage"`
-	LogicalOp    string   `json:"logical_op"`              // "AND" or "OR" connecting to previous condition
-	Alternatives []string `json:"alternatives,omitempty"`  // For OR conditions on same field
-	IsComputed   bool     `json:"is_computed,omitempty"`   // True if field was created by extend/project
-	SourceField  string   `json:"source_field,omitempty"`  // Original field before transformation (for computed fields)
+	LogicalOp    string   `json:"logical_op"`             // "AND" or "OR" connecting to previous condition
+	Alternatives []string `json:"alternatives,omitempty"` // For OR conditions on same field
+	IsComputed   bool     `json:"is_computed,omitempty"`  // True if field was created by extend/project
+	SourceField  string   `json:"source_field,omitempty"` // Original field before transformation (for computed fields)
 }
 
 // ParseResult contains all conditions extracted from the query
 type ParseResult struct {
 	Conditions      []Condition       `json:"conditions"`
 	ComputedFields  map[string]string `json:"computed_fields,omitempty"`  // Map of computed field name -> source field (from extend)
-	GroupByFields   []string          `json:"group_by_fields,omitempty"` // Fields from summarize BY clauses
+	GroupByFields   []string          `json:"group_by_fields,omitempty"`  // Fields from summarize BY clauses
 	Commands        []string          `json:"commands,omitempty"`         // List of commands used in the query (summarize, extend, etc.)
 	ProjectedFields []string          `json:"projected_fields,omitempty"` // Fields selected by project operators
 	Joins           []JoinInfo        `json:"joins,omitempty"`
@@ -83,19 +83,19 @@ var kqlKeywords = map[string]bool{
 // conditionExtractor walks the parse tree to extract conditions
 type conditionExtractor struct {
 	*BaseKQLParserListener
-	conditions     []Condition
-	computedFields map[string]string // Fields created by extend/project: computed field -> source field
-	groupByFields  []string          // Fields from summarize BY clauses
+	conditions      []Condition
+	computedFields  map[string]string // Fields created by extend/project: computed field -> source field
+	groupByFields   []string          // Fields from summarize BY clauses
 	commands        []string          // Commands used in the query
 	projectedFields []string          // Fields selected by project operators
 	joins           []JoinInfo
-	currentStage   int
-	inSubquery     int // depth of subquery nesting
-	inFunctionCall int // depth of function call nesting (countif, sumif, etc.)
-	negated        bool
-	lastLogicalOp  string
-	errors         []string
-	originalQuery  string // normalized query text for extracting subexpressions
+	currentStage    int
+	inSubquery      int // depth of subquery nesting
+	inFunctionCall  int // depth of function call nesting (countif, sumif, etc.)
+	negated         bool
+	lastLogicalOp   string
+	errors          []string
+	originalQuery   string // normalized query text for extracting subexpressions
 }
 
 // errorListener collects parse errors
@@ -4596,7 +4596,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 		addExprs := ctx.AllAdditiveExpression()
 		if len(addExprs) >= 1 && ctx.ExpressionList() != nil {
 			leftText := addExprs[0].GetText()
-			isNegated := hasNOT_IN || hasNOT_IN_CS || e.negated
+			isNegated := (hasNOT_IN || hasNOT_IN_CS) != e.negated
 			e.handleInOperator(leftText, ctx.ExpressionList(), isNegated)
 		}
 		return
@@ -4609,7 +4609,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 			leftText := addExprs[0].GetText()
 			lowValue := addExprs[1].GetText()
 			highValue := addExprs[2].GetText()
-			isNegated := ctx.NOT_BETWEEN() != nil || e.negated
+			isNegated := (ctx.NOT_BETWEEN() != nil) != e.negated
 			e.handleBetweenOperator(leftText, lowValue, highValue, isNegated)
 		}
 		return
@@ -4928,15 +4928,14 @@ func groupORConditions(conditions []Condition) []Condition {
 		cond := conditions[i]
 
 		// Look ahead for OR conditions on the same field
-		if i+1 < len(conditions) && conditions[i+1].LogicalOp == "OR" {
-			fieldLower := strings.ToLower(cond.Field)
-			alternatives := []string{cond.Value}
+		if i+1 < len(conditions) && conditions[i+1].LogicalOp == "OR" && sameConditionGroup(cond, conditions[i+1]) {
+			alternatives := conditionAlternatives(cond)
 
 			j := i + 1
 			for j < len(conditions) {
 				next := conditions[j]
-				if next.LogicalOp == "OR" && strings.ToLower(next.Field) == fieldLower && next.Operator == cond.Operator {
-					alternatives = append(alternatives, next.Value)
+				if next.LogicalOp == "OR" && sameConditionGroup(cond, next) {
+					alternatives = append(alternatives, conditionAlternatives(next)...)
 					j++
 				} else {
 					break
@@ -4944,7 +4943,7 @@ func groupORConditions(conditions []Condition) []Condition {
 			}
 
 			if len(alternatives) > 1 {
-				cond.Alternatives = alternatives
+				cond.Alternatives = deduplicateConditionValues(alternatives)
 				result = append(result, cond)
 				i = j - 1 // skip the grouped conditions
 				continue
@@ -4955,6 +4954,50 @@ func groupORConditions(conditions []Condition) []Condition {
 	}
 
 	return result
+}
+
+func sameConditionGroup(a, b Condition) bool {
+	return strings.EqualFold(a.Field, b.Field) &&
+		a.Operator == b.Operator &&
+		a.Negated == b.Negated &&
+		a.IsComputed == b.IsComputed &&
+		strings.EqualFold(a.SourceField, b.SourceField)
+}
+
+func conditionAlternatives(cond Condition) []string {
+	if len(cond.Alternatives) > 0 {
+		return append([]string(nil), cond.Alternatives...)
+	}
+	return []string{cond.Value}
+}
+
+func deduplicateConditionValues(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if !seen[value] {
+			seen[value] = true
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+func conditionDedupKey(cond Condition) string {
+	return strings.ToLower(cond.Field) + "|" +
+		cond.Operator + "|" +
+		cond.Value + "|" +
+		boolKey(cond.Negated) + "|" +
+		boolKey(cond.IsComputed) + "|" +
+		strings.ToLower(cond.SourceField) + "|" +
+		strings.Join(cond.Alternatives, "\x00")
+}
+
+func boolKey(value bool) string {
+	if value {
+		return "1"
+	}
+	return "0"
 }
 
 // DeduplicateConditions removes duplicate conditions, keeping the latest pipe stage
@@ -4990,7 +5033,7 @@ func DeduplicateConditions(conditions []Condition) []Condition {
 		// Keep only conditions from max stage
 		for _, cond := range conds {
 			if cond.PipeStage == maxStage {
-				key := strings.ToLower(cond.Field) + "|" + cond.Operator + "|" + cond.Value
+				key := conditionDedupKey(cond)
 				if !seen[key] {
 					seen[key] = true
 					result = append(result, cond)
@@ -5042,12 +5085,12 @@ func HasComplexWhereConditions(result *ParseResult) bool {
 	// Check for conditions with complex operators
 	// KQL complex operators: matches regex, ipv4_is_in_range, etc.
 	complexOperators := map[string]bool{
-		"matches":            true, // regex matching
-		"matches_regex":      true, // explicit regex
-		"ipv4_is_in_range":   true, // CIDR matching (equivalent to SPL cidrmatch)
-		"ipv6_is_in_range":   true, // IPv6 CIDR matching
-		"has_any":            true, // dynamic list matching
-		"has_all":            true, // dynamic list matching
+		"matches":          true, // regex matching
+		"matches_regex":    true, // explicit regex
+		"ipv4_is_in_range": true, // CIDR matching (equivalent to SPL cidrmatch)
+		"ipv6_is_in_range": true, // IPv6 CIDR matching
+		"has_any":          true, // dynamic list matching
+		"has_all":          true, // dynamic list matching
 	}
 
 	for _, cond := range result.Conditions {

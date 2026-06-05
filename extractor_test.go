@@ -292,18 +292,18 @@ func TestExtractConditions_ExtendedFields(t *testing.T) {
 
 func TestExtractConditions_NotExpression(t *testing.T) {
 	tests := []struct {
-		name        string
-		query       string
+		name          string
+		query         string
 		expectNegated bool
 	}{
 		{
-			name:        "NOT before condition",
-			query:       "SecurityEvent | where not(EventID == 4624)",
+			name:          "NOT before condition",
+			query:         "SecurityEvent | where not(EventID == 4624)",
 			expectNegated: true,
 		},
 		{
-			name:        "without NOT",
-			query:       "SecurityEvent | where EventID == 4624",
+			name:          "without NOT",
+			query:         "SecurityEvent | where EventID == 4624",
 			expectNegated: false,
 		},
 	}
@@ -527,6 +527,62 @@ func TestGroupORConditions(t *testing.T) {
 
 	if result[1].Field != "Status" {
 		t.Errorf("Expected second condition to be Status, got %s", result[1].Field)
+	}
+}
+
+func TestGroupORConditionsPreservesAlternativesAndNegation(t *testing.T) {
+	conditions := []Condition{
+		{Field: "AccountName", Operator: "==", Value: "admin", Alternatives: []string{"admin", "root"}, Negated: true, LogicalOp: "AND"},
+		{Field: "AccountName", Operator: "==", Value: "SYSTEM", Alternatives: []string{"SYSTEM", "svc_*"}, Negated: true, LogicalOp: "OR"},
+		{Field: "AccountName", Operator: "==", Value: "guest", Negated: false, LogicalOp: "OR"},
+	}
+
+	result := groupORConditions(conditions)
+	if len(result) != 2 {
+		t.Fatalf("Expected 2 conditions after grouping, got %d: %+v", len(result), result)
+	}
+	if !result[0].Negated {
+		t.Fatalf("Expected first grouped condition to stay negated: %+v", result[0])
+	}
+	seen := make(map[string]bool)
+	for _, value := range result[0].Alternatives {
+		seen[value] = true
+	}
+	for _, expected := range []string{"admin", "root", "SYSTEM", "svc_*"} {
+		if !seen[expected] {
+			t.Errorf("Expected alternative %q in %+v", expected, result[0])
+		}
+	}
+	if result[1].Negated || result[1].Value != "guest" {
+		t.Fatalf("Expected positive AccountName=guest to remain separate, got %+v", result[1])
+	}
+}
+
+func TestDeduplicateConditionsPreservesNegatedVariant(t *testing.T) {
+	conditions := []Condition{
+		{Field: "Status", Operator: "==", Value: "Success", PipeStage: 1},
+		{Field: "Status", Operator: "==", Value: "Success", Negated: true, PipeStage: 1},
+	}
+
+	result := DeduplicateConditions(conditions)
+	if len(result) != 2 {
+		t.Fatalf("Expected positive and negated variants to survive dedup, got %+v", result)
+	}
+}
+
+func TestNotOfNotInCancelsNegation(t *testing.T) {
+	result := ExtractConditions(`SecurityEvent | where not(Status !in ("Failed", "Error"))`)
+	if len(result.Errors) > 0 {
+		t.Fatalf("Unexpected parse errors: %v", result.Errors)
+	}
+	if len(result.Conditions) != 1 {
+		t.Fatalf("Expected one grouped IN condition, got %+v", result.Conditions)
+	}
+	if result.Conditions[0].Negated {
+		t.Fatalf("Expected outer NOT and !in to cancel, got %+v", result.Conditions)
+	}
+	if len(result.Conditions[0].Alternatives) != 2 {
+		t.Fatalf("Expected grouped alternatives to survive, got %+v", result.Conditions[0])
 	}
 }
 
