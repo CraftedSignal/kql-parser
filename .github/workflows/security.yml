@@ -35,6 +35,7 @@ jobs:
         with:
           go-version-input: ${{ steps.vars.outputs.go_version }}
           go-package: ./...
+          repo-checkout: false
 
   trivy:
     name: trivy
