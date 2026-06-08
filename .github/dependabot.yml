@@ -3,26 +3,41 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "daily"
+      interval: "weekly"
+      day: "monday"
       time: "04:00"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(cicd):"
+    groups:
+      github-actions-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: "gomod"
     directory: "/"
     schedule:
-      interval: "daily"
+      interval: "weekly"
+      day: "monday"
       time: "04:00"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(go):"
+    groups:
+      go-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: "docker"
     directory: "/.github/go/"
     schedule:
-      interval: "daily"
+      interval: "weekly"
+      day: "monday"
       time: "04:00"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(go):"
+    groups:
+      go-docker-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
