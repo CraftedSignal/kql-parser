@@ -147,6 +147,194 @@ func TestExtractConditions_StringOperators(t *testing.T) {
 	}
 }
 
+func TestExtractConditions_PortableKeywordExtraction(t *testing.T) {
+	tests := []struct {
+		name       string
+		query      string
+		want       string
+		wantSource string
+	}{
+		{
+			name:       "search in keyword",
+			query:      "search in (OfficeActivity) \"username\"\n| project hash_sha256(\"file.exe\")",
+			want:       "username",
+			wantSource: "OfficeActivity",
+		},
+		{
+			name:  "prose-like query",
+			query: "# Documentation only\n\nThis entry has no query yet.",
+			want:  "# Documentation only This entry has no query yet.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ExtractConditions(tt.query)
+			if len(result.Conditions) != 1 {
+				t.Fatalf("expected one keyword extraction condition, got %d: %+v errors=%v", len(result.Conditions), result.Conditions, result.Errors)
+			}
+			got := result.Conditions[0]
+			if got.Field != "_keyword_" {
+				t.Fatalf("expected _keyword_ field, got %q", got.Field)
+			}
+			if got.Operator != "contains" {
+				t.Fatalf("expected contains operator, got %q", got.Operator)
+			}
+			if got.Value != tt.want {
+				t.Fatalf("expected value %q, got %q", tt.want, got.Value)
+			}
+			if !containsString(result.Errors, portableKeywordExtractionNote) {
+				t.Fatalf("expected parser-native keyword extraction note, got %v", result.Errors)
+			}
+			if tt.wantSource != "" && !containsString(result.DataSources, tt.wantSource) {
+				t.Fatalf("expected datasource %q, got %v", tt.wantSource, result.DataSources)
+			}
+		})
+	}
+}
+
+func TestExtractConditions_ExternalDataProjectionStructure(t *testing.T) {
+	query := `let CFPhishing=externaldata(Url:string)
+[h'https://gist.githubusercontent.com/whichbuffer/4dab8a4d4ce4fea0dbfe73b7e3c3f6a7/raw/df8993ea4ebdb069905ec7c4f22531299759e55a/PhishingDomains'];
+CFPhishing
+| extend Domains = extract(@"https?://([^/]+)", 1, Url)
+| project Domains`
+
+	result := ExtractConditions(query)
+	if containsString(result.DataSources, "externaldata") {
+		t.Fatalf("externaldata operator must not be treated as datasource: %v", result.DataSources)
+	}
+	for _, condition := range result.Conditions {
+		if condition.Field == "_keyword_" && condition.Value == "CFPhishing" {
+			t.Fatalf("externaldata alias must not be converted to keyword search: %+v", result.Conditions)
+		}
+	}
+	assertLetStatement(t, result.LetStatements, "CFPhishing", `externaldata(Url:string)
+[h'https://gist.githubusercontent.com/whichbuffer/4dab8a4d4ce4fea0dbfe73b7e3c3f6a7/raw/df8993ea4ebdb069905ec7c4f22531299759e55a/PhishingDomains']`)
+	if result.ComputedFields["domains"] != "Url" {
+		t.Fatalf("expected Domains source field Url, got %q in %+v", result.ComputedFields["domains"], result.ComputedFields)
+	}
+	if result.ComputedExpressions["domains"] != `extract(@"https?://([^/]+)",1,Url)` {
+		t.Fatalf("expected Domains extract expression, got %q", result.ComputedExpressions["domains"])
+	}
+	if !containsString(result.ProjectedFields, "Domains") {
+		t.Fatalf("expected Domains projected field, got %v", result.ProjectedFields)
+	}
+}
+
+func TestExtractConditions_PortablePredicateExtraction(t *testing.T) {
+	query := `let IOC = dynamic(["hash-one", "hash-two"]);
+let DeviceFileHunt = (
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where MD5 in (IOC) or SHA1 in (IOC)
+    | project Timestamp, DeviceName, FileName, MD5, SHA1);
+let DeviceProcessHunt = (
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where SHA256 in (IOC)
+    | project Timestamp, DeviceName, FileName, SHA256);
+union isfuzzy=true DeviceFileHunt, DeviceProcessHunt`
+
+	result := ExtractConditions(query)
+	assertConditionAlternatives(t, result.Conditions, "MD5", "in", []string{"hash-one", "hash-two"})
+	assertConditionAlternatives(t, result.Conditions, "SHA1", "in", []string{"hash-one", "hash-two"})
+	assertConditionAlternatives(t, result.Conditions, "SHA256", "in", []string{"hash-one", "hash-two"})
+	assertConditionReference(t, result.Conditions, "MD5", "in", "IOC")
+	assertConditionReference(t, result.Conditions, "SHA1", "in", "IOC")
+	assertConditionReference(t, result.Conditions, "SHA256", "in", "IOC")
+	if !containsString(result.DataSources, "DeviceFileEvents") {
+		t.Fatalf("expected DeviceFileEvents datasource, got %v", result.DataSources)
+	}
+	if !containsString(result.DataSources, "DeviceProcessEvents") {
+		t.Fatalf("expected DeviceProcessEvents datasource, got %v", result.DataSources)
+	}
+	if !containsString(result.Errors, portablePredicateExtractionNote) {
+		t.Fatalf("expected parser-native portable predicate extraction note, got %v", result.Errors)
+	}
+	assertLetStatement(t, result.LetStatements, "IOC", `dynamic(["hash-one", "hash-two"])`)
+	assertLetStatement(t, result.LetStatements, "DeviceFileHunt", `(DeviceFileEvents
+| where Timestamp > ago(30d)
+| where MD5 in (IOC) or SHA1 in (IOC)
+| project Timestamp, DeviceName, FileName, MD5, SHA1)`)
+}
+
+func TestExtractConditions_PortablePredicateExtractionHasAny(t *testing.T) {
+	query := `let powercfg_hits = DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName == "powercfg.exe"
+| where InitiatingProcessFileName != "tsmanager.exe"
+| where ProcessCommandLine has_any ("/hibernate off", "-h off");`
+
+	result := ExtractConditions(query)
+	assertConditionValue(t, result.Conditions, "FileName", "==", "powercfg.exe")
+	assertConditionValue(t, result.Conditions, "InitiatingProcessFileName", "!=", "tsmanager.exe")
+	assertConditionAlternatives(t, result.Conditions, "ProcessCommandLine", "has_any", []string{"/hibernate off", "-h off"})
+	if !containsString(result.DataSources, "DeviceProcessEvents") {
+		t.Fatalf("expected DeviceProcessEvents datasource, got %v", result.DataSources)
+	}
+	if !containsString(result.Errors, portablePredicateExtractionNote) {
+		t.Fatalf("expected parser-native portable predicate extraction note, got %v", result.Errors)
+	}
+}
+
+func TestExtractConditions_PortablePredicateExtractionWhenWalkerOnlyComputed(t *testing.T) {
+	query := `let BadDomains = ThreatIntelIndicators
+| where TimeGenerated > ago(11d)
+and ObservableKey == "domain-name:value"
+| extend RemoteUrl = ObservableValue
+| summarize arg_max(TimeGenerated, Id) by RemoteUrl;
+DeviceNetworkEvents
+| extend Domain = tostring(parse_url(RemoteUrl).Host)
+| where Domain has_any(BadDomains)`
+
+	result := ExtractConditions(query)
+	assertConditionValue(t, result.Conditions, "ObservableKey", "==", "domain-name:value")
+	if !containsString(result.DataSources, "ThreatIntelIndicators") {
+		t.Fatalf("expected ThreatIntelIndicators datasource, got %v", result.DataSources)
+	}
+	if !containsString(result.DataSources, "DeviceNetworkEvents") {
+		t.Fatalf("expected DeviceNetworkEvents datasource, got %v", result.DataSources)
+	}
+	if !containsString(result.Errors, portablePredicateExtractionNote) {
+		t.Fatalf("expected parser-native portable predicate extraction note, got %v", result.Errors)
+	}
+}
+
+func TestExtractConditions_PortablePredicateExtractionComputedWhere(t *testing.T) {
+	query := `CopilotActivity
+| extend LLM = parse_json(LLMEventData)
+| mv-expand AccessedResources = LLM.AccessedResources
+| extend XPIADetected = toboolean(AccessedResources.XPIADetected)
+| where XPIADetected == true`
+
+	result := ExtractConditions(query)
+	assertConditionValue(t, result.Conditions, "XPIADetected", "==", "true")
+	if !containsString(result.DataSources, "CopilotActivity") {
+		t.Fatalf("expected CopilotActivity datasource, got %v", result.DataSources)
+	}
+	if !containsString(result.Errors, portablePredicateExtractionNote) {
+		t.Fatalf("expected parser-native portable predicate extraction note, got %v", result.Errors)
+	}
+}
+
+func TestExtractConditions_PortablePredicateExtractionSetHasElement(t *testing.T) {
+	query := `ExposureGraphNodes
+| where set_has_element(Categories, "identity")
+| extend NumberofRoles = array_length(AdminRoles)
+| where NumberofRoles > 0`
+
+	result := ExtractConditions(query)
+	assertConditionValue(t, result.Conditions, "Categories", "has", "identity")
+	assertConditionValue(t, result.Conditions, "NumberofRoles", ">", "0")
+	if !containsString(result.DataSources, "ExposureGraphNodes") {
+		t.Fatalf("expected ExposureGraphNodes datasource, got %v", result.DataSources)
+	}
+	if !containsString(result.Errors, portablePredicateExtractionNote) {
+		t.Fatalf("expected parser-native portable predicate extraction note, got %v", result.Errors)
+	}
+}
+
 func TestExtractConditions_LogicalOperators(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -480,6 +668,82 @@ func TestExtractConditions_EdgeCases(t *testing.T) {
 			t.Logf("Conditions: %d, Errors: %d", len(result.Conditions), len(result.Errors))
 		})
 	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func assertConditionValue(t *testing.T, conditions []Condition, field, operator, value string) {
+	t.Helper()
+	for _, condition := range conditions {
+		if condition.Field == field && condition.Operator == operator {
+			if condition.Value != value {
+				t.Fatalf("condition %s %s value = %q, want %q", field, operator, condition.Value, value)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected condition %s %s %q in %+v", field, operator, value, conditions)
+}
+
+func assertConditionAlternatives(t *testing.T, conditions []Condition, field, operator string, values []string) {
+	t.Helper()
+	for _, condition := range conditions {
+		if condition.Field != field || condition.Operator != operator {
+			continue
+		}
+		if len(condition.Alternatives) != len(values) {
+			t.Fatalf("condition %s %s alternatives = %+v, want %+v", field, operator, condition.Alternatives, values)
+		}
+		for i := range values {
+			if condition.Alternatives[i] != values[i] {
+				t.Fatalf("condition %s %s alternatives = %+v, want %+v", field, operator, condition.Alternatives, values)
+			}
+		}
+		return
+	}
+	t.Fatalf("expected condition %s %s alternatives %+v in %+v", field, operator, values, conditions)
+}
+
+func assertLetStatement(t *testing.T, statements []LetStatement, name, expression string) {
+	t.Helper()
+	for _, statement := range statements {
+		if statement.Name != name {
+			continue
+		}
+		if normalizeTestWhitespace(statement.Expression) != normalizeTestWhitespace(expression) {
+			t.Fatalf("let %s expression = %q, want %q", name, statement.Expression, expression)
+		}
+		return
+	}
+	t.Fatalf("expected let %s in %+v", name, statements)
+}
+
+func normalizeTestWhitespace(value string) string {
+	normalized := strings.Join(strings.Fields(value), " ")
+	normalized = strings.ReplaceAll(normalized, "( ", "(")
+	normalized = strings.ReplaceAll(normalized, " )", ")")
+	return normalized
+}
+
+func assertConditionReference(t *testing.T, conditions []Condition, field, operator, reference string) {
+	t.Helper()
+	for _, condition := range conditions {
+		if condition.Field != field || condition.Operator != operator {
+			continue
+		}
+		if condition.ValueReference != reference {
+			t.Fatalf("condition %s %s reference = %q, want %q", field, operator, condition.ValueReference, reference)
+		}
+		return
+	}
+	t.Fatalf("expected condition %s %s reference %q in %+v", field, operator, reference, conditions)
 }
 
 func TestDeduplicateConditions(t *testing.T) {

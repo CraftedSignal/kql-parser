@@ -3,6 +3,7 @@ package kql
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,28 +14,37 @@ import (
 // Queries that exceed this are returned with an error.
 var MaxParseTime = 5 * time.Second
 
+const (
+	portablePredicateExtractionNote = "parser-native portable predicate extraction emitted conditions"
+	portableKeywordExtractionNote   = "parser-native keyword extraction emitted _keyword_ condition"
+)
+
 // Condition represents a field condition extracted from a KQL query
 type Condition struct {
-	Field        string   `json:"field"`
-	Operator     string   `json:"operator"`
-	Value        string   `json:"value"`
-	Negated      bool     `json:"negated"`
-	PipeStage    int      `json:"pipe_stage"`
-	LogicalOp    string   `json:"logical_op"`             // "AND" or "OR" connecting to previous condition
-	Alternatives []string `json:"alternatives,omitempty"` // For OR conditions on same field
-	IsComputed   bool     `json:"is_computed,omitempty"`  // True if field was created by extend/project
-	SourceField  string   `json:"source_field,omitempty"` // Original field before transformation (for computed fields)
+	Field          string   `json:"field"`
+	Operator       string   `json:"operator"`
+	Value          string   `json:"value"`
+	ValueReference string   `json:"value_reference,omitempty"` // Variable or symbol referenced by the value expression
+	Negated        bool     `json:"negated"`
+	PipeStage      int      `json:"pipe_stage"`
+	LogicalOp      string   `json:"logical_op"`             // "AND" or "OR" connecting to previous condition
+	Alternatives   []string `json:"alternatives,omitempty"` // For OR conditions on same field
+	IsComputed     bool     `json:"is_computed,omitempty"`  // True if field was created by extend/project
+	SourceField    string   `json:"source_field,omitempty"` // Original field before transformation (for computed fields)
 }
 
 // ParseResult contains all conditions extracted from the query
 type ParseResult struct {
-	Conditions      []Condition       `json:"conditions"`
-	ComputedFields  map[string]string `json:"computed_fields,omitempty"`  // Map of computed field name -> source field (from extend)
-	GroupByFields   []string          `json:"group_by_fields,omitempty"`  // Fields from summarize BY clauses
-	Commands        []string          `json:"commands,omitempty"`         // List of commands used in the query (summarize, extend, etc.)
-	ProjectedFields []string          `json:"projected_fields,omitempty"` // Fields selected by project operators
-	Joins           []JoinInfo        `json:"joins,omitempty"`
-	Errors          []string          `json:"errors,omitempty"`
+	Conditions          []Condition       `json:"conditions"`
+	DataSources         []string          `json:"data_sources,omitempty"`         // Table/source names referenced by the query
+	LetStatements       []LetStatement    `json:"let_statements,omitempty"`       // KQL let variable definitions
+	ComputedFields      map[string]string `json:"computed_fields,omitempty"`      // Map of computed field name -> source field (from extend)
+	ComputedExpressions map[string]string `json:"computed_expressions,omitempty"` // Map of computed field name -> source expression
+	GroupByFields       []string          `json:"group_by_fields,omitempty"`      // Fields from summarize BY clauses
+	Commands            []string          `json:"commands,omitempty"`             // List of commands used in the query (summarize, extend, etc.)
+	ProjectedFields     []string          `json:"projected_fields,omitempty"`     // Fields selected by project operators
+	Joins               []JoinInfo        `json:"joins,omitempty"`
+	Errors              []string          `json:"errors,omitempty"`
 }
 
 // FieldProvenance indicates where a field originates relative to a join
@@ -57,6 +67,12 @@ type JoinInfo struct {
 	Subsearch     *ParseResult `json:"subsearch,omitempty"`      // Recursively parsed right-side expression (if subquery)
 	PipeStage     int          `json:"pipe_stage"`               // Pipeline stage where join appears
 	ExposedFields []string     `json:"exposed_fields,omitempty"` // Fields the right side makes available
+}
+
+// LetStatement captures a KQL let variable definition.
+type LetStatement struct {
+	Name       string `json:"name"`
+	Expression string `json:"expression"`
 }
 
 // KQL keywords that should be excluded from conditions
@@ -83,19 +99,20 @@ var kqlKeywords = map[string]bool{
 // conditionExtractor walks the parse tree to extract conditions
 type conditionExtractor struct {
 	*BaseKQLParserListener
-	conditions      []Condition
-	computedFields  map[string]string // Fields created by extend/project: computed field -> source field
-	groupByFields   []string          // Fields from summarize BY clauses
-	commands        []string          // Commands used in the query
-	projectedFields []string          // Fields selected by project operators
-	joins           []JoinInfo
-	currentStage    int
-	inSubquery      int // depth of subquery nesting
-	inFunctionCall  int // depth of function call nesting (countif, sumif, etc.)
-	negated         bool
-	lastLogicalOp   string
-	errors          []string
-	originalQuery   string // normalized query text for extracting subexpressions
+	conditions          []Condition
+	computedFields      map[string]string // Fields created by extend/project: computed field -> source field
+	computedExpressions map[string]string // Fields created by extend/project: computed field -> expression
+	groupByFields       []string          // Fields from summarize BY clauses
+	commands            []string          // Commands used in the query
+	projectedFields     []string          // Fields selected by project operators
+	joins               []JoinInfo
+	currentStage        int
+	inSubquery          int // depth of subquery nesting
+	inFunctionCall      int // depth of function call nesting (countif, sumif, etc.)
+	negated             bool
+	lastLogicalOp       string
+	errors              []string
+	originalQuery       string // normalized query text for extracting subexpressions
 }
 
 // errorListener collects parse errors
@@ -4122,9 +4139,10 @@ func ExtractConditions(query string) *ParseResult {
 		return result
 	case <-time.After(MaxParseTime):
 		return &ParseResult{
-			Conditions: []Condition{},
-			Commands:   []string{},
-			Errors:     []string{fmt.Sprintf("parser timeout: query took longer than %s to parse", MaxParseTime)},
+			Conditions:  []Condition{},
+			DataSources: []string{},
+			Commands:    []string{},
+			Errors:      []string{fmt.Sprintf("parser timeout: query took longer than %s to parse", MaxParseTime)},
 		}
 	}
 }
@@ -4133,9 +4151,10 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 	defer func() {
 		if r := recover(); r != nil {
 			result = &ParseResult{
-				Conditions: []Condition{},
-				Commands:   []string{},
-				Errors:     []string{fmt.Sprintf("parser panic: %v", r)},
+				Conditions:  []Condition{},
+				DataSources: []string{},
+				Commands:    []string{},
+				Errors:      []string{fmt.Sprintf("parser panic: %v", r)},
 			}
 		}
 	}()
@@ -4163,12 +4182,13 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 
 	// Walk the tree to extract conditions
 	extractor := &conditionExtractor{
-		conditions:     make([]Condition, 0),
-		computedFields: make(map[string]string), // computed field -> source field
-		commands:       make([]string, 0),
-		joins:          make([]JoinInfo, 0),
-		lastLogicalOp:  "AND", // default
-		originalQuery:  normalizedQuery,
+		conditions:          make([]Condition, 0),
+		computedFields:      make(map[string]string), // computed field -> source field
+		computedExpressions: make(map[string]string), // computed field -> expression
+		commands:            make([]string, 0),
+		joins:               make([]JoinInfo, 0),
+		lastLogicalOp:       "AND", // default
+		originalQuery:       normalizedQuery,
 	}
 	antlr.ParseTreeWalkerDefault.Walk(extractor, tree)
 
@@ -4178,15 +4198,31 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 
 	// Post-process to group OR conditions on same field
 	conditions := groupORConditions(extractor.conditions)
+	if !hasPortableFieldConditions(conditions) {
+		var note string
+		var extracted []Condition
+		extracted, note = extractPortableConditions(query, normalizedQuery)
+		for _, condition := range extracted {
+			if !containsCondition(conditions, condition) {
+				conditions = append(conditions, condition)
+			}
+		}
+		if note != "" {
+			allErrors = append(allErrors, note)
+		}
+	}
 
 	return &ParseResult{
-		Conditions:      conditions,
-		ComputedFields:  extractor.computedFields,
-		GroupByFields:   extractor.groupByFields,
-		Commands:        extractor.commands,
-		ProjectedFields: extractor.projectedFields,
-		Joins:           extractor.joins,
-		Errors:          allErrors,
+		Conditions:          conditions,
+		DataSources:         extractPortableDataSources(query, normalizedQuery),
+		LetStatements:       extractLetStatements(query),
+		ComputedFields:      extractor.computedFields,
+		ComputedExpressions: extractor.computedExpressions,
+		GroupByFields:       extractor.groupByFields,
+		Commands:            extractor.commands,
+		ProjectedFields:     extractor.projectedFields,
+		Joins:               extractor.joins,
+		Errors:              allErrors,
 	}
 }
 
@@ -4485,13 +4521,16 @@ func (e *conditionExtractor) EnterExtendItem(ctx *ExtendItemContext) {
 	if ctx.Identifier() != nil {
 		field := ctx.Identifier().GetText()
 		sourceField := ""
+		expression := ""
 
 		// Try to extract the source field from the expression
 		if ctx.Expression() != nil {
+			expression = ctx.Expression().GetText()
 			sourceField = extractFirstFieldFromExpression(ctx.Expression())
 		}
 
 		e.computedFields[strings.ToLower(field)] = sourceField
+		e.computedExpressions[strings.ToLower(field)] = expression
 	}
 }
 
@@ -4504,6 +4543,16 @@ func extractFirstFieldFromExpression(ctx IExpressionContext) string {
 
 	// Get the text and look for function call pattern: functionName(fieldName, ...)
 	text := ctx.GetText()
+	if name, args, ok := parseFunctionCall(text); ok {
+		if strings.EqualFold(name, "extract") && len(args) >= 3 {
+			if field := firstSimpleFieldArgument(args[2:]); field != "" {
+				return field
+			}
+		}
+		if field := firstSimpleFieldArgument(args); field != "" {
+			return field
+		}
+	}
 
 	// Find the first identifier after an opening paren
 	inParen := false
@@ -4528,6 +4577,16 @@ func extractFirstFieldFromExpression(ctx IExpressionContext) string {
 				}
 				return text[i:end]
 			}
+		}
+	}
+	return ""
+}
+
+func firstSimpleFieldArgument(args []string) string {
+	for _, arg := range args {
+		arg = strings.TrimSpace(arg)
+		if isSimpleIdentifier(arg) && !kqlKeywords[strings.ToLower(arg)] {
+			return arg
 		}
 	}
 	return ""
@@ -4682,23 +4741,24 @@ func (e *conditionExtractor) handleInOperator(field string, exprList IExpression
 	sourceField, isComputed := e.computedFields[fieldLower]
 
 	values := extractExpressionListValues(exprList)
-	for i, value := range values {
-		logOp := e.lastLogicalOp
-		if i > 0 {
-			logOp = "OR"
-		}
-		cond := Condition{
-			Field:       field,
-			Operator:    "==",
-			Value:       value,
-			Negated:     negated,
-			PipeStage:   e.currentStage,
-			LogicalOp:   logOp,
-			IsComputed:  isComputed,
-			SourceField: sourceField,
-		}
-		e.conditions = append(e.conditions, cond)
+	if len(values) == 0 {
+		return
 	}
+	cond := Condition{
+		Field:        field,
+		Operator:     "in",
+		Value:        values[0],
+		Negated:      negated,
+		PipeStage:    e.currentStage,
+		LogicalOp:    e.lastLogicalOp,
+		Alternatives: values,
+		IsComputed:   isComputed,
+		SourceField:  sourceField,
+	}
+	if len(values) == 1 && isSimpleIdentifier(values[0]) {
+		cond.ValueReference = values[0]
+	}
+	e.conditions = append(e.conditions, cond)
 	e.lastLogicalOp = "AND"
 }
 
@@ -4903,7 +4963,1171 @@ func extractValue(s string) string {
 	return s
 }
 
-// extractExpressionListValues extracts values from an expression list
+func extractPortableDataSources(originalQuery, normalizedQuery string) []string {
+	letNames := extractLetNames(originalQuery)
+	for name := range extractLetNames(normalizedQuery) {
+		letNames[name] = true
+	}
+
+	var sources []string
+	for _, query := range []string{originalQuery, normalizedQuery} {
+		for _, source := range extractDataSourcesFromQuery(query, letNames) {
+			sources = appendUnique(sources, source)
+		}
+	}
+	return sources
+}
+
+func extractLetStatements(query string) []LetStatement {
+	var statements []LetStatement
+	seen := make(map[string]bool)
+	for _, statement := range splitStatements(normalizeNewlines(query)) {
+		cleaned := trimLeadingLineComments(statement)
+		name, expression, ok := parseLetAssignment(strings.TrimSpace(cleaned))
+		if !ok || expression == "" {
+			continue
+		}
+		key := strings.ToLower(name)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		statements = append(statements, LetStatement{
+			Name:       name,
+			Expression: strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(expression), ";")),
+		})
+	}
+	return statements
+}
+
+func trimLeadingLineComments(value string) string {
+	lines := strings.Split(normalizeNewlines(value), "\n")
+	for len(lines) > 0 {
+		line := strings.TrimSpace(lines[0])
+		if line == "" || strings.HasPrefix(line, "//") {
+			lines = lines[1:]
+			continue
+		}
+		break
+	}
+	return strings.Join(lines, "\n")
+}
+
+func hasPortableFieldConditions(conditions []Condition) bool {
+	for _, condition := range conditions {
+		if condition.IsComputed {
+			continue
+		}
+		if condition.Field == "" || condition.Field == "_keyword_" {
+			continue
+		}
+		if kqlKeywords[strings.ToLower(condition.Field)] {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func extractLetNames(query string) map[string]bool {
+	names := make(map[string]bool)
+	for _, statement := range splitStatements(normalizeNewlines(query)) {
+		name, _, ok := parseLetAssignment(strings.TrimSpace(statement))
+		if ok {
+			names[strings.ToLower(name)] = true
+		}
+	}
+	for _, line := range strings.Split(normalizeNewlines(query), "\n") {
+		name, _, ok := parseLetAssignment(strings.TrimSpace(line))
+		if ok {
+			names[strings.ToLower(name)] = true
+		}
+	}
+	return names
+}
+
+func extractDataSourcesFromQuery(query string, letNames map[string]bool) []string {
+	query = normalizeNewlines(query)
+	var sources []string
+	for _, line := range strings.Split(query, "\n") {
+		_, rhs, ok := parseLetAssignment(strings.TrimSpace(line))
+		if !ok {
+			continue
+		}
+		for _, source := range extractDataSourcesFromStatement(rhs, letNames, true) {
+			sources = appendUnique(sources, source)
+		}
+	}
+	segments := splitPipeSegments(query)
+	for i, segment := range segments {
+		allowLeadingSource := len(segments) > 1 && i < len(segments)-1
+		for _, statement := range splitStatements(segment) {
+			for _, source := range extractDataSourcesFromStatement(statement, letNames, allowLeadingSource) {
+				sources = appendUnique(sources, source)
+			}
+		}
+	}
+	return sources
+}
+
+func splitStatements(query string) []string {
+	var statements []string
+	start := 0
+	depth := 0
+	var quote byte
+	verbatim := false
+	for i := 0; i < len(query); i++ {
+		ch := query[i]
+		if quote != 0 {
+			if verbatim && ch == quote && i+1 < len(query) && query[i+1] == quote {
+				i++
+				continue
+			}
+			if ch == '\\' && !verbatim && i+1 < len(query) {
+				i++
+				continue
+			}
+			if ch == quote {
+				quote = 0
+				verbatim = false
+			}
+			continue
+		}
+		if ch == '@' && i+1 < len(query) && (query[i+1] == '"' || query[i+1] == '\'') {
+			quote = query[i+1]
+			verbatim = true
+			i++
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			quote = ch
+			continue
+		}
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ';':
+			if depth == 0 {
+				statements = append(statements, query[start:i])
+				start = i + 1
+			}
+		}
+	}
+	statements = append(statements, query[start:])
+	return statements
+}
+
+func extractDataSourcesFromStatement(statement string, letNames map[string]bool, allowLeadingSource bool) []string {
+	statement = strings.TrimSpace(trimLineComment(statement))
+	statement = strings.TrimLeft(statement, " \t\r\n(),")
+	statement = stripOuterParens(statement)
+	if statement == "" {
+		return nil
+	}
+
+	if _, rhs, ok := parseLetAssignment(statement); ok {
+		return extractDataSourcesFromStatement(rhs, letNames, true)
+	}
+
+	lower := strings.ToLower(statement)
+	switch {
+	case strings.HasPrefix(lower, "search in"):
+		return extractParenthesizedSources(statement, "search in", letNames)
+	case strings.HasPrefix(lower, "find in"):
+		return extractParenthesizedSources(statement, "find in", letNames)
+	case strings.HasPrefix(lower, "union "):
+		return extractUnionSources(statement, letNames)
+	case strings.HasPrefix(lower, "join "):
+		return extractJoinSources(statement, letNames)
+	}
+
+	if !allowLeadingSource {
+		return nil
+	}
+	if source := leadingDataSource(statement, letNames); source != "" {
+		return []string{source}
+	}
+	return nil
+}
+
+func extractParenthesizedSources(statement, keyword string, letNames map[string]bool) []string {
+	rest := strings.TrimSpace(statement[len(keyword):])
+	open := strings.Index(rest, "(")
+	if open < 0 {
+		return nil
+	}
+	open += len(statement) - len(rest)
+	close := findMatchingParen(statement, open)
+	if close < 0 {
+		return nil
+	}
+	var sources []string
+	for _, part := range splitCommaList(statement[open+1 : close]) {
+		if source := cleanDataSourceToken(part, letNames); source != "" {
+			sources = appendUnique(sources, source)
+		}
+	}
+	return sources
+}
+
+func extractUnionSources(statement string, letNames map[string]bool) []string {
+	rest := strings.TrimSpace(statement[len("union "):])
+	var sources []string
+	for _, part := range splitCommaList(rest) {
+		part = strings.TrimSpace(part)
+		fields := strings.Fields(part)
+		for len(fields) > 0 && strings.Contains(fields[0], "=") {
+			fields = fields[1:]
+		}
+		if len(fields) == 0 {
+			continue
+		}
+		if source := cleanDataSourceToken(fields[0], letNames); source != "" {
+			sources = appendUnique(sources, source)
+		}
+	}
+	return sources
+}
+
+func extractJoinSources(statement string, letNames map[string]bool) []string {
+	rest := strings.TrimSpace(statement[len("join "):])
+	for {
+		fields := strings.Fields(rest)
+		if len(fields) == 0 || !strings.Contains(fields[0], "=") {
+			break
+		}
+		rest = strings.TrimSpace(strings.TrimPrefix(rest, fields[0]))
+	}
+	if strings.HasPrefix(rest, "(") {
+		close := findMatchingParen(rest, 0)
+		if close > 0 {
+			return extractDataSourcesFromQuery(rest[1:close], letNames)
+		}
+	}
+	if source := leadingDataSource(rest, letNames); source != "" {
+		return []string{source}
+	}
+	return nil
+}
+
+func leadingDataSource(statement string, letNames map[string]bool) string {
+	statement = strings.TrimSpace(statement)
+	lower := strings.ToLower(statement)
+	if fields := strings.Fields(lower); len(fields) > 0 {
+		for _, command := range []string{
+			"where", "project", "project-away", "extend", "summarize", "order", "sort",
+			"take", "top", "count", "render", "evaluate", "mv-expand", "mv-apply",
+			"parse", "distinct", "lookup", "print", "range", "datatable",
+			"externaldata", "dynamic", "pack_array", "pack", "bag_pack",
+		} {
+			if fields[0] == command || strings.HasPrefix(fields[0], command+"(") {
+				return ""
+			}
+		}
+	}
+	end := len(statement)
+	for i, ch := range statement {
+		if ch == '|' || ch == ',' || ch == '(' || ch == ')' || ch == '[' || ch == ']' || ch == ';' || ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' {
+			end = i
+			break
+		}
+	}
+	return cleanDataSourceToken(statement[:end], letNames)
+}
+
+func cleanDataSourceToken(token string, letNames map[string]bool) string {
+	token = strings.TrimSpace(token)
+	token = strings.Trim(token, " \t\r\n,;()[]")
+	if idx := strings.LastIndex(token, "."); idx >= 0 && idx+1 < len(token) {
+		token = token[idx+1:]
+	}
+	if !isPortableDataSourceCandidate(token, letNames) {
+		return ""
+	}
+	return token
+}
+
+func isPortableDataSourceCandidate(token string, letNames map[string]bool) bool {
+	if token == "" || !isSimpleIdentifier(token) {
+		return false
+	}
+	lower := strings.ToLower(token)
+	if letNames[lower] {
+		return false
+	}
+	switch lower {
+	case "dummytable", "lookuptable", "alltables", "true", "false", "t":
+		return false
+	}
+	if _, err := strconv.ParseFloat(token, 64); err == nil {
+		return false
+	}
+	return true
+}
+
+func findMatchingParen(s string, open int) int {
+	if open < 0 || open >= len(s) || s[open] != '(' {
+		return -1
+	}
+	depth := 0
+	var quote byte
+	verbatim := false
+	for i := open; i < len(s); i++ {
+		ch := s[i]
+		if quote != 0 {
+			if verbatim && ch == quote && i+1 < len(s) && s[i+1] == quote {
+				i++
+				continue
+			}
+			if ch == '\\' && !verbatim && i+1 < len(s) {
+				i++
+				continue
+			}
+			if ch == quote {
+				quote = 0
+				verbatim = false
+			}
+			continue
+		}
+		if ch == '@' && i+1 < len(s) && (s[i+1] == '"' || s[i+1] == '\'') {
+			quote = s[i+1]
+			verbatim = true
+			i++
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			quote = ch
+			continue
+		}
+		if ch == '(' {
+			depth++
+			continue
+		}
+		if ch == ')' {
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// extractPortableConditions extracts translatable conditions from KQL shapes
+// that parse successfully but do not produce portable predicates in the tree walker.
+func extractPortableConditions(originalQuery, normalizedQuery string) ([]Condition, string) {
+	if conditions := extractPortablePredicates(originalQuery); len(conditions) > 0 {
+		return conditions, portablePredicateExtractionNote
+	}
+	if conditions := extractPortablePredicates(normalizedQuery); len(conditions) > 0 {
+		return conditions, portablePredicateExtractionNote
+	}
+	if containsExternalDataLet(originalQuery) {
+		return nil, ""
+	}
+	keyword := extractPortableKeyword(originalQuery)
+	if keyword == "" {
+		keyword = extractPortableKeyword(normalizedQuery)
+	}
+	if keyword == "" {
+		return nil, ""
+	}
+	return []Condition{{
+		Field:     "_keyword_",
+		Operator:  "contains",
+		Value:     keyword,
+		PipeStage: 1,
+		LogicalOp: "AND",
+	}}, portableKeywordExtractionNote
+}
+
+func extractPortablePredicates(query string) []Condition {
+	lists := extractLetLists(query)
+	var conditions []Condition
+	for _, expr := range extractWhereExpressions(query) {
+		for _, part := range splitBooleanConditions(expr) {
+			cond, ok := parsePortablePredicate(part, lists)
+			if !ok {
+				continue
+			}
+			if !containsCondition(conditions, cond) {
+				conditions = append(conditions, cond)
+			}
+		}
+	}
+	return conditions
+}
+
+func extractLetLists(query string) map[string][]string {
+	lists := make(map[string][]string)
+	for _, line := range strings.Split(normalizeNewlines(query), "\n") {
+		name, rhs, ok := parseLetAssignment(strings.TrimSpace(line))
+		if !ok {
+			continue
+		}
+		if values, ok := parseDynamicList(rhs); ok {
+			lists[strings.ToLower(name)] = values
+		}
+	}
+	return lists
+}
+
+func extractWhereExpressions(query string) []string {
+	var expressions []string
+	for _, segment := range splitPipeSegments(normalizeNewlines(query)) {
+		segment = strings.TrimSpace(segment)
+		if len(segment) < len("where ") || !strings.HasPrefix(strings.ToLower(segment), "where ") {
+			continue
+		}
+		expr := strings.TrimSpace(segment[len("where "):])
+		expr = strings.TrimSuffix(expr, ";")
+		expr = strings.TrimSpace(expr)
+		if expr != "" {
+			expressions = append(expressions, expr)
+		}
+	}
+	return expressions
+}
+
+func splitPipeSegments(query string) []string {
+	var segments []string
+	start := 0
+	var quote byte
+	verbatim := false
+	for i := 0; i < len(query); i++ {
+		ch := query[i]
+		if quote != 0 {
+			if verbatim && ch == quote && i+1 < len(query) && query[i+1] == quote {
+				i++
+				continue
+			}
+			if ch == '\\' && !verbatim && i+1 < len(query) {
+				i++
+				continue
+			}
+			if ch == quote {
+				quote = 0
+				verbatim = false
+			}
+			continue
+		}
+		if ch == '@' && i+1 < len(query) && (query[i+1] == '"' || query[i+1] == '\'') {
+			quote = query[i+1]
+			verbatim = true
+			i++
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			quote = ch
+			continue
+		}
+		if ch == '|' {
+			segments = append(segments, query[start:i])
+			start = i + 1
+		}
+	}
+	segments = append(segments, query[start:])
+	return segments
+}
+
+func splitBooleanConditions(expr string) []string {
+	expr = stripOuterParens(strings.TrimSpace(expr))
+	var parts []string
+	start := 0
+	depth := 0
+	var quote byte
+	verbatim := false
+	for i := 0; i < len(expr); i++ {
+		ch := expr[i]
+		if quote != 0 {
+			if verbatim && ch == quote && i+1 < len(expr) && expr[i+1] == quote {
+				i++
+				continue
+			}
+			if ch == '\\' && !verbatim && i+1 < len(expr) {
+				i++
+				continue
+			}
+			if ch == quote {
+				quote = 0
+				verbatim = false
+			}
+			continue
+		}
+		if ch == '@' && i+1 < len(expr) && (expr[i+1] == '"' || expr[i+1] == '\'') {
+			quote = expr[i+1]
+			verbatim = true
+			i++
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			quote = ch
+			continue
+		}
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 {
+				if word := booleanAt(expr, i); word != "" {
+					part := strings.TrimSpace(expr[start:i])
+					if part != "" {
+						parts = append(parts, splitBooleanConditions(part)...)
+					}
+					i += len(word) - 1
+					start = i + 1
+				}
+			}
+		}
+	}
+	tail := strings.TrimSpace(expr[start:])
+	if tail != "" {
+		tail = stripOuterParens(tail)
+		tailLower := strings.ToLower(tail)
+		if tail != expr && (strings.Contains(tailLower, " or ") || strings.Contains(tailLower, " and ")) {
+			parts = append(parts, splitBooleanConditions(tail)...)
+		} else {
+			parts = append(parts, tail)
+		}
+	}
+	return parts
+}
+
+func booleanAt(s string, idx int) string {
+	for _, word := range []string{"and", "or"} {
+		if idx+len(word) > len(s) || !strings.EqualFold(s[idx:idx+len(word)], word) {
+			continue
+		}
+		if wordBoundary(s, idx-1) && wordBoundary(s, idx+len(word)) {
+			return word
+		}
+	}
+	return ""
+}
+
+func parsePortablePredicate(expr string, lists map[string][]string) (Condition, bool) {
+	expr = strings.TrimSpace(stripOuterParens(expr))
+	if expr == "" || strings.Contains(expr, "|") {
+		return Condition{}, false
+	}
+	if condition, ok := parsePortableFunctionPredicate(expr, lists); ok {
+		return condition, true
+	}
+	for _, op := range portablePredicateOperators() {
+		idx := indexOperatorOutside(expr, op)
+		if idx < 0 {
+			continue
+		}
+		left := strings.TrimSpace(expr[:idx])
+		right := strings.TrimSpace(expr[idx+len(op):])
+		if !isSimpleIdentifier(left) || strings.EqualFold(left, "Timestamp") && strings.Contains(strings.ToLower(right), "ago(") {
+			return Condition{}, false
+		}
+		valueReference := portableValueReference(right, lists)
+		value, alternatives, ok := parsePortableValue(right, lists)
+		if !ok {
+			return Condition{}, false
+		}
+		return Condition{
+			Field:          left,
+			Operator:       op,
+			Value:          value,
+			ValueReference: valueReference,
+			Alternatives:   alternatives,
+			PipeStage:      1,
+			LogicalOp:      "AND",
+		}, true
+	}
+	return Condition{}, false
+}
+
+func parsePortableFunctionPredicate(expr string, lists map[string][]string) (Condition, bool) {
+	name, args, ok := parseFunctionCall(expr)
+	if !ok {
+		return Condition{}, false
+	}
+	switch strings.ToLower(name) {
+	case "set_has_element":
+		if len(args) != 2 {
+			return Condition{}, false
+		}
+		field := strings.TrimSpace(args[0])
+		if !isSimpleIdentifier(field) {
+			return Condition{}, false
+		}
+		valueReference := portableValueReference(args[1], lists)
+		value, alternatives, ok := parsePortableValue(args[1], lists)
+		if !ok {
+			return Condition{}, false
+		}
+		return Condition{
+			Field:          field,
+			Operator:       "has",
+			Value:          value,
+			ValueReference: valueReference,
+			Alternatives:   alternatives,
+			PipeStage:      1,
+			LogicalOp:      "AND",
+		}, true
+	}
+	return Condition{}, false
+}
+
+func parseFunctionCall(expr string) (string, []string, bool) {
+	open := strings.Index(expr, "(")
+	if open <= 0 || !strings.HasSuffix(strings.TrimSpace(expr), ")") {
+		return "", nil, false
+	}
+	name := strings.TrimSpace(expr[:open])
+	if !isSimpleIdentifier(name) {
+		return "", nil, false
+	}
+	close := findMatchingParen(expr, open)
+	if close < 0 || strings.TrimSpace(expr[close+1:]) != "" {
+		return "", nil, false
+	}
+	return name, splitCommaList(expr[open+1 : close]), true
+}
+
+func portablePredicateOperators() []string {
+	return []string{
+		"matches regex",
+		"!contains",
+		"!startswith",
+		"!endswith",
+		"!hasprefix",
+		"!hassuffix",
+		"!in~",
+		"!in",
+		"has_any",
+		"has_all",
+		"startswith",
+		"endswith",
+		"hasprefix",
+		"hassuffix",
+		"contains_cs",
+		"contains",
+		"has_cs",
+		"has",
+		"in~",
+		"in",
+		"=~",
+		"!~",
+		"==",
+		"!=",
+		">=",
+		"<=",
+		">",
+		"<",
+	}
+}
+
+func parsePortableValue(raw string, lists map[string][]string) (string, []string, bool) {
+	raw = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(raw), ";"))
+	if raw == "" {
+		return "", nil, false
+	}
+	if values, ok := parseListValue(raw, lists); ok {
+		return values[0], values, true
+	}
+	if value, rest, ok := parseStringLiteral(raw); ok && strings.TrimSpace(rest) == "" {
+		return value, nil, true
+	}
+	if values, ok := lists[strings.ToLower(raw)]; ok && len(values) > 0 {
+		return values[0], values, true
+	}
+	if _, err := strconv.ParseFloat(raw, 64); err == nil {
+		return raw, nil, true
+	}
+	lower := strings.ToLower(raw)
+	if lower == "true" || lower == "false" {
+		return lower, nil, true
+	}
+	return "", nil, false
+}
+
+func portableValueReference(raw string, lists map[string][]string) string {
+	raw = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(raw), ";"))
+	if raw == "" {
+		return ""
+	}
+	if isSimpleIdentifier(raw) {
+		if _, ok := lists[strings.ToLower(raw)]; ok {
+			return raw
+		}
+	}
+	if strings.HasPrefix(raw, "(") && strings.HasSuffix(raw, ")") {
+		body := strings.TrimSpace(raw[1 : len(raw)-1])
+		if isSimpleIdentifier(body) {
+			if _, ok := lists[strings.ToLower(body)]; ok {
+				return body
+			}
+		}
+	}
+	return ""
+}
+
+func parseDynamicList(raw string) ([]string, bool) {
+	raw = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(raw), ";"))
+	return parseListValue(raw, nil)
+}
+
+func parseListValue(raw string, lists map[string][]string) ([]string, bool) {
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(strings.ToLower(raw), "dynamic(") && strings.HasSuffix(raw, ")") {
+		raw = strings.TrimSpace(raw[len("dynamic(") : len(raw)-1])
+	}
+	if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		raw = "(" + strings.TrimSpace(raw[1:len(raw)-1]) + ")"
+	}
+	if !strings.HasPrefix(raw, "(") || !strings.HasSuffix(raw, ")") {
+		return nil, false
+	}
+	body := strings.TrimSpace(raw[1 : len(raw)-1])
+	if body == "" {
+		return nil, false
+	}
+	var values []string
+	for _, item := range splitCommaList(body) {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if nested, ok := lists[strings.ToLower(item)]; ok {
+			for _, value := range nested {
+				values = appendUnique(values, value)
+			}
+			continue
+		}
+		if value, rest, ok := parseStringLiteral(item); ok && strings.TrimSpace(rest) == "" {
+			values = appendUnique(values, value)
+			continue
+		}
+		if _, err := strconv.ParseFloat(item, 64); err == nil {
+			values = appendUnique(values, item)
+		}
+	}
+	if len(values) == 0 {
+		return nil, false
+	}
+	return values, true
+}
+
+func splitCommaList(body string) []string {
+	var parts []string
+	start := 0
+	depth := 0
+	var quote byte
+	verbatim := false
+	for i := 0; i < len(body); i++ {
+		ch := body[i]
+		if quote != 0 {
+			if verbatim && ch == quote && i+1 < len(body) && body[i+1] == quote {
+				i++
+				continue
+			}
+			if ch == '\\' && !verbatim && i+1 < len(body) {
+				i++
+				continue
+			}
+			if ch == quote {
+				quote = 0
+				verbatim = false
+			}
+			continue
+		}
+		if ch == '@' && i+1 < len(body) && (body[i+1] == '"' || body[i+1] == '\'') {
+			quote = body[i+1]
+			verbatim = true
+			i++
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			quote = ch
+			continue
+		}
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				parts = append(parts, body[start:i])
+				start = i + 1
+			}
+		}
+	}
+	parts = append(parts, body[start:])
+	return parts
+}
+
+func indexOperatorOutside(s, op string) int {
+	for i := 0; i+len(op) <= len(s); i++ {
+		idx := indexOutsideQuotesAndParens(s[i:], op)
+		if idx < 0 {
+			return -1
+		}
+		idx += i
+		if !operatorHasWord(op) || wordBoundary(s, idx-1) && wordBoundary(s, idx+len(op)) {
+			return idx
+		}
+		i = idx
+	}
+	return -1
+}
+
+func operatorHasWord(op string) bool {
+	for i := 0; i < len(op); i++ {
+		ch := op[i]
+		if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch == '_' {
+			return true
+		}
+	}
+	return false
+}
+
+func wordBoundary(s string, idx int) bool {
+	return idx < 0 || idx >= len(s) || !isIdentChar(s[idx])
+}
+
+func stripOuterParens(s string) string {
+	for {
+		s = strings.TrimSpace(s)
+		if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
+			return s
+		}
+		depth := 0
+		balanced := true
+		var quote byte
+		for i := 0; i < len(s); i++ {
+			ch := s[i]
+			if quote != 0 {
+				if ch == '\\' && i+1 < len(s) {
+					i++
+					continue
+				}
+				if ch == quote {
+					quote = 0
+				}
+				continue
+			}
+			if ch == '"' || ch == '\'' {
+				quote = ch
+				continue
+			}
+			if ch == '(' {
+				depth++
+			}
+			if ch == ')' {
+				depth--
+				if depth == 0 && i != len(s)-1 {
+					balanced = false
+					break
+				}
+				if depth < 0 {
+					balanced = false
+					break
+				}
+			}
+		}
+		if !balanced || depth != 0 {
+			return s
+		}
+		s = s[1 : len(s)-1]
+	}
+}
+
+func containsCondition(conditions []Condition, condition Condition) bool {
+	key := conditionKey(condition)
+	for _, existing := range conditions {
+		if conditionKey(existing) == key {
+			return true
+		}
+	}
+	return false
+}
+
+func conditionKey(condition Condition) string {
+	return fmt.Sprintf("%t|%s|%s|%s|%s|%s", condition.IsComputed, strings.ToLower(condition.Field), condition.Operator, condition.Value, condition.ValueReference, strings.Join(condition.Alternatives, "\x00"))
+}
+
+func appendUnique(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func extractPortableKeyword(query string) string {
+	query = strings.TrimSpace(query)
+	if isTrivialPortableQuery(query) {
+		return ""
+	}
+	if term := extractSearchKeyword(query); term != "" {
+		return term
+	}
+	if containsExternalDataLet(query) {
+		return ""
+	}
+	if ident := extractFinalIdentifier(query); ident != "" {
+		return ident
+	}
+	if literal := firstStringLiteral(query); literal != "" && !looksLikeURL(literal) {
+		return literal
+	}
+	return compactKeyword(query)
+}
+
+func containsExternalDataLet(query string) bool {
+	for _, statement := range splitStatements(normalizeNewlines(query)) {
+		_, rhs, ok := parseLetAssignment(strings.TrimSpace(statement))
+		if ok && strings.HasPrefix(strings.ToLower(strings.TrimSpace(rhs)), "externaldata") {
+			return true
+		}
+	}
+	return false
+}
+
+func isTrivialPortableQuery(query string) bool {
+	switch strings.ToLower(strings.TrimSpace(query)) {
+	case "", "n/a", "na", "none", "tbd", "todo", "-":
+		return true
+	}
+	return false
+}
+
+func extractSearchKeyword(query string) string {
+	lower := strings.ToLower(query)
+	idx := strings.Index(lower, "search in")
+	if idx < 0 {
+		return ""
+	}
+	rest := query[idx+len("search in"):]
+	if close := strings.Index(rest, ")"); close >= 0 {
+		rest = rest[close+1:]
+	}
+	if value, _, ok := parseStringLiteral(strings.TrimSpace(rest)); ok {
+		return value
+	}
+	return ""
+}
+
+func extractExternalDataAlias(query string) string {
+	for _, line := range strings.Split(normalizeNewlines(query), "\n") {
+		name, rhs, ok := parseLetAssignment(strings.TrimSpace(line))
+		if ok && strings.Contains(strings.ToLower(rhs), "externaldata") {
+			return name
+		}
+	}
+	return ""
+}
+
+func parseLetAssignment(line string) (string, string, bool) {
+	line = trimLineComment(line)
+	if !strings.HasPrefix(strings.ToLower(line), "let ") {
+		return "", "", false
+	}
+	rest := strings.TrimSpace(line[len("let "):])
+	eq := indexOutsideQuotesAndParens(rest, "=")
+	if eq <= 0 {
+		return "", "", false
+	}
+	name := strings.TrimSpace(rest[:eq])
+	if !isSimpleIdentifier(name) {
+		return "", "", false
+	}
+	return name, strings.TrimSpace(rest[eq+1:]), true
+}
+
+func extractFinalIdentifier(query string) string {
+	lines := strings.Split(normalizeNewlines(query), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := trimLineComment(strings.TrimSpace(lines[i]))
+		line = strings.TrimSuffix(line, ";")
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "|") {
+			continue
+		}
+		if isSimpleIdentifier(line) {
+			return line
+		}
+		break
+	}
+	return ""
+}
+
+func firstStringLiteral(query string) string {
+	for i := 0; i < len(query); i++ {
+		ch := query[i]
+		if ch != '"' && ch != '\'' && !(ch == '@' && i+1 < len(query) && (query[i+1] == '"' || query[i+1] == '\'')) {
+			continue
+		}
+		if value, _, ok := parseStringLiteral(query[i:]); ok {
+			return value
+		}
+	}
+	return ""
+}
+
+func parseStringLiteral(raw string) (string, string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", false
+	}
+	verbatim := false
+	if raw[0] == '@' && len(raw) > 1 && (raw[1] == '"' || raw[1] == '\'') {
+		verbatim = true
+		raw = raw[1:]
+	}
+	if raw[0] != '"' && raw[0] != '\'' {
+		return "", "", false
+	}
+	quote := raw[0]
+	var b strings.Builder
+	for i := 1; i < len(raw); i++ {
+		ch := raw[i]
+		if verbatim && ch == quote && i+1 < len(raw) && raw[i+1] == quote {
+			b.WriteByte(quote)
+			i++
+			continue
+		}
+		if !verbatim && ch == '\\' && i+1 < len(raw) {
+			i++
+			b.WriteByte(raw[i])
+			continue
+		}
+		if ch == quote {
+			return b.String(), raw[i+1:], true
+		}
+		b.WriteByte(ch)
+	}
+	return "", "", false
+}
+
+func indexOutsideQuotesAndParens(s, token string) int {
+	depth := 0
+	var quote byte
+	verbatim := false
+	for i := 0; i+len(token) <= len(s); i++ {
+		ch := s[i]
+		if quote != 0 {
+			if verbatim && ch == quote && i+1 < len(s) && s[i+1] == quote {
+				i++
+				continue
+			}
+			if ch == '\\' && !verbatim && i+1 < len(s) {
+				i++
+				continue
+			}
+			if ch == quote {
+				quote = 0
+				verbatim = false
+			}
+			continue
+		}
+		if ch == '@' && i+1 < len(s) && (s[i+1] == '"' || s[i+1] == '\'') {
+			quote = s[i+1]
+			verbatim = true
+			i++
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			quote = ch
+			continue
+		}
+		switch ch {
+		case '(':
+			depth++
+			continue
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth == 0 && s[i:i+len(token)] == token {
+			return i
+		}
+	}
+	return -1
+}
+
+func trimLineComment(line string) string {
+	var quote byte
+	for i := 0; i+1 < len(line); i++ {
+		ch := line[i]
+		if quote != 0 {
+			if ch == '\\' && i+1 < len(line) {
+				i++
+				continue
+			}
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			quote = ch
+			continue
+		}
+		if ch == '/' && line[i+1] == '/' {
+			return strings.TrimSpace(line[:i])
+		}
+	}
+	return line
+}
+
+func normalizeNewlines(query string) string {
+	return strings.ReplaceAll(query, "\r\n", "\n")
+}
+
+func isSimpleIdentifier(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if i == 0 && (ch >= '0' && ch <= '9' || ch == '.') {
+			return false
+		}
+		if !isIdentChar(ch) && ch != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func looksLikeURL(value string) bool {
+	lower := strings.ToLower(value)
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
+}
+
+func compactKeyword(query string) string {
+	fields := strings.Fields(query)
+	if len(fields) == 0 {
+		return ""
+	}
+	compact := strings.Join(fields, " ")
+	if len(compact) > 160 {
+		compact = strings.TrimSpace(compact[:160])
+	}
+	return compact
+}
+
 func extractExpressionListValues(ctx IExpressionListContext) []string {
 	if ctx == nil {
 		return nil
