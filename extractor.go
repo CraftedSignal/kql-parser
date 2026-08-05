@@ -4534,62 +4534,102 @@ func (e *conditionExtractor) EnterExtendItem(ctx *ExtendItemContext) {
 	}
 }
 
-// extractFirstFieldFromExpression tries to extract the first field name from an expression
-// This handles patterns like: tolower(CommandLine), coalesce(field1, field2), etc.
+// extractFirstFieldFromExpression tries to extract the first raw event field name from an expression.
+// It handles simple identifiers (AccountName), direct aliases (Account = AccountName), and
+// nested function calls (tostring(split(SenderMailFromAddress, "@")[-1])).
 func extractFirstFieldFromExpression(ctx IExpressionContext) string {
 	if ctx == nil {
 		return ""
 	}
+	return firstFieldInExpressionText(ctx.GetText())
+}
 
-	// Get the text and look for function call pattern: functionName(fieldName, ...)
-	text := ctx.GetText()
-	if name, args, ok := parseFunctionCall(text); ok {
-		if strings.EqualFold(name, "extract") && len(args) >= 3 {
-			if field := firstSimpleFieldArgument(args[2:]); field != "" {
-				return field
-			}
+// firstFieldInExpressionText returns the first raw field argument inside an expression,
+// skipping function names, string literals, and numeric literals.
+func firstFieldInExpressionText(expr string) string {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return ""
+	}
+
+	// Simple identifier by itself (e.g., the right-hand side of "extend Account = AccountName").
+	if isSimpleIdentifier(expr) && !kqlKeywords[strings.ToLower(expr)] {
+		return expr
+	}
+
+	parenDepth := 0
+	inString := byte(0)
+	identStart := -1
+
+	flushIdent := func(end int) string {
+		if identStart < 0 {
+			return ""
 		}
-		if field := firstSimpleFieldArgument(args); field != "" {
+		field := expr[identStart:end]
+		identStart = -1
+		if isSimpleIdentifier(field) && !kqlKeywords[strings.ToLower(field)] {
 			return field
 		}
+		return ""
 	}
 
-	// Find the first identifier after an opening paren
-	inParen := false
-	start := -1
-	for i, ch := range text {
-		if ch == '(' {
-			inParen = true
-			start = i + 1
-		} else if inParen && start == i {
-			// Check if this is a valid field name character
-			if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' {
-				// Find the end of the field name
-				end := i
-				for j := i; j < len(text); j++ {
-					ch := text[j]
-					if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-						(ch >= '0' && ch <= '9') || ch == '_' || ch == '.' {
-						end = j + 1
-					} else {
-						break
-					}
+	for i := 0; i < len(expr); {
+		ch := expr[i]
+
+		if inString != 0 {
+			if ch == '\\' && i+1 < len(expr) {
+				i += 2
+				continue
+			}
+			if ch == inString {
+				inString = 0
+			}
+			i++
+			continue
+		}
+
+		switch ch {
+		case '"', '\'', '`':
+			inString = ch
+			identStart = -1
+		case '(':
+			// Any identifier immediately before '(' is a function name, not a raw
+			// event field, so discard it rather than returning it.
+			parenDepth++
+			identStart = -1
+		case ')':
+			if field := flushIdent(i); field != "" {
+				return field
+			}
+			parenDepth--
+			identStart = -1
+		case ',':
+			if field := flushIdent(i); field != "" {
+				return field
+			}
+			identStart = -1
+		default:
+			if !isIdentChar(ch) {
+				if field := flushIdent(i); field != "" {
+					return field
 				}
-				return text[i:end]
+				identStart = -1
+			} else if identStart < 0 && isIdentStart(ch) {
+				identStart = i
 			}
 		}
+		i++
 	}
+
+	if field := flushIdent(len(expr)); field != "" {
+		return field
+	}
+
 	return ""
 }
 
-func firstSimpleFieldArgument(args []string) string {
-	for _, arg := range args {
-		arg = strings.TrimSpace(arg)
-		if isSimpleIdentifier(arg) && !kqlKeywords[strings.ToLower(arg)] {
-			return arg
-		}
-	}
-	return ""
+func isIdentStart(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
 }
 
 // EnterProjectItem tracks renamed fields from project
