@@ -116,10 +116,24 @@ func TestExtractConditions_StringOperators(t *testing.T) {
 			},
 		},
 		{
+			name:  "case-sensitive contains alias",
+			query: "SecurityEvent | where Message containscs \"ERROR\"",
+			expected: []Condition{
+				{Field: "Message", Operator: "contains_cs", Value: "ERROR"},
+			},
+		},
+		{
 			name:  "negated contains",
 			query: "SecurityEvent | where Message !contains \"test\"",
 			expected: []Condition{
 				{Field: "Message", Operator: "!contains", Value: "test"},
+			},
+		},
+		{
+			name:  "negated case-sensitive contains alias",
+			query: "SecurityEvent | where Message !containscs \"test\"",
+			expected: []Condition{
+				{Field: "Message", Operator: "!contains_cs", Value: "test"},
 			},
 		},
 	}
@@ -144,6 +158,139 @@ func TestExtractConditions_StringOperators(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestNormalizeQuery_StringOperatorAliasesPreserveIdentifiersAndStrings(t *testing.T) {
+	normalized := NormalizeQueryForDebug(`SecurityEvent | where containscsummary == "containscs" and Message containscs "ERROR"`)
+	if !strings.Contains(normalized, `containscsummary == "containscs"`) {
+		t.Fatalf("normalization should preserve identifiers and strings, got:\n%s", normalized)
+	}
+	if !strings.Contains(normalized, `Message contains_cs "ERROR"`) {
+		t.Fatalf("normalization should rewrite containscs operator, got:\n%s", normalized)
+	}
+}
+
+func TestNormalizeQuery_InSubqueriesUsePlaceholderOutsideStrings(t *testing.T) {
+	query := `PushSecurity_CL
+| where category == "Account"
+| where new !in (PushSecurity_CL
+                 | where category == "Account"
+                 | summarize make_set(tostring(new)))
+| where app == "OAuth"`
+
+	normalized := NormalizeQueryForDebug(query)
+	if !strings.Contains(normalized, `new !in (SubqueryResult)`) {
+		t.Fatalf("normalization should replace tabular in() subquery, got:\n%s", normalized)
+	}
+
+	result := ExtractConditions(query)
+	if errors := unexpectedParserErrors(result.Errors); len(errors) > 0 {
+		t.Fatalf("unexpected parser errors: %v\nnormalized query:\n%s", errors, normalized)
+	}
+	if !containsString(result.DataSources, "PushSecurity_CL") {
+		t.Fatalf("expected datasource PushSecurity_CL, got %v", result.DataSources)
+	}
+}
+
+func TestNormalizeQuery_InSubqueriesPreserveStrings(t *testing.T) {
+	normalized := NormalizeQueryForDebug(`SecurityEvent | where Message == "value in (Table | project X)"`)
+	if strings.Contains(normalized, "SubqueryResult") {
+		t.Fatalf("normalization should preserve string literals, got:\n%s", normalized)
+	}
+}
+
+func TestNormalizeQuery_TrailingDecimalPreservesIndexedFieldPaths(t *testing.T) {
+	query := `SecurityEvent | where AdditionalDetails._idx0.key == "User-Agent" and Severity > 7.`
+	normalized := NormalizeQueryForDebug(query)
+	if strings.Contains(normalized, "_idx0._0key") || strings.Contains(normalized, "_idx0.0key") {
+		t.Fatalf("normalization should preserve indexed field paths, got:\n%s", normalized)
+	}
+	if !strings.Contains(normalized, "Severity > 7.0") {
+		t.Fatalf("normalization should still fix trailing numeric decimals, got:\n%s", normalized)
+	}
+
+	result := ExtractConditions(`SecurityEvent | where AdditionalDetails._idx0.key == "User-Agent"`)
+	if errors := unexpectedParserErrors(result.Errors); len(errors) > 0 {
+		t.Fatalf("unexpected parser errors: %v", errors)
+	}
+	if len(result.Conditions) != 1 {
+		t.Fatalf("expected one condition, got %+v", result.Conditions)
+	}
+	if result.Conditions[0].Field != "AdditionalDetails._idx0.key" {
+		t.Fatalf("expected indexed field path to be preserved, got %q", result.Conditions[0].Field)
+	}
+}
+
+func TestNormalizeQuery_PreservesParametersInsideStrings(t *testing.T) {
+	query := `SecurityEvent | where _keyword_ contains "{{StartTimeISO}}"`
+	normalized := NormalizeQueryForDebug(query)
+	if strings.Contains(normalized, "DummyParam") || strings.Contains(normalized, `"{StartTimeISO}"`) {
+		t.Fatalf("normalization should preserve quoted template parameters, got:\n%s", normalized)
+	}
+
+	result := ExtractConditions(query)
+	if errors := unexpectedParserErrors(result.Errors); len(errors) > 0 {
+		t.Fatalf("unexpected parser errors: %v", errors)
+	}
+	if len(result.Conditions) != 1 {
+		t.Fatalf("expected one condition, got %+v", result.Conditions)
+	}
+	if result.Conditions[0].Value != "{{StartTimeISO}}" {
+		t.Fatalf("expected quoted template parameter value to be preserved, got %q", result.Conditions[0].Value)
+	}
+}
+
+func TestNormalizeQuery_PreservesExternalDataInsideStrings(t *testing.T) {
+	query := `SecurityEvent | where _keyword_ contains "let url = (externaldata(url: string ) [@\"https://urlhaus.abuse.ch/downloads/text_online/\"] with (format=\"txt\")) | project url"`
+	normalized := NormalizeQueryForDebug(query)
+	if strings.Contains(normalized, "ExtDataResult") {
+		t.Fatalf("normalization should preserve quoted externaldata text, got:\n%s", normalized)
+	}
+
+	result := ExtractConditions(query)
+	if errors := unexpectedParserErrors(result.Errors); len(errors) > 0 {
+		t.Fatalf("unexpected parser errors: %v", errors)
+	}
+	found := false
+	for _, condition := range result.Conditions {
+		if strings.Contains(condition.Value, "ExtDataResult") {
+			t.Fatalf("extracted value should not rewrite quoted externaldata text, got %+v", result.Conditions)
+		}
+		if strings.Contains(condition.Value, "externaldata(url: string )") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected quoted externaldata text to be preserved, got %+v", result.Conditions)
+	}
+}
+
+func TestExtractConditions_KeywordConditionSkipsPortableDuplicate(t *testing.T) {
+	query := `SecurityEvent | where _keyword_ contains "a\\.b"`
+	result := ExtractConditions(query)
+	if errors := unexpectedParserErrors(result.Errors); len(errors) > 0 {
+		t.Fatalf("unexpected parser errors: %v", errors)
+	}
+	if len(result.Conditions) != 1 {
+		t.Fatalf("expected parser-native keyword condition only, got %+v", result.Conditions)
+	}
+	if result.Conditions[0].Value != `a\\.b` {
+		t.Fatalf("expected parser-native escaped value to be preserved, got %q", result.Conditions[0].Value)
+	}
+}
+
+func TestExtractConditions_KeywordRegexBackslashDotBeforeCharacterClass(t *testing.T) {
+	query := `SecurityEvent | where _keyword_ contains "^[a-z]+\\.[a-z]+$"`
+	result := ExtractConditions(query)
+	if errors := unexpectedParserErrors(result.Errors); len(errors) > 0 {
+		t.Fatalf("unexpected parser errors: %v", errors)
+	}
+	if len(result.Conditions) != 1 {
+		t.Fatalf("expected one condition, got %+v", result.Conditions)
+	}
+	if result.Conditions[0].Value != `^[a-z]+\\.[a-z]+$` {
+		t.Fatalf("expected escaped dot before character class to be preserved, got %q", result.Conditions[0].Value)
 	}
 }
 
@@ -677,6 +824,19 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func unexpectedParserErrors(errors []string) []string {
+	var unexpected []string
+	for _, err := range errors {
+		switch err {
+		case portablePredicateExtractionNote, portableKeywordExtractionNote:
+			continue
+		default:
+			unexpected = append(unexpected, err)
+		}
+	}
+	return unexpected
 }
 
 func assertConditionValue(t *testing.T, conditions []Condition, field, operator, value string) {
