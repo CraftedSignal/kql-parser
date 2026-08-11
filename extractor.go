@@ -188,12 +188,15 @@ func normalizeQuery(query string) string {
 	normalized = strings.ReplaceAll(normalized, "\nin~", "\nin")
 	normalized = strings.ReplaceAll(normalized, "in~(", "in(")
 
-	// Convert make_set and make_list to generic function names that the parser recognizes
-	// Handle both make_set( and make_set ( with space
+	// Convert make_set and make_list aliases used by existing parser fixtures.
+	// Handle both make_set( and make_set ( with space.
 	normalized = strings.ReplaceAll(normalized, "make_set(", "makeset(")
 	normalized = strings.ReplaceAll(normalized, "make_set (", "makeset(")
 	normalized = strings.ReplaceAll(normalized, "make_list(", "makelist(")
 	normalized = strings.ReplaceAll(normalized, "make_list (", "makelist(")
+
+	// Normalize string operator aliases commonly found in Sentinel content.
+	normalized = normalizeStringOperatorAliases(normalized)
 
 	// Handle summarize without aggregation (summarize by x -> summarize count() by x)
 	// The grammar requires aggregation before BY, but KQL allows just "summarize by"
@@ -265,11 +268,16 @@ func normalizeQuery(query string) string {
 
 	// Normalize dot-bracket pattern: obj.[0] -> obj[0], obj.["key"] -> obj["key"]
 	// This unusual KQL syntax isn't handled by our grammar
-	normalized = strings.ReplaceAll(normalized, ".[", "[")
+	normalized = replaceAllOutsideStrings(normalized, ".[", "[")
 
 	// Convert bracket property access to dot notation
 	// obj['key'] -> obj._key_ (the lexer's QUOTED_IDENTIFIER conflicts with bracket access)
 	normalized = convertBracketAccess(normalized)
+
+	// Reduce "field in (Tabular | project X)" to a scalar placeholder so
+	// expression parsing can continue. Portable extraction still sees the
+	// original query for table and predicate discovery.
+	normalized = normalizeInSubqueries(normalized)
 
 	// Fix identifiers that start with numbers by prepending underscore
 	// e.g., 3plogTime -> _3plogTime
@@ -316,7 +324,7 @@ func normalizeQuery(query string) string {
 	normalized = normalizeUnionParameters(normalized)
 
 	// Handle queries that start with union (grammar requires union to follow a table reference)
-	if strings.HasPrefix(strings.ToLower(normalized), "union") {
+	if hasKeywordPrefix(strings.TrimLeft(strings.ToLower(normalized), " \t\r\n"), "union") {
 		normalized = "DummyTable | " + normalized
 	}
 
@@ -335,6 +343,10 @@ func normalizeQuery(query string) string {
 	// Normalize top-nested operator: top-nested N of X by count() -> summarize count() by X
 	// The grammar doesn't support the "of" keyword in top-nested
 	normalized = normalizeTopNested(normalized)
+
+	// Normalize partition bodies that start with an operator rather than a table
+	// source, e.g. `partition by aid (top 1 by TimeGenerated desc)`.
+	normalized = normalizePartitionOperator(normalized)
 
 	// Strip named parameters from function calls: func(param=value) -> func()
 	// These are common in user-defined function calls like parser(pack=true)
@@ -1083,71 +1095,40 @@ func handleUnicodeEscape(hex string, result *strings.Builder) {
 // normalizeSummarizeBy adds a dummy aggregation when summarize has only BY clause
 // KQL allows "summarize by x" but grammar requires aggregation before BY
 func normalizeSummarizeBy(query string) string {
-	// Look for patterns like "summarize by", "summarize  by", "summarize\nby"
-	// and convert to "summarize count() by"
-	result := query
-	lowerResult := strings.ToLower(result)
+	lowerQuery := strings.ToLower(query)
+	var b strings.Builder
+	b.Grow(len(query) + 32)
+	lastCopied := 0
+	changed := false
+	searchFrom := 0
 
-	// Find all occurrences of "summarize" followed eventually by "by" without aggregation
 	for {
-		idx := strings.Index(lowerResult, "summarize")
+		idx := indexKeyword(lowerQuery, "summarize", searchFrom)
 		if idx == -1 {
 			break
 		}
 
-		// Find where summarize ends (after whitespace)
-		sumEnd := idx + 9 // length of "summarize"
-		for sumEnd < len(result) && (result[sumEnd] == ' ' || result[sumEnd] == '\t' || result[sumEnd] == '\n') {
-			sumEnd++
+		afterSummarize := idx + len("summarize")
+		byStart := afterSummarize
+		for byStart < len(query) && (query[byStart] == ' ' || query[byStart] == '\t' || query[byStart] == '\n' || query[byStart] == '\r') {
+			byStart++
 		}
 
-		// Check if the next token is "by"
-		if sumEnd+2 <= len(result) && strings.ToLower(result[sumEnd:sumEnd+2]) == "by" {
-			// Check that "by" is followed by whitespace (not "byx" or similar)
-			if sumEnd+2 == len(result) || result[sumEnd+2] == ' ' || result[sumEnd+2] == '\t' || result[sumEnd+2] == '\n' {
-				// Insert "count() " before "by"
-				result = result[:sumEnd] + "count() " + result[sumEnd:]
-				lowerResult = strings.ToLower(result)
-				continue
-			}
+		if hasKeywordPrefix(lowerQuery[byStart:], "by") {
+			b.WriteString(query[lastCopied:byStart])
+			b.WriteString("count() ")
+			lastCopied = byStart
+			changed = true
 		}
 
-		// Move past this summarize
-		lowerResult = lowerResult[idx+9:]
-		if len(lowerResult) == 0 {
-			break
-		}
-		// Adjust idx for next iteration - this won't work, need different approach
-		break
+		searchFrom = afterSummarize
 	}
 
-	// Use a regex-like approach for multiple occurrences
-	result = query
-	patterns := []string{
-		"summarize by ",
-		"summarize by\t",
-		"summarize by\n",
-		"summarize  by ",
-		"summarize  by\t",
-		"summarize  by\n",
-		"summarize\nby ",
-		"summarize\nby\t",
-		"summarize\nby\n",
-		"summarize\tby ",
-		"summarize\tby\t",
-		"summarize\tby\n",
+	if !changed {
+		return query
 	}
-
-	for _, pattern := range patterns {
-		replacement := strings.Replace(pattern, " by", " count() by", 1)
-		replacement = strings.Replace(replacement, "\tby", " count() by", 1)
-		replacement = strings.Replace(replacement, "\nby", " count() by", 1)
-		result = strings.ReplaceAll(result, pattern, replacement)
-		// Also handle case variations
-		result = strings.ReplaceAll(result, strings.ToUpper(pattern[:1])+pattern[1:], replacement)
-	}
-
-	return result
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // stripReturnTypeAnnotations removes return type annotations from evaluate statements
@@ -1462,6 +1443,7 @@ func stripParseStatements(query string) string {
 	for {
 		// Find "| parse" or "\nparse" (parse operator at start of pipe stage)
 		idx := strings.Index(lowerQuery[searchFrom:], "| parse ")
+		parseKeywordLen := len("parse")
 		if idx == -1 {
 			idx = strings.Index(lowerQuery[searchFrom:], "| parse\t")
 		}
@@ -1469,12 +1451,24 @@ func stripParseStatements(query string) string {
 			idx = strings.Index(lowerQuery[searchFrom:], "| parse\n")
 		}
 		if idx == -1 {
+			idx = strings.Index(lowerQuery[searchFrom:], "| parse-where ")
+			parseKeywordLen = len("parse-where")
+		}
+		if idx == -1 {
+			idx = strings.Index(lowerQuery[searchFrom:], "| parse-where\t")
+			parseKeywordLen = len("parse-where")
+		}
+		if idx == -1 {
+			idx = strings.Index(lowerQuery[searchFrom:], "| parse-where\n")
+			parseKeywordLen = len("parse-where")
+		}
+		if idx == -1 {
 			break
 		}
 		idx += searchFrom
 
 		// Find the end of this parse statement (next pipe, closing paren, or end of query)
-		parseStart := idx + 2 // skip "| "
+		parseStart := idx + 2 + parseKeywordLen
 		pipeOrEnd := parseStart
 
 		// Track string literals and parentheses
@@ -2023,6 +2017,7 @@ func normalizeTrailingDecimals(query string) string {
 	result.Grow(len(query))
 	inString := false
 	stringChar := byte(0)
+	isVerbatim := false
 
 	for i := 0; i < len(query); i++ {
 		c := query[i]
@@ -2031,12 +2026,31 @@ func normalizeTrailingDecimals(query string) string {
 		if !inString && (c == '"' || c == '\'') {
 			inString = true
 			stringChar = c
+			isVerbatim = i > 0 && query[i-1] == '@'
 			result.WriteByte(c)
 			continue
 		}
 		if inString {
-			if c == stringChar && (i == 0 || query[i-1] != '\\') {
-				inString = false
+			if c == stringChar {
+				if isVerbatim {
+					if i+1 < len(query) && query[i+1] == stringChar {
+						result.WriteByte(c)
+						i++
+						continue
+					}
+					inString = false
+					isVerbatim = false
+				} else if stringChar == '"' {
+					backslashes := 0
+					for j := i - 1; j >= 0 && query[j] == '\\'; j-- {
+						backslashes++
+					}
+					if backslashes%2 == 0 {
+						inString = false
+					}
+				} else {
+					inString = false
+				}
 			}
 			result.WriteByte(c)
 			continue
@@ -2046,7 +2060,9 @@ func normalizeTrailingDecimals(query string) string {
 		if c == '.' && i > 0 && isDigit(query[i-1]) {
 			// Check what follows the dot
 			nextIdx := i + 1
-			if nextIdx >= len(query) || !isDigit(query[nextIdx]) {
+			if (nextIdx >= len(query) || (!isDigit(query[nextIdx]) && query[nextIdx] != '.')) &&
+				isStandaloneNumericLiteralBeforeDot(query, i) &&
+				isTrailingDecimalBoundary(query, nextIdx) {
 				// Trailing decimal point - add .0
 				result.WriteByte('.')
 				result.WriteByte('0')
@@ -2058,6 +2074,29 @@ func normalizeTrailingDecimals(query string) string {
 	}
 
 	return result.String()
+}
+
+func isStandaloneNumericLiteralBeforeDot(query string, dotIdx int) bool {
+	start := dotIdx - 1
+	for start >= 0 && isDigit(query[start]) {
+		start--
+	}
+	if start < 0 {
+		return true
+	}
+	return !isIdentChar(query[start]) && query[start] != '.'
+}
+
+func isTrailingDecimalBoundary(query string, idx int) bool {
+	if idx >= len(query) {
+		return true
+	}
+	switch query[idx] {
+	case ' ', '\t', '\r', '\n', ',', ';', ')', ']', '}', '|', '+', '-', '*', '/', '%', '=', '!', '<', '>':
+		return true
+	default:
+		return false
+	}
 }
 
 // normalizeNullEscapes converts \0 to \x00 in regular strings
@@ -2156,6 +2195,293 @@ func isIdentChar(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
 }
 
+func hasKeywordPrefix(s, keyword string) bool {
+	if !strings.HasPrefix(s, keyword) {
+		return false
+	}
+	return len(s) == len(keyword) || !isIdentChar(s[len(keyword)])
+}
+
+func indexKeyword(s, keyword string, start int) int {
+	for start < len(s) {
+		idx := strings.Index(s[start:], keyword)
+		if idx == -1 {
+			return -1
+		}
+		idx += start
+		beforeOK := idx == 0 || !isIdentChar(s[idx-1])
+		after := idx + len(keyword)
+		afterOK := after >= len(s) || !isIdentChar(s[after])
+		if beforeOK && afterOK {
+			return idx
+		}
+		start = idx + len(keyword)
+	}
+	return -1
+}
+
+func indexKeywordOutsideStrings(s, keyword string, start int) int {
+	for start < len(s) {
+		idx := indexOutsideStrings(s, keyword, start, true)
+		if idx == -1 {
+			return -1
+		}
+		beforeOK := idx == 0 || !isIdentChar(s[idx-1])
+		after := idx + len(keyword)
+		afterOK := after >= len(s) || !isIdentChar(s[after])
+		if beforeOK && afterOK {
+			return idx
+		}
+		start = idx + len(keyword)
+	}
+	return -1
+}
+
+func indexOutsideStrings(s, needle string, start int, caseInsensitive bool) int {
+	if needle == "" {
+		return start
+	}
+	if start < 0 {
+		start = 0
+	}
+	if len(needle) > len(s) || start > len(s)-len(needle) {
+		return -1
+	}
+
+	var quote byte
+	verbatim := false
+	for i := start; i <= len(s)-len(needle); i++ {
+		ch := s[i]
+		if quote != 0 {
+			if verbatim && ch == quote && i+1 < len(s) && s[i+1] == quote {
+				i++
+				continue
+			}
+			if ch == '\\' && !verbatim && i+1 < len(s) {
+				i++
+				continue
+			}
+			if ch == quote {
+				quote = 0
+				verbatim = false
+			}
+			continue
+		}
+		if ch == '@' && i+1 < len(s) && (s[i+1] == '"' || s[i+1] == '\'') {
+			quote = s[i+1]
+			verbatim = true
+			i++
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			quote = ch
+			continue
+		}
+		candidate := s[i : i+len(needle)]
+		if (!caseInsensitive && candidate == needle) || (caseInsensitive && strings.EqualFold(candidate, needle)) {
+			return i
+		}
+	}
+	return -1
+}
+
+func indexByteOutsideStrings(s string, needle byte, start int) int {
+	return indexOutsideStrings(s, string(needle), start, false)
+}
+
+func normalizeInSubqueries(query string) string {
+	var b strings.Builder
+	b.Grow(len(query))
+	lastCopied := 0
+	changed := false
+	var quote byte
+	verbatim := false
+
+	for i := 0; i < len(query); i++ {
+		ch := query[i]
+		if quote != 0 {
+			if verbatim && ch == quote && i+1 < len(query) && query[i+1] == quote {
+				i++
+				continue
+			}
+			if ch == '\\' && !verbatim && i+1 < len(query) {
+				i++
+				continue
+			}
+			if ch == quote {
+				quote = 0
+				verbatim = false
+			}
+			continue
+		}
+
+		if ch == '@' && i+1 < len(query) && (query[i+1] == '"' || query[i+1] == '\'') {
+			quote = query[i+1]
+			verbatim = true
+			i++
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			quote = ch
+			continue
+		}
+
+		if ch != '(' || !precededByInOperator(query, i) {
+			continue
+		}
+
+		close := findMatchingParen(query, i)
+		if close <= i {
+			continue
+		}
+
+		if !containsPipeOutsideStrings(query[i+1 : close]) {
+			i = close
+			continue
+		}
+
+		b.WriteString(query[lastCopied : i+1])
+		b.WriteString("SubqueryResult")
+		lastCopied = close
+		changed = true
+		i = close
+	}
+
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
+}
+
+func precededByInOperator(query string, openParen int) bool {
+	i := openParen - 1
+	for i >= 0 && (query[i] == ' ' || query[i] == '\t' || query[i] == '\r' || query[i] == '\n') {
+		i--
+	}
+	end := i + 1
+	for i >= 0 && (isIdentChar(query[i]) || query[i] == '!') {
+		i--
+	}
+	token := strings.ToLower(query[i+1 : end])
+	if token != "in" && token != "!in" {
+		return false
+	}
+	return i < 0 || !isIdentChar(query[i])
+}
+
+func containsPipeOutsideStrings(s string) bool {
+	var quote byte
+	verbatim := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if quote != 0 {
+			if verbatim && ch == quote && i+1 < len(s) && s[i+1] == quote {
+				i++
+				continue
+			}
+			if ch == '\\' && !verbatim && i+1 < len(s) {
+				i++
+				continue
+			}
+			if ch == quote {
+				quote = 0
+				verbatim = false
+			}
+			continue
+		}
+		if ch == '@' && i+1 < len(s) && (s[i+1] == '"' || s[i+1] == '\'') {
+			quote = s[i+1]
+			verbatim = true
+			i++
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			quote = ch
+			continue
+		}
+		if ch == '|' {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeStringOperatorAliases(query string) string {
+	var b strings.Builder
+	b.Grow(len(query))
+	lastCopied := 0
+	changed := false
+	var quote byte
+	verbatim := false
+
+	for i := 0; i < len(query); i++ {
+		ch := query[i]
+		if quote != 0 {
+			if verbatim && ch == quote && i+1 < len(query) && query[i+1] == quote {
+				i++
+				continue
+			}
+			if ch == '\\' && !verbatim && i+1 < len(query) {
+				i++
+				continue
+			}
+			if ch == quote {
+				quote = 0
+				verbatim = false
+			}
+			continue
+		}
+
+		if ch == '@' && i+1 < len(query) && (query[i+1] == '"' || query[i+1] == '\'') {
+			quote = query[i+1]
+			verbatim = true
+			i++
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			quote = ch
+			continue
+		}
+
+		if hasOperatorTokenAt(query, i, "!containscs") {
+			b.WriteString(query[lastCopied:i])
+			b.WriteString("!contains_cs")
+			i += len("!containscs") - 1
+			lastCopied = i + 1
+			changed = true
+			continue
+		}
+		if hasOperatorTokenAt(query, i, "containscs") {
+			b.WriteString(query[lastCopied:i])
+			b.WriteString("contains_cs")
+			i += len("containscs") - 1
+			lastCopied = i + 1
+			changed = true
+		}
+	}
+
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
+}
+
+func hasOperatorTokenAt(query string, idx int, token string) bool {
+	if idx+len(token) > len(query) {
+		return false
+	}
+	if strings.ToLower(query[idx:idx+len(token)]) != token {
+		return false
+	}
+	if idx > 0 && isIdentChar(query[idx-1]) {
+		return false
+	}
+	after := idx + len(token)
+	return after == len(query) || !isIdentChar(query[after])
+}
+
 // removeUnionParam removes all occurrences of a case-insensitive parameter (e.g., "isfuzzy")
 // along with its =value and any trailing comma/whitespace, using a single-pass Builder.
 func removeUnionParam(input string, paramLower string, paramLen int) string {
@@ -2209,7 +2535,7 @@ func normalizeUnionParameters(query string) string {
 	// or: (union ...) -> union ...
 	// Also handles: (union ...) // comment -> union ... // comment
 	trimmed := strings.TrimSpace(result)
-	if strings.HasPrefix(trimmed, "(union") {
+	if strings.HasPrefix(strings.ToLower(trimmed), "(union") && (len(trimmed) == len("(union") || !isIdentChar(trimmed[len("(union")])) {
 		// Find the matching closing paren
 		depth := 0
 		for i := 0; i < len(trimmed); i++ {
@@ -2833,7 +3159,7 @@ func stripUnionFunctionParams(query string) string {
 	lowerResult := strings.ToLower(result)
 
 	// Find "union" keyword followed by any whitespace (space, tab, newline)
-	idx := strings.Index(lowerResult, "union")
+	idx := indexKeyword(lowerResult, "union", 0)
 	if idx == -1 {
 		return result
 	}
@@ -3294,7 +3620,6 @@ func replaceArgFunction(query string) string {
 // replaceExternalData replaces externaldata(...) [...] with (...) with a dummy table reference
 // Full syntax: externaldata (Column:Type, ...) [ @"url" ] with (option=value)
 func replaceExternalData(query string) string {
-	lowerQuery := strings.ToLower(query)
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
@@ -3302,35 +3627,27 @@ func replaceExternalData(query string) string {
 	searchFrom := 0
 
 	for {
-		idx := strings.Index(lowerQuery[searchFrom:], "externaldata")
+		idx := indexKeywordOutsideStrings(query, "externaldata", searchFrom)
 		if idx == -1 {
 			break
 		}
-		idx += searchFrom
 
-		// Find the matching closing parenthesis after externaldata(
-		openParenRel := strings.Index(query[idx:], "(")
-		if openParenRel == -1 {
-			break
+		openParen := idx + len("externaldata")
+		for openParen < len(query) && (query[openParen] == ' ' || query[openParen] == '\t' || query[openParen] == '\n' || query[openParen] == '\r') {
+			openParen++
 		}
-		openParen := idx + openParenRel
+		if openParen >= len(query) || query[openParen] != '(' {
+			searchFrom = idx + len("externaldata")
+			continue
+		}
 
-		depth := 1
-		closeParen := openParen + 1
-		for closeParen < len(query) && depth > 0 {
-			if query[closeParen] == '(' {
-				depth++
-			} else if query[closeParen] == ')' {
-				depth--
-			}
-			closeParen++
-		}
-		if depth != 0 {
+		closeParen := findMatchingParen(query, openParen)
+		if closeParen == -1 {
 			break
 		}
 
 		// Now look for the data source block: [ ... ]
-		end := closeParen
+		end := closeParen + 1
 		// Skip whitespace
 		for end < len(query) && (query[end] == ' ' || query[end] == '\t' || query[end] == '\n' || query[end] == '\r') {
 			end++
@@ -3352,7 +3669,7 @@ func replaceExternalData(query string) string {
 				end++
 			}
 			// Check for 'with' clause: with (...)
-			if end+4 < len(query) && lowerQuery[end:end+4] == "with" {
+			if end+4 <= len(query) && strings.EqualFold(query[end:end+4], "with") {
 				end += 4
 				// Skip whitespace
 				for end < len(query) && (query[end] == ' ' || query[end] == '\t' || query[end] == '\n' || query[end] == '\r') {
@@ -3360,15 +3677,8 @@ func replaceExternalData(query string) string {
 				}
 				// Find ( ... )
 				if end < len(query) && query[end] == '(' {
-					withDepth := 1
-					end++
-					for end < len(query) && withDepth > 0 {
-						if query[end] == '(' {
-							withDepth++
-						} else if query[end] == ')' {
-							withDepth--
-						}
-						end++
+					if closeWith := findMatchingParen(query, end); closeWith != -1 {
+						end = closeWith + 1
 					}
 				}
 			}
@@ -3392,24 +3702,30 @@ func replaceExternalData(query string) string {
 // stripDocumentationPreamble removes documentation wrappers from queries
 // Some queries are wrapped with "Description:...Query:..." headers
 func stripDocumentationPreamble(query string) string {
-	// Look for "Query:" or "Query:\n" pattern that separates description from actual query
-	lowerQuery := strings.ToLower(query)
-
-	// Check for common patterns like "Query:" or "KQL Query:" that precede the actual query
-	patterns := []string{"query:", "kql query:", "kql:"}
-	for _, pattern := range patterns {
-		idx := strings.Index(lowerQuery, pattern)
-		if idx != -1 {
-			// Return everything after the pattern marker
-			afterPattern := strings.TrimSpace(query[idx+len(pattern):])
-			if len(afterPattern) > 0 {
-				return afterPattern
+	// Process line by line, skipping documentation and finding where KQL starts
+	lines := strings.Split(query, "\n")
+	for i, line := range lines {
+		lineTrimmed := strings.TrimSpace(line)
+		lowerLine := strings.ToLower(lineTrimmed)
+		for _, marker := range []string{"query:", "kql query:", "kql:"} {
+			if lowerLine == marker {
+				return strings.TrimSpace(strings.Join(lines[i+1:], "\n"))
+			}
+			if strings.HasPrefix(lowerLine, marker+" ") {
+				markerStart := strings.Index(strings.ToLower(line), marker)
+				if markerStart == -1 {
+					continue
+				}
+				afterMarker := strings.TrimSpace(line[markerStart+len(marker):])
+				rest := strings.TrimSpace(strings.Join(lines[i+1:], "\n"))
+				if rest == "" {
+					return afterMarker
+				}
+				return strings.TrimSpace(afterMarker + "\n" + rest)
 			}
 		}
 	}
 
-	// Process line by line, skipping documentation and finding where KQL starts
-	lines := strings.Split(query, "\n")
 	for i, line := range lines {
 		lineTrimmed := strings.TrimSpace(line)
 		lowerLine := strings.ToLower(lineTrimmed)
@@ -3422,6 +3738,12 @@ func stripDocumentationPreamble(query string) string {
 		// Skip comment lines (// or #)
 		if strings.HasPrefix(lineTrimmed, "//") || strings.HasPrefix(lineTrimmed, "#") {
 			continue
+		}
+
+		// Parenthesized tabular expressions are common in KQL, especially
+		// `(union ...)` and `(Table | where ...)` query roots.
+		if strings.HasPrefix(lineTrimmed, "(") {
+			return strings.Join(lines[i:], "\n")
 		}
 
 		// Skip documentation-style lines (Key: Value pattern)
@@ -3440,8 +3762,8 @@ func stripDocumentationPreamble(query string) string {
 		isNaturalLanguage := false
 		wordCount := strings.Count(lineTrimmed, " ") + 1
 
-		// Lines with many words (>6) that don't start with | are likely natural language
-		if wordCount > 6 && !strings.HasPrefix(lineTrimmed, "|") {
+		// Lines with many words (>6) that don't start with a KQL operator are likely natural language.
+		if wordCount > 6 && !strings.HasPrefix(lineTrimmed, "|") && !hasKQLStarterPrefix(lowerLine) {
 			// Check it doesn't look like KQL with lots of conditions
 			// KQL lines with many words typically have operators like ==, contains, in, etc.
 			hasKQLOperator := strings.Contains(lineTrimmed, "==") ||
@@ -3457,7 +3779,7 @@ func stripDocumentationPreamble(query string) string {
 
 		// Also check for lines ending with punctuation that suggests natural language
 		lastChar := lineTrimmed[len(lineTrimmed)-1]
-		if (lastChar == ':' || lastChar == '.') && wordCount >= 4 {
+		if (lastChar == ':' || lastChar == '.') && wordCount >= 4 && !hasKQLStarterPrefix(lowerLine) {
 			isNaturalLanguage = true
 		}
 
@@ -3473,13 +3795,8 @@ func stripDocumentationPreamble(query string) string {
 			isLikelyKQL = true
 		}
 
-		// Direct KQL keyword starters
-		kqlStarters := []string{"let ", "union ", "where ", "search ", "find ", "range ", "print ", "datatable"}
-		for _, starter := range kqlStarters {
-			if strings.HasPrefix(lowerLine, starter) {
-				isLikelyKQL = true
-				break
-			}
+		if hasKQLStarterPrefix(lowerLine) {
+			isLikelyKQL = true
 		}
 
 		// Table name pattern: identifier possibly followed by | or newline
@@ -3547,6 +3864,16 @@ func stripDocumentationPreamble(query string) string {
 	}
 
 	return query
+}
+
+func hasKQLStarterPrefix(lowerLine string) bool {
+	kqlStarters := []string{"let", "union", "where", "search", "find", "range", "print", "datatable"}
+	for _, starter := range kqlStarters {
+		if lowerLine == starter || strings.HasPrefix(lowerLine, starter+" ") || strings.HasPrefix(lowerLine, starter+"\t") {
+			return true
+		}
+	}
+	return false
 }
 
 // stripDeclareStatements removes declare query_parameters(...) statements
@@ -3649,51 +3976,24 @@ func stripLeadingComments(query string) string {
 // replaceParameters replaces {Parameter} placeholders with dummy values
 func replaceParameters(query string) string {
 	// Common parameter patterns (non-time-related)
-	replacements := map[string]string{
-		"{SourceTable}":  "SecurityEvent",
-		"{TotalE5Seats}": "100",
-		"{Workspace}":    "workspace",
-		"{Subscription}": "subscription",
+	replacements := []struct {
+		param string
+		value string
+	}{
+		{param: "{SourceTable}", value: "SecurityEvent"},
+		{param: "{TotalE5Seats}", value: "100"},
+		{param: "{Workspace}", value: "workspace"},
+		{param: "{Subscription}", value: "subscription"},
 	}
 
 	result := query
 
 	// Handle double curly braces {{param}} (Jinja2/Sentinel/Logic Apps style)
 	// Convert to single curly braces first, then let regular handling take over
-	{
-		var b strings.Builder
-		b.Grow(len(result))
-		lastCopied := 0
-		dcChanged := false
-		searchFrom := 0
-		for {
-			start := strings.Index(result[searchFrom:], "{{")
-			if start == -1 {
-				break
-			}
-			start += searchFrom
-			end := strings.Index(result[start+2:], "}}")
-			if end == -1 {
-				break
-			}
-			end += start + 2
-			// Replace {{param}} with {param}
-			b.WriteString(result[lastCopied:start])
-			b.WriteByte('{')
-			b.WriteString(result[start+2 : end])
-			b.WriteByte('}')
-			lastCopied = end + 2
-			searchFrom = lastCopied
-			dcChanged = true
-		}
-		if dcChanged {
-			b.WriteString(result[lastCopied:])
-			result = b.String()
-		}
-	}
+	result = collapseDoubleCurlyParametersOutsideStrings(result)
 
-	for param, value := range replacements {
-		result = strings.ReplaceAll(result, param, value)
+	for _, replacement := range replacements {
+		result = replaceAllOutsideStrings(result, replacement.param, replacement.value)
 	}
 
 	// Handle time range parameters with context awareness
@@ -3702,43 +4002,102 @@ func replaceParameters(query string) string {
 
 	// Generic replacement for any remaining {param} patterns
 	// Replace {word} with a dummy identifier or expression depending on context
+	result = replaceGenericParametersOutsideStrings(result)
+
+	return result
+}
+
+func collapseDoubleCurlyParametersOutsideStrings(query string) string {
+	var b strings.Builder
+	b.Grow(len(query))
+	lastCopied := 0
+	changed := false
+	searchFrom := 0
 	for {
-		start := strings.Index(result, "{")
+		start := indexOutsideStrings(query, "{{", searchFrom, false)
 		if start == -1 {
 			break
 		}
-		end := strings.Index(result[start:], "}")
+		end := indexOutsideStrings(query, "}}", start+2, false)
 		if end == -1 {
 			break
 		}
-		end += start
-		// Get the entire {param}
-		param := result[start : end+1]
-		// Check if it looks like a parameter (contains only alphanumeric, underscore, colon)
-		inner := result[start+1 : end]
-		if isValidParamName(inner) {
-			// Check context to determine replacement value
-			replacement := "DummyParam"
-			// If parameter name suggests time range and appears after a field (for filter context)
-			lowerInner := strings.ToLower(inner)
-			if strings.Contains(lowerInner, "time") || strings.Contains(lowerInner, "timer") ||
-				strings.Contains(lowerInner, "date") || strings.Contains(lowerInner, "range") {
-				// Check if preceded by a field name (time filter context)
-				beforeParam := strings.TrimSpace(result[:start])
-				lastWord := getLastWord(beforeParam)
-				if strings.Contains(strings.ToLower(lastWord), "time") ||
-					strings.Contains(strings.ToLower(lastWord), "timestamp") ||
-					strings.Contains(strings.ToLower(lastWord), "date") {
-					replacement = "> ago(1d)"
-				}
-			}
-			result = strings.Replace(result, param, replacement, 1)
-		} else {
-			// Skip this one - might be a dynamic literal or regex
-			break
-		}
+
+		b.WriteString(query[lastCopied:start])
+		b.WriteByte('{')
+		b.WriteString(query[start+2 : end])
+		b.WriteByte('}')
+		lastCopied = end + 2
+		searchFrom = lastCopied
+		changed = true
 	}
 
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
+}
+
+func replaceAllOutsideStrings(query, old, new string) string {
+	var b strings.Builder
+	b.Grow(len(query))
+	lastCopied := 0
+	changed := false
+	searchFrom := 0
+	for {
+		idx := indexOutsideStrings(query, old, searchFrom, false)
+		if idx == -1 {
+			break
+		}
+		b.WriteString(query[lastCopied:idx])
+		b.WriteString(new)
+		lastCopied = idx + len(old)
+		searchFrom = lastCopied
+		changed = true
+	}
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
+}
+
+func replaceGenericParametersOutsideStrings(query string) string {
+	result := query
+	searchFrom := 0
+	for {
+		start := indexByteOutsideStrings(result, '{', searchFrom)
+		if start == -1 {
+			break
+		}
+		end := indexByteOutsideStrings(result, '}', start+1)
+		if end == -1 {
+			break
+		}
+
+		inner := result[start+1 : end]
+		if !isValidParamName(inner) {
+			searchFrom = start + 1
+			continue
+		}
+
+		replacement := "DummyParam"
+		lowerInner := strings.ToLower(inner)
+		if strings.Contains(lowerInner, "time") || strings.Contains(lowerInner, "timer") ||
+			strings.Contains(lowerInner, "date") || strings.Contains(lowerInner, "range") {
+			beforeParam := strings.TrimSpace(result[:start])
+			lastWord := getLastWord(beforeParam)
+			if strings.Contains(strings.ToLower(lastWord), "time") ||
+				strings.Contains(strings.ToLower(lastWord), "timestamp") ||
+				strings.Contains(strings.ToLower(lastWord), "date") {
+				replacement = "> ago(1d)"
+			}
+		}
+
+		result = result[:start] + replacement + result[end+1:]
+		searchFrom = start + len(replacement)
+	}
 	return result
 }
 
@@ -3755,11 +4114,10 @@ func replaceTimeRangeParams(query string) string {
 		searchFrom := 0
 
 		for {
-			idx := strings.Index(result[searchFrom:], param)
+			idx := indexOutsideStrings(result, param, searchFrom, false)
 			if idx == -1 {
 				break
 			}
-			idx += searchFrom
 
 			// Check context - what's before the parameter?
 			beforeParam := strings.TrimSpace(result[:idx])
@@ -4034,6 +4392,71 @@ func normalizeTopNested(query string) string {
 	}
 
 	return result
+}
+
+func normalizePartitionOperator(query string) string {
+	lowerQuery := strings.ToLower(query)
+	var b strings.Builder
+	b.Grow(len(query))
+	lastCopied := 0
+	changed := false
+	searchFrom := 0
+
+	for {
+		rel := strings.Index(lowerQuery[searchFrom:], "| partition")
+		if rel == -1 {
+			break
+		}
+		idx := searchFrom + rel
+		partitionStart := idx + len("| partition")
+		i := partitionStart
+		for i < len(query) && (query[i] == ' ' || query[i] == '\t' || query[i] == '\n' || query[i] == '\r') {
+			i++
+		}
+
+		if !hasKeywordPrefix(lowerQuery[i:], "by") {
+			searchFrom = partitionStart
+			continue
+		}
+		i += len("by")
+		for i < len(query) && (query[i] == ' ' || query[i] == '\t' || query[i] == '\n' || query[i] == '\r') {
+			i++
+		}
+
+		keyStart := i
+		for i < len(query) && query[i] != '(' && query[i] != '|' {
+			i++
+		}
+		if i >= len(query) || query[i] != '(' {
+			searchFrom = partitionStart
+			continue
+		}
+
+		key := strings.TrimSpace(query[keyStart:i])
+		if key == "" {
+			searchFrom = partitionStart
+			continue
+		}
+
+		close := findMatchingParen(query, i)
+		if close <= i {
+			searchFrom = partitionStart
+			continue
+		}
+
+		b.WriteString(query[lastCopied:idx])
+		b.WriteString("| summarize count() by ")
+		b.WriteString(key)
+		lastCopied = close + 1
+		searchFrom = close + 1
+		changed = true
+	}
+
+	if !changed {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // normalizeSearchOperator converts search statements to standard where clauses
@@ -5058,7 +5481,7 @@ func hasPortableFieldConditions(conditions []Condition) bool {
 		if condition.IsComputed {
 			continue
 		}
-		if condition.Field == "" || condition.Field == "_keyword_" {
+		if condition.Field == "" {
 			continue
 		}
 		if kqlKeywords[strings.ToLower(condition.Field)] {

@@ -41,6 +41,13 @@ type queryEntry struct {
 	Query  string `json:"query"`
 }
 
+type inputQueryEntry struct {
+	Source string `json:"source"`
+	Name   string `json:"name"`
+	Title  string `json:"title"`
+	Query  string `json:"query"`
+}
+
 type runResult struct {
 	ID           int64         `json:"id"`
 	Query        string        `json:"query,omitempty"`
@@ -152,6 +159,7 @@ func main() {
 		strict      = flag.Bool("strict", false, "exit non-zero if any generated case fails")
 		stopOnFirst = flag.Bool("stop-on-first", false, "stop scheduling new work after first failure")
 		unique      = flag.Bool("unique", false, "write only unique query strings; keep generating until n unique verified queries are written")
+		inputCorpus = flag.String("input-corpus", "", "JSON array of real query entries to verify instead of generated cases")
 	)
 	flag.Parse()
 
@@ -175,11 +183,172 @@ func main() {
 	defer fw.close()
 
 	start := time.Now()
+	if *inputCorpus != "" {
+		s, failureRecords := runInputCorpus(*inputCorpus, *failLimit, cw, fw, start)
+		printInputSummary(s, *inputCorpus, *failPath, failureRecords)
+		if *strict && s.Failed > 0 {
+			os.Exit(1)
+		}
+		return
+	}
+
 	s, failureRecords := runGenerated(*seed, *total, *workers, *failLimit, *progress, *stopOnFirst, *unique, cw, fw, start)
 	printSummary(s, *corpusPath, *failPath, failureRecords)
 	if *strict && s.Failed > 0 {
 		os.Exit(1)
 	}
+}
+
+func runInputCorpus(path string, failLimit int, cw *corpusWriter, fw *failureWriter, start time.Time) (summary, int) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fatalf("read input corpus: %v", err)
+	}
+	var entries []inputQueryEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		fatalf("parse input corpus: %v", err)
+	}
+
+	var s summary
+	var failureRecords int
+	for i, entry := range entries {
+		if strings.TrimSpace(entry.Query) == "" {
+			continue
+		}
+		s.Total++
+		result := processInputEntry(int64(i), entry)
+		if result.Failure == nil {
+			s.Passed++
+			if result.Verification != nil {
+				s.SigmaCheck++
+				s.BackCheck++
+				s.ParserConds += int64(result.Verification.ParserConditions)
+				s.SigmaConds += int64(result.Verification.SigmaConditions)
+				s.BackConds += int64(result.Verification.BackConditions)
+			}
+			if result.Entry != nil {
+				if err := cw.write(*result.Entry); err != nil {
+					fatalf("write corpus: %v", err)
+				}
+			}
+			continue
+		}
+		recordFailure(result, &s, &failureRecords, failLimit, fw)
+	}
+	s.Duration = time.Since(start)
+	return s, failureRecords
+}
+
+func processInputEntry(id int64, entry inputQueryEntry) runResult {
+	name := entry.Name
+	if name == "" {
+		name = entry.Title
+	}
+	result := runResult{
+		ID:    id,
+		Query: entry.Query,
+		Entry: &queryEntry{
+			Source: entry.Source,
+			Name:   name,
+			Query:  entry.Query,
+		},
+	}
+
+	kqlResult := kql.ExtractConditions(entry.Query)
+	if kqlResult == nil {
+		result.Failure = &failure{Stage: "kql_parse", Reason: "ExtractConditions returned nil"}
+		return result
+	}
+	if errors := unexpectedKQLErrors(kqlResult.Errors); len(errors) > 0 {
+		result.Failure = &failure{Stage: "kql_parse", Reason: "KQL parser returned errors", Errors: errors}
+		return result
+	}
+
+	actualKQL := normalizeKQLConditions(flattenKQLConditions(kqlResult))
+	if len(actualKQL) == 0 {
+		result.Failure = &failure{Stage: "kql_parse", Reason: "KQL parser extracted no conditions"}
+		return result
+	}
+
+	sigmaYAML, err := kqlResultToSigmaYAML(id, kqlResult)
+	if err != nil {
+		result.Failure = &failure{Stage: "sigma_build", Reason: err.Error()}
+		return result
+	}
+	result.SigmaYAML = sigmaYAML
+
+	sigmaResult := sigma.ExtractConditions(sigmaYAML)
+	if sigmaResult == nil {
+		result.Failure = &failure{Stage: "sigma_parse", Reason: "Sigma ExtractConditions returned nil"}
+		return result
+	}
+	if len(sigmaResult.Errors) > 0 {
+		result.Failure = &failure{Stage: "sigma_parse", Reason: "Sigma parser returned errors", Errors: sigmaResult.Errors}
+		return result
+	}
+
+	actualSigma := normalizeSigmaConditions(sigmaResult.Conditions)
+	if missing, extra := compareConditionSets(actualKQL, actualSigma); len(missing) > 0 || len(extra) > 0 {
+		result.Failure = &failure{
+			Stage:    "sigma_mismatch",
+			Reason:   "KQL parse result and Sigma parser result differ",
+			Expected: conditionKeys(actualKQL),
+			Actual:   conditionKeys(actualSigma),
+			Missing:  conditionKeys(missing),
+			Extra:    conditionKeys(extra),
+		}
+		return result
+	}
+
+	backKQL, err := sigmaResultToKQL(sigmaResult)
+	if err != nil {
+		result.Failure = &failure{Stage: "back_kql_build", Reason: err.Error()}
+		return result
+	}
+	result.BackKQL = backKQL
+
+	backResult := kql.ExtractConditions(backKQL)
+	if backResult == nil {
+		result.Failure = &failure{Stage: "back_kql_parse", Reason: "KQL parser returned nil for back-converted KQL"}
+		return result
+	}
+	if errors := unexpectedKQLErrors(backResult.Errors); len(errors) > 0 {
+		result.Failure = &failure{Stage: "back_kql_parse", Reason: "KQL parser returned errors for back-converted KQL", Errors: errors}
+		return result
+	}
+	actualBack := normalizeKQLConditions(flattenKQLConditions(backResult))
+	if missing, extra := compareConditionSets(actualSigma, actualBack); len(missing) > 0 || len(extra) > 0 {
+		result.Failure = &failure{
+			Stage:    "back_kql_mismatch",
+			Reason:   "Sigma parser result and back-converted KQL parser result differ",
+			Expected: conditionKeys(actualSigma),
+			Actual:   conditionKeys(actualBack),
+			Missing:  conditionKeys(missing),
+			Extra:    conditionKeys(extra),
+		}
+		return result
+	}
+
+	result.Verification = &verification{
+		ParserConditions: len(actualKQL),
+		SigmaConditions:  len(actualSigma),
+		BackConditions:   len(actualBack),
+	}
+	return result
+}
+
+func unexpectedKQLErrors(errors []string) []string {
+	var unexpected []string
+	for _, err := range errors {
+		switch err {
+		case "parser-native portable predicate extraction emitted conditions",
+			"parser-native keyword extraction emitted _keyword_ condition":
+			continue
+		default:
+			unexpected = append(unexpected, err)
+		}
+	}
+	return unexpected
 }
 
 func runGenerated(seed, target int64, workers, failLimit int, progress int64, stopOnFirst, unique bool, cw *corpusWriter, fw *failureWriter, start time.Time) (summary, int) {
@@ -651,8 +820,7 @@ func kqlResultToSigmaYAML(id int64, result *kql.ParseResult) (string, error) {
 
 func kqlConditionToSigmaSelection(cond kql.Condition, name string) sigmaSelection {
 	field := cond.Field
-	op, negated := canonicalKQLOperator(cond.Operator, cond.Negated)
-	values := conditionValues(cond.Value, cond.Alternatives)
+	op, values, negated := canonicalKQLCondition(cond)
 	if field == "" || op == "keyword" {
 		if len(values) > 1 {
 			return sigmaSelection{Name: name, Raw: values, Negated: negated}
@@ -663,12 +831,18 @@ func kqlConditionToSigmaSelection(cond kql.Condition, name string) sigmaSelectio
 	var value any = sigmaValue(values)
 	switch op {
 	case "=":
+		value = sigmaValue(escapeSigmaEqualityLiterals(values))
 	case "contains":
 		key += "|contains"
+		if isAllOfKQLOperator(cond.Operator) {
+			key += "|all"
+		}
 	case "startswith":
 		key += "|startswith"
 	case "endswith":
 		key += "|endswith"
+	case "matches regex":
+		key += "|re"
 	case ">":
 		key += "|gt"
 	case ">=":
@@ -677,6 +851,8 @@ func kqlConditionToSigmaSelection(cond kql.Condition, name string) sigmaSelectio
 		key += "|lt"
 	case "<=":
 		key += "|lte"
+	case "exists":
+		key += "|exists"
 	default:
 		key += "|" + op
 	}
@@ -717,7 +893,7 @@ func sigmaConditionToKQL(cond sigma.Condition) string {
 		if len(values) > 1 {
 			return fmt.Sprintf("%s in (%s)", cond.Field, joinKQLValues(values))
 		}
-		return fmt.Sprintf("%s == %s", cond.Field, formatKQLValue(first(values)))
+		return fmt.Sprintf("%s == %s", cond.Field, formatKQLValue(unescapeSigmaEqualityLiteral(first(values))))
 	case "contains":
 		return joinAlternativeExpressions(values, func(v string) string {
 			return fmt.Sprintf("%s contains %s", cond.Field, formatKQLValue(v))
@@ -746,6 +922,16 @@ func sigmaConditionToKQL(cond sigma.Condition) string {
 		return joinAlternativeExpressions(values, func(v string) string {
 			return fmt.Sprintf("%s <= %s", cond.Field, formatKQLValue(v))
 		})
+	case "matches":
+		return joinAlternativeExpressions(values, func(v string) string {
+			return fmt.Sprintf("%s matches regex %s", cond.Field, formatKQLValue(v))
+		})
+	case "exists":
+		exists := sigmaExistsValue(first(values))
+		if exists {
+			return fmt.Sprintf("isnotempty(%s)", cond.Field)
+		}
+		return fmt.Sprintf("isempty(%s)", cond.Field)
 	default:
 		return fmt.Sprintf("%s == %s", cond.Field, formatKQLValue(first(values)))
 	}
@@ -776,8 +962,8 @@ func normalizeExpected(conditions []expectedCondition) []normCondition {
 func normalizeKQLConditions(conditions []kql.Condition) []normCondition {
 	normalized := make([]normCondition, 0, len(conditions))
 	for _, cond := range conditions {
-		op, negated := canonicalKQLOperator(cond.Operator, cond.Negated)
-		for _, value := range conditionValues(cond.Value, cond.Alternatives) {
+		op, values, negated := canonicalKQLCondition(cond)
+		for _, value := range values {
 			normalized = append(normalized, normalizeParts(cond.Field, op, value, negated))
 		}
 	}
@@ -788,14 +974,40 @@ func normalizeSigmaConditions(conditions []sigma.Condition) []normCondition {
 	normalized := make([]normCondition, 0, len(conditions))
 	for _, cond := range conditions {
 		op := cond.Operator
-		if op == "keyword" {
+		values := conditionValues(cond.Value, cond.Alternatives)
+		negated := cond.Negated
+		switch op {
+		case "keyword":
 			op = "contains"
+		case "matches":
+			op = "matches regex"
+		case "exists":
+			exists := sigmaExistsValue(cond.Value)
+			if cond.Negated {
+				exists = !exists
+			}
+			values = []string{strconv.FormatBool(exists)}
+			negated = false
 		}
-		for _, value := range conditionValues(cond.Value, cond.Alternatives) {
-			normalized = append(normalized, normalizeParts(cond.Field, op, value, cond.Negated))
+		for _, value := range values {
+			normalized = append(normalized, normalizeParts(cond.Field, op, value, negated))
 		}
 	}
 	return dedupeNorm(normalized)
+}
+
+func canonicalKQLCondition(cond kql.Condition) (string, []string, bool) {
+	op, negated := canonicalKQLOperator(cond.Operator, cond.Negated)
+	values := conditionValues(cond.Value, cond.Alternatives)
+	switch op {
+	case "isnotnull":
+		exists := !negated
+		return "exists", []string{strconv.FormatBool(exists)}, false
+	case "isnull":
+		exists := negated
+		return "exists", []string{strconv.FormatBool(exists)}, false
+	}
+	return op, values, negated
 }
 
 func canonicalKQLOperator(op string, negated bool) (string, bool) {
@@ -804,23 +1016,38 @@ func canonicalKQLOperator(op string, negated bool) (string, bool) {
 		return "=", negated
 	case "!=", "!~":
 		return "=", !negated
-	case "contains", "contains_cs", "has", "has_cs":
+	case "contains", "contains_cs", "has", "has_cs", "has_any", "has_any_cs", "has_all", "has_all_cs":
 		return "contains", negated
-	case "!contains", "!contains_cs", "!has", "!has_cs":
+	case "!contains", "!contains_cs", "!has", "!has_cs", "!has_any", "!has_any_cs", "!has_all", "!has_all_cs":
 		return "contains", !negated
-	case "startswith", "startswith_cs":
+	case "startswith", "startswith_cs", "hasprefix", "hasprefix_cs":
 		return "startswith", negated
-	case "!startswith", "!startswith_cs":
+	case "!startswith", "!startswith_cs", "!hasprefix", "!hasprefix_cs":
 		return "startswith", !negated
-	case "endswith", "endswith_cs":
+	case "endswith", "endswith_cs", "hassuffix", "hassuffix_cs":
 		return "endswith", negated
-	case "!endswith", "!endswith_cs":
+	case "!endswith", "!endswith_cs", "!hassuffix", "!hassuffix_cs":
 		return "endswith", !negated
-	case "in":
+	case "matches regex", "matches", "re":
+		return "matches regex", negated
+	case "!matches regex", "!matches", "!re":
+		return "matches regex", !negated
+	case "in", "in~":
 		return "=", negated
+	case "!in", "!in~":
+		return "=", !negated
+	case "isnotnull", "isnotempty":
+		return "isnotnull", negated
+	case "isnull", "isempty":
+		return "isnull", negated
 	default:
 		return op, negated
 	}
+}
+
+func isAllOfKQLOperator(op string) bool {
+	op = strings.TrimPrefix(strings.ToLower(op), "!")
+	return op == "has_all" || op == "has_all_cs"
 }
 
 func normalizeParts(field, op, value string, negated bool) normCondition {
@@ -830,6 +1057,38 @@ func normalizeParts(field, op, value string, negated bool) normCondition {
 func canonicalValue(value string) string {
 	for strings.Contains(value, `\\`) {
 		value = strings.ReplaceAll(value, `\\`, `\`)
+	}
+	value = strings.ReplaceAll(value, `\"`, `"`)
+	value = unescapeSigmaEqualityLiteral(value)
+	return value
+}
+
+func sigmaExistsValue(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "true", "yes", "1":
+		return true
+	case "false", "no", "0":
+		return false
+	default:
+		return true
+	}
+}
+
+func escapeSigmaEqualityLiterals(values []string) []string {
+	out := make([]string, len(values))
+	for i, value := range values {
+		if value == "*" {
+			out[i] = `\*`
+		} else {
+			out[i] = value
+		}
+	}
+	return out
+}
+
+func unescapeSigmaEqualityLiteral(value string) string {
+	if value == `\*` {
+		return "*"
 	}
 	return value
 }
@@ -1137,6 +1396,17 @@ func printSummary(s summary, corpusPath, failPath string, failureRecords int) {
 	if corpusPath != "" {
 		fmt.Printf("verified corpus: %s\n", corpusPath)
 	}
+	if failPath != "" {
+		fmt.Printf("failure records: %s (%d written)\n", failPath, failureRecords)
+	}
+}
+
+func printInputSummary(s summary, inputPath, failPath string, failureRecords int) {
+	fmt.Printf("input=%s total=%d passed=%d failed=%d duration=%s\n", inputPath, s.Total, s.Passed, s.Failed, s.Duration)
+	fmt.Printf("assertions: sigma=%d back_conversion=%d\n", s.SigmaCheck, s.BackCheck)
+	fmt.Printf("conditions compared: parser=%d sigma=%d back=%d\n", s.ParserConds, s.SigmaConds, s.BackConds)
+	fmt.Printf("failures: kql_parse=%d sigma_parse=%d sigma_mismatch=%d back_kql_parse=%d back_kql_mismatch=%d\n",
+		s.KQLParseErrors, s.SigmaParseErrors, s.SigmaMismatch, s.BackKQLParseError, s.BackKQLMismatch)
 	if failPath != "" {
 		fmt.Printf("failure records: %s (%d written)\n", failPath, failureRecords)
 	}
