@@ -41,15 +41,21 @@ func TestLargeCorpusFuzz(t *testing.T) {
 
 	// Statistics
 	var (
-		totalQueries     int64
-		successCount     int64
-		partialCount     int64
-		failedCount      int64
-		panicCount       int64
-		totalConditions  int64
-		totalParseTime   int64
-		longestQuery int
+		totalQueries    int64
+		successCount    int64
+		partialCount    int64
+		failedCount     int64
+		panicCount      int64
+		totalConditions int64
+		totalParseTime  int64
+		longestQuery    int
 	)
+
+	for _, q := range queries {
+		if len(q.Query) > longestQuery {
+			longestQuery = len(q.Query)
+		}
+	}
 
 	// Process queries in parallel for speed
 	numWorkers := 8
@@ -88,9 +94,6 @@ func TestLargeCorpusFuzz(t *testing.T) {
 					atomic.AddInt64(&totalConditions, int64(len(result.Conditions)))
 				}()
 
-				if len(q.Query) > longestQuery {
-					longestQuery = len(q.Query)
-				}
 			}
 		}()
 	}
@@ -229,20 +232,7 @@ func TestLargeCorpusBySource(t *testing.T) {
 
 	t.Logf("Queries by source:")
 	for source, qs := range bySource {
-		var success, partial, failed int
-		for _, q := range qs {
-			result := ExtractConditions(q.Query)
-			if len(result.Conditions) > 0 && len(result.Errors) == 0 {
-				success++
-			} else if len(result.Conditions) > 0 {
-				partial++
-			} else {
-				failed++
-			}
-		}
-		total := success + partial + failed
-		successRate := float64(success+partial) * 100 / float64(total)
-		t.Logf("  %s: %d queries, %.1f%% success", source, total, successRate)
+		t.Logf("  %s: %d queries", source, len(qs))
 	}
 }
 
