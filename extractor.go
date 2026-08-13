@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/antlr4-go/antlr/v4"
 )
@@ -138,6 +140,10 @@ func normalizeQuery(query string) string {
 	// Fix escaped newlines from JSON extraction - but only outside of string literals
 	// This handles queries extracted from YAML/JSON where \r\n became literal characters
 	normalized = normalizeEscapeSequences(normalized)
+
+	// Normalize actual UTF-8 whitespace runes that the lexer does not treat as WS.
+	// Sentinel exports occasionally contain NBSP after query text.
+	normalized = normalizeUnicodeWhitespace(normalized)
 
 	// Strip documentation preambles like "Description:...Query:..."
 	// These are common in documentation templates where the actual query follows "Query:"
@@ -1044,6 +1050,107 @@ func normalizeEscapeSequences(query string) string {
 
 		result.WriteByte(c)
 		i++
+	}
+
+	return result.String()
+}
+
+// normalizeUnicodeWhitespace converts non-ASCII whitespace outside string
+// literals to regular spaces so the lexer does not emit ERROR_CHAR tokens.
+func normalizeUnicodeWhitespace(query string) string {
+	var result strings.Builder
+	result.Grow(len(query))
+
+	inString := false
+	stringChar := byte(0)
+	isVerbatim := false
+
+	for i := 0; i < len(query); {
+		c := query[i]
+
+		if !inString && c == '/' && i+1 < len(query) && query[i+1] == '/' {
+			for i < len(query) && query[i] != '\n' {
+				result.WriteByte(query[i])
+				i++
+			}
+			continue
+		}
+
+		if !inString && c == '/' && i+1 < len(query) && query[i+1] == '*' {
+			result.WriteByte(c)
+			result.WriteByte(query[i+1])
+			i += 2
+			for i < len(query) {
+				result.WriteByte(query[i])
+				if query[i] == '*' && i+1 < len(query) && query[i+1] == '/' {
+					i++
+					result.WriteByte(query[i])
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+
+		if !inString && (c == '"' || c == '\'') {
+			isVerbatim = i > 0 && query[i-1] == '@'
+			inString = true
+			stringChar = c
+			result.WriteByte(c)
+			i++
+			continue
+		}
+
+		if inString {
+			result.WriteByte(c)
+			if c == stringChar {
+				if isVerbatim {
+					if i+1 < len(query) && query[i+1] == c {
+						i++
+						result.WriteByte(query[i])
+					} else {
+						inString = false
+						isVerbatim = false
+					}
+				} else if stringChar == '"' {
+					backslashes := 0
+					for j := i - 1; j >= 0 && query[j] == '\\'; j-- {
+						backslashes++
+					}
+					if backslashes%2 == 0 {
+						inString = false
+					}
+				} else {
+					inString = false
+				}
+			}
+			i++
+			continue
+		}
+
+		if c < utf8.RuneSelf {
+			result.WriteByte(c)
+			i++
+			continue
+		}
+
+		r, size := utf8.DecodeRuneInString(query[i:])
+		if r == utf8.RuneError && size == 1 {
+			result.WriteByte(c)
+			i++
+			continue
+		}
+
+		switch {
+		case r == 0x200b || r == 0x200c || r == 0x200d || r == 0xfeff:
+			// Drop zero-width formatting characters outside string literals.
+		case unicode.IsSpace(r):
+			result.WriteByte(' ')
+		default:
+			result.WriteRune(r)
+		}
+		i += size
 	}
 
 	return result.String()

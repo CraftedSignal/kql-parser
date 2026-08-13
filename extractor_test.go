@@ -266,6 +266,29 @@ func TestNormalizeQuery_PreservesExternalDataInsideStrings(t *testing.T) {
 	}
 }
 
+func TestNormalizeQuery_UnicodeWhitespaceOutsideStrings(t *testing.T) {
+	query := "SecurityEvent | where EventID == 4624" + "\u00a0"
+	normalized := NormalizeQueryForDebug(query)
+	if strings.Contains(normalized, "\u00a0") {
+		t.Fatalf("normalization should rewrite non-breaking spaces outside strings, got:\n%s", normalized)
+	}
+
+	result := ExtractConditions(query)
+	if errors := unexpectedParserErrors(result.Errors); len(errors) > 0 {
+		t.Fatalf("unexpected parser errors: %v", errors)
+	}
+	if len(result.Conditions) != 1 {
+		t.Fatalf("expected one condition, got %+v", result.Conditions)
+	}
+
+	stringQuery := `SecurityEvent | where Message == "alpha` + "\u00a0" + `beta"`
+	result = ExtractConditions(stringQuery)
+	if errors := unexpectedParserErrors(result.Errors); len(errors) > 0 {
+		t.Fatalf("unexpected parser errors for string whitespace: %v", errors)
+	}
+	assertConditionValue(t, result.Conditions, "Message", "==", "alpha"+"\u00a0"+"beta")
+}
+
 func TestExtractConditions_KeywordConditionSkipsPortableDuplicate(t *testing.T) {
 	query := `SecurityEvent | where _keyword_ contains "a\\.b"`
 	result := ExtractConditions(query)
