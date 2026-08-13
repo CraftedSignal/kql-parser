@@ -5628,9 +5628,15 @@ func extractDataSourcesFromQuery(query string, letNames map[string]bool) []strin
 			sources = appendUnique(sources, source)
 		}
 	}
-	segments := splitPipeSegments(query)
+	segments := splitTopLevelPipeSegments(query)
 	for i, segment := range segments {
-		allowLeadingSource := len(segments) > 1 && i < len(segments)-1
+		// The first segment names the data source; later segments are operators,
+		// except the trailing one which never introduces a source. Requiring more
+		// than one segment here used to discard bare table queries ("SecurityEvent"),
+		// and — because a parenthesized join operand recurses through this function
+		// as its own single-segment query — it also discarded the right-hand table
+		// of every parenthesized join.
+		allowLeadingSource := i == 0 || i < len(segments)-1
 		for _, statement := range splitStatements(segment) {
 			for _, source := range extractDataSourcesFromStatement(statement, letNames, allowLeadingSource) {
 				sources = appendUnique(sources, source)
@@ -5963,6 +5969,10 @@ func extractWhereExpressions(query string) []string {
 	return expressions
 }
 
+// splitPipeSegments splits on every pipe regardless of nesting. Predicate
+// extraction depends on this: a parenthesised let-subquery such as
+// "let H = (T | where MD5 in (IOC));" must still yield its inner "where"
+// segments. Use splitTopLevelPipeSegments when nesting must be respected.
 func splitPipeSegments(query string) []string {
 	var segments []string
 	start := 0
@@ -5998,6 +6008,61 @@ func splitPipeSegments(query string) []string {
 		if ch == '|' {
 			segments = append(segments, query[start:i])
 			start = i + 1
+		}
+	}
+	segments = append(segments, query[start:])
+	return segments
+}
+
+// splitTopLevelPipeSegments splits on pipes at paren depth zero only, so a
+// parenthesised subquery stays intact. Data-source extraction needs this:
+// "T | join (U | where x) on k" must keep "(U | where x)" together, otherwise
+// the join operand is torn in half and U is never recognised as a source.
+func splitTopLevelPipeSegments(query string) []string {
+	var segments []string
+	start := 0
+	depth := 0
+	var quote byte
+	verbatim := false
+	for i := 0; i < len(query); i++ {
+		ch := query[i]
+		if quote != 0 {
+			if verbatim && ch == quote && i+1 < len(query) && query[i+1] == quote {
+				i++
+				continue
+			}
+			if ch == '\\' && !verbatim && i+1 < len(query) {
+				i++
+				continue
+			}
+			if ch == quote {
+				quote = 0
+				verbatim = false
+			}
+			continue
+		}
+		if ch == '@' && i+1 < len(query) && (query[i+1] == '"' || query[i+1] == '\'') {
+			quote = query[i+1]
+			verbatim = true
+			i++
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			quote = ch
+			continue
+		}
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case '|':
+			if depth == 0 {
+				segments = append(segments, query[start:i])
+				start = i + 1
+			}
 		}
 	}
 	segments = append(segments, query[start:])
