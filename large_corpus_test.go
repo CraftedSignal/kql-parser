@@ -289,11 +289,21 @@ func TestFindFailingQueries(t *testing.T) {
 		t.Fatalf("Failed to parse corpus: %v", err)
 	}
 
+	selected := queries
+	if os.Getenv("KQL_FULL_DIAGNOSTIC") != "1" && len(queries) > 1000 {
+		selected = make([]QueryEntry, 0, 1000)
+		step := len(queries) / 1000
+		for i := 0; i < len(queries) && len(selected) < 1000; i += step {
+			selected = append(selected, queries[i])
+		}
+		t.Logf("Testing diagnostic sample of %d queries from %d total; set KQL_FULL_DIAGNOSTIC=1 for full sweep", len(selected), len(queries))
+	}
+
 	// Collect unique error types
 	errorTypes := make(map[string]int)
 	var failedQueries []QueryEntry
 
-	for _, q := range queries {
+	for _, q := range selected {
 		result := ExtractConditions(q.Query)
 		if len(result.Conditions) == 0 && len(result.Errors) > 0 {
 			failedQueries = append(failedQueries, q)
