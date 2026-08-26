@@ -2,7 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/craftedsignal/kql-parser.svg)](https://pkg.go.dev/github.com/craftedsignal/kql-parser)
 [![Go Report Card](https://goreportcard.com/badge/github.com/craftedsignal/kql-parser)](https://goreportcard.com/report/github.com/craftedsignal/kql-parser)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 
 A production-ready Go parser for Kusto Query Language (KQL), built with ANTLR4. This parser extracts conditions, fields, and table references from KQL queries used in Microsoft Sentinel, Azure Data Explorer, and other Microsoft security products.
 
@@ -170,7 +170,7 @@ Contributions are welcome! Please ensure:
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+AGPL-3.0 - see [LICENSE](LICENSE) for details.
 
 ## Related Projects
 
