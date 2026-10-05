@@ -289,6 +289,143 @@ func TestNormalizeQuery_UnicodeWhitespaceOutsideStrings(t *testing.T) {
 	assertConditionValue(t, result.Conditions, "Message", "==", "alpha"+"\u00a0"+"beta")
 }
 
+func TestNormalizeQuery_EscapedUnicodeOutsideStrings(t *testing.T) {
+	query := `SecurityEvent\u00a0|\u00a0where EventID == 4624`
+	normalized := NormalizeQueryForDebug(query)
+	if strings.Contains(normalized, `\u00a0`) || !strings.Contains(normalized, "SecurityEvent | where EventID == 4624") {
+		t.Fatalf("escaped NBSP should normalize to KQL whitespace, got:\n%s", normalized)
+	}
+
+	result := ExtractConditions(query)
+	if errors := unexpectedParserErrors(result.Errors); len(errors) > 0 {
+		t.Fatalf("unexpected parser errors: %v", errors)
+	}
+	if !containsString(result.DataSources, "SecurityEvent") {
+		t.Fatalf("expected SecurityEvent datasource, got %v", result.DataSources)
+	}
+	assertConditionValue(t, result.Conditions, "EventID", "==", "4624")
+}
+
+func TestNormalizeQuery_EscapedUnicodeQuotesAndZeroWidth(t *testing.T) {
+	query := `Security\u200bEvent | where Message == \u201chello\u201d`
+	normalized := NormalizeQueryForDebug(query)
+	if strings.Contains(normalized, `\u200b`) || strings.Contains(normalized, `\u201c`) || strings.Contains(normalized, `\u201d`) {
+		t.Fatalf("escaped Unicode formatting should be normalized, got:\n%s", normalized)
+	}
+	if !strings.Contains(normalized, `SecurityEvent | where Message == "hello"`) {
+		t.Fatalf("expected zero-width char removed and smart quotes normalized, got:\n%s", normalized)
+	}
+
+	result := ExtractConditions(query)
+	if errors := unexpectedParserErrors(result.Errors); len(errors) > 0 {
+		t.Fatalf("unexpected parser errors: %v", errors)
+	}
+	if !containsString(result.DataSources, "SecurityEvent") {
+		t.Fatalf("expected SecurityEvent datasource, got %v", result.DataSources)
+	}
+	assertConditionValue(t, result.Conditions, "Message", "==", "hello")
+}
+
+func TestNormalizeQuery_FindOperatorPreservesConditionsAndProjection(t *testing.T) {
+	query := `find in (SecurityEvent, DeviceProcessEvents) where EventID == 4624 project EventID, Account`
+	normalized := NormalizeQueryForDebug(query)
+	if normalized != `DummyTable | where EventID == 4624 | project EventID, Account` {
+		t.Fatalf("unexpected normalized find query:\n%s", normalized)
+	}
+
+	result := ExtractConditions(query)
+	if errors := unexpectedParserErrors(result.Errors); len(errors) > 0 {
+		t.Fatalf("unexpected parser errors: %v", errors)
+	}
+	assertConditionValue(t, result.Conditions, "EventID", "==", "4624")
+	if !containsString(result.ProjectedFields, "EventID") || !containsString(result.ProjectedFields, "Account") {
+		t.Fatalf("expected projected fields from find query, got %v", result.ProjectedFields)
+	}
+}
+
+func TestNormalizeQuery_FindOperatorKeepsExistingProjectPipe(t *testing.T) {
+	query := "find in (SecurityEvent)\nwhere Account contains \"admin\" | project Account"
+	normalized := NormalizeQueryForDebug(query)
+	if strings.Contains(normalized, "| | project") || !strings.Contains(normalized, `DummyTable | where Account contains "admin" | project Account`) {
+		t.Fatalf("unexpected normalized piped find query:\n%s", normalized)
+	}
+
+	result := ExtractConditions(query)
+	if errors := unexpectedParserErrors(result.Errors); len(errors) > 0 {
+		t.Fatalf("unexpected parser errors: %v", errors)
+	}
+	assertConditionValue(t, result.Conditions, "Account", "contains", "admin")
+	if !containsString(result.ProjectedFields, "Account") {
+		t.Fatalf("expected Account projected field, got %v", result.ProjectedFields)
+	}
+}
+
+func TestNormalizeQuery_NamedFunctionParametersAtSource(t *testing.T) {
+	query := `parser(pack=true, mode="wide") | where EventID == 4624`
+	normalized := NormalizeQueryForDebug(query)
+	if strings.Contains(normalized, "pack=true") || !strings.Contains(normalized, `parser | where EventID == 4624`) {
+		t.Fatalf("expected named source function parameters stripped, got:\n%s", normalized)
+	}
+
+	result := ExtractConditions(query)
+	if errors := unexpectedParserErrors(result.Errors); len(errors) > 0 {
+		t.Fatalf("unexpected parser errors: %v", errors)
+	}
+	assertConditionValue(t, result.Conditions, "EventID", "==", "4624")
+	if !containsString(result.DataSources, "parser") {
+		t.Fatalf("expected parser datasource after stripping named params, got %v", result.DataSources)
+	}
+}
+
+func TestNormalizeQuery_NamedFunctionParameterDetectionIgnoresStringEquality(t *testing.T) {
+	query := `parser("x=y") | where EventID == 4624`
+	normalized := NormalizeQueryForDebug(query)
+	if !strings.Contains(normalized, `parser("x=y")`) {
+		t.Fatalf("string equality inside positional args should not be stripped, got:\n%s", normalized)
+	}
+}
+
+func TestNormalizeQuery_ArgFunctionTablePrefix(t *testing.T) {
+	query := `arg("11111111-1111-1111-1111-111111111111").Resources | where type == "microsoft.compute/virtualmachines"`
+	normalized := NormalizeQueryForDebug(query)
+	if strings.Contains(normalized, "arg(") || !strings.Contains(normalized, `Resources | where type == "microsoft.compute/virtualmachines"`) {
+		t.Fatalf("expected arg().Table prefix normalized to table name, got:\n%s", normalized)
+	}
+
+	result := ExtractConditions(query)
+	if errors := unexpectedParserErrors(result.Errors); len(errors) > 0 {
+		t.Fatalf("unexpected parser errors: %v", errors)
+	}
+	assertConditionValue(t, result.Conditions, "type", "==", "microsoft.compute/virtualmachines")
+	if !containsString(result.DataSources, "Resources") {
+		t.Fatalf("expected Resources datasource, got %v", result.DataSources)
+	}
+}
+
+func TestNormalizeQuery_DeclareQueryParametersPreamble(t *testing.T) {
+	query := `declare query_parameters(Account:string = "admin", Threshold:int = 5);
+SecurityEvent | where EventID == 4624 and AccountName == Account`
+	normalized := NormalizeQueryForDebug(query)
+	if strings.Contains(strings.ToLower(normalized), "declare query_parameters") || !strings.HasPrefix(normalized, "SecurityEvent | where") {
+		t.Fatalf("expected declare query_parameters preamble stripped, got:\n%s", normalized)
+	}
+
+	result := ExtractConditions(query)
+	if errors := unexpectedParserErrors(result.Errors); len(errors) > 0 {
+		t.Fatalf("unexpected parser errors: %v", errors)
+	}
+	assertConditionValue(t, result.Conditions, "EventID", "==", "4624")
+	foundReference := false
+	for _, condition := range result.Conditions {
+		if condition.Field == "AccountName" && condition.ValueReference == "Account" {
+			foundReference = true
+		}
+	}
+	if !foundReference {
+		t.Fatalf("expected AccountName field reference to Account parameter, got %+v", result.Conditions)
+	}
+}
+
 func TestExtractConditions_KeywordConditionSkipsPortableDuplicate(t *testing.T) {
 	query := `SecurityEvent | where _keyword_ contains "a\\.b"`
 	result := ExtractConditions(query)
@@ -552,6 +689,49 @@ func TestExtractConditions_LogicalOperators(t *testing.T) {
 	}
 }
 
+func TestExtractConditions_ORAcrossAndBranchesDoesNotMergeAlternatives(t *testing.T) {
+	query := `DeviceProcessEvents | where (InitiatingProcessCommandLine contains "whoami" and InitiatingProcessFileName endswith "\\cmd.exe") or (InitiatingProcessFileName endswith "\\powershell.exe" and InitiatingProcessCommandLine contains "hostname")`
+	result := ExtractConditions(query)
+	if len(result.Errors) > 0 {
+		t.Logf("Parse warnings/errors: %v", result.Errors)
+	}
+
+	var fileValues []string
+	for _, c := range result.Conditions {
+		if c.Field == "InitiatingProcessFileName" {
+			if len(c.Alternatives) > 0 {
+				t.Fatalf("file suffixes from separate OR branches must not be merged: %+v", c)
+			}
+			fileValues = append(fileValues, c.Value)
+		}
+	}
+
+	if len(fileValues) != 2 {
+		t.Fatalf("expected two separate file suffix conditions, got %v from %+v", fileValues, result.Conditions)
+	}
+}
+
+func TestExtractConditions_GroupedSameFieldOrAfterAndPreservesAlternatives(t *testing.T) {
+	query := `DeviceProcessEvents | where InitiatingProcessCommandLine contains "whoami" and (InitiatingProcessFileName endswith "\\cmd.exe" or InitiatingProcessFileName endswith "\\powershell.exe") and not(AccountName =~ "SYSTEM")`
+	result := ExtractConditions(query)
+	if len(result.Errors) > 0 {
+		t.Logf("Parse warnings/errors: %v", result.Errors)
+	}
+
+	found := false
+	for _, c := range result.Conditions {
+		if c.Field == "InitiatingProcessFileName" {
+			found = true
+			if len(c.Alternatives) != 2 {
+				t.Fatalf("expected grouped same-field OR alternatives, got %+v from %+v", c, result.Conditions)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected InitiatingProcessFileName condition in %+v", result.Conditions)
+	}
+}
+
 func TestExtractConditions_InOperator(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -585,6 +765,23 @@ func TestExtractConditions_InOperator(t *testing.T) {
 				t.Errorf("Expected field %q, got %q", tt.expectedField, result.Conditions[0].Field)
 			}
 		})
+	}
+}
+
+func TestExtractConditions_InTildePreservesOperator(t *testing.T) {
+	result := ExtractConditions(`SecurityEvent | where User !in~ ("SYSTEM", "LOCAL SERVICE")`)
+	if len(result.Conditions) != 1 {
+		t.Fatalf("expected one condition, got %#v errors %v", result.Conditions, result.Errors)
+	}
+	condition := result.Conditions[0]
+	if condition.Operator != "in~" {
+		t.Fatalf("expected in~ operator, got %#v", condition)
+	}
+	if !condition.Negated {
+		t.Fatalf("expected negated condition, got %#v", condition)
+	}
+	if len(condition.Alternatives) != 2 {
+		t.Fatalf("expected two alternatives, got %#v", condition)
 	}
 }
 
@@ -781,8 +978,10 @@ func TestExtractConditions_SummarizeAliasComputedFields(t *testing.T) {
 	}
 
 	// "failedattempts" should be in ComputedFields
-	if _, ok := result.ComputedFields["failedattempts"]; !ok {
+	if got, ok := result.ComputedFields["failedattempts"]; !ok {
 		t.Errorf("Expected 'failedattempts' to be in ComputedFields, got: %v", result.ComputedFields)
+	} else if got != "count()" {
+		t.Errorf("Expected failedattempts source count(), got %q", got)
 	}
 
 	// The "FailedAttempts > 10" condition should be marked as computed
@@ -797,6 +996,37 @@ func TestExtractConditions_SummarizeAliasComputedFields(t *testing.T) {
 	}
 	if !foundCondition {
 		t.Error("Expected to find 'FailedAttempts' condition from | where FailedAttempts > 10")
+	}
+}
+
+func TestExtractConditions_SummarizeAggregationComputedFields(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    string
+		alias    string
+		expected string
+	}{
+		{
+			name:     "sum",
+			query:    `SecurityEvent | summarize TotalBytes = sum(Bytes) by SourceIP`,
+			alias:    "totalbytes",
+			expected: "sum(Bytes)",
+		},
+		{
+			name:     "dcount",
+			query:    `SecurityEvent | summarize UniqueUsers = dcount(UserPrincipalName) by SourceIP`,
+			alias:    "uniqueusers",
+			expected: "dcount(UserPrincipalName)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ExtractConditions(tt.query)
+			if got := result.ComputedFields[tt.alias]; got != tt.expected {
+				t.Fatalf("expected %s=%q, got %q in %+v", tt.alias, tt.expected, got, result.ComputedFields)
+			}
+		})
 	}
 }
 
@@ -977,7 +1207,7 @@ func TestGroupORConditions(t *testing.T) {
 	}
 }
 
-func TestGroupORConditionsPreservesAlternativesAndNegation(t *testing.T) {
+func TestGroupORConditionsDoesNotMergeNegatedAlternatives(t *testing.T) {
 	conditions := []Condition{
 		{Field: "AccountName", Operator: "==", Value: "admin", Alternatives: []string{"admin", "root"}, Negated: true, LogicalOp: "AND"},
 		{Field: "AccountName", Operator: "==", Value: "SYSTEM", Alternatives: []string{"SYSTEM", "svc_*"}, Negated: true, LogicalOp: "OR"},
@@ -985,23 +1215,16 @@ func TestGroupORConditionsPreservesAlternativesAndNegation(t *testing.T) {
 	}
 
 	result := groupORConditions(conditions)
-	if len(result) != 2 {
-		t.Fatalf("Expected 2 conditions after grouping, got %d: %+v", len(result), result)
+	if len(result) != 3 {
+		t.Fatalf("Expected 3 conditions without negated OR grouping, got %d: %+v", len(result), result)
 	}
-	if !result[0].Negated {
-		t.Fatalf("Expected first grouped condition to stay negated: %+v", result[0])
-	}
-	seen := make(map[string]bool)
-	for _, value := range result[0].Alternatives {
-		seen[value] = true
-	}
-	for _, expected := range []string{"admin", "root", "SYSTEM", "svc_*"} {
-		if !seen[expected] {
-			t.Errorf("Expected alternative %q in %+v", expected, result[0])
+	for i := 0; i < 2; i++ {
+		if !result[i].Negated || len(result[i].Alternatives) == 0 {
+			t.Fatalf("Expected negated native alternatives to remain separate at %d: %+v", i, result)
 		}
 	}
-	if result[1].Negated || result[1].Value != "guest" {
-		t.Fatalf("Expected positive AccountName=guest to remain separate, got %+v", result[1])
+	if result[2].Negated || result[2].Value != "guest" {
+		t.Fatalf("Expected positive AccountName=guest to remain separate, got %+v", result[2])
 	}
 }
 

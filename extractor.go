@@ -37,16 +37,17 @@ type Condition struct {
 
 // ParseResult contains all conditions extracted from the query
 type ParseResult struct {
-	Conditions          []Condition       `json:"conditions"`
-	DataSources         []string          `json:"data_sources,omitempty"`         // Table/source names referenced by the query
-	LetStatements       []LetStatement    `json:"let_statements,omitempty"`       // KQL let variable definitions
-	ComputedFields      map[string]string `json:"computed_fields,omitempty"`      // Map of computed field name -> source field (from extend)
-	ComputedExpressions map[string]string `json:"computed_expressions,omitempty"` // Map of computed field name -> source expression
-	GroupByFields       []string          `json:"group_by_fields,omitempty"`      // Fields from summarize BY clauses
-	Commands            []string          `json:"commands,omitempty"`             // List of commands used in the query (summarize, extend, etc.)
-	ProjectedFields     []string          `json:"projected_fields,omitempty"`     // Fields selected by project operators
-	Joins               []JoinInfo        `json:"joins,omitempty"`
-	Errors              []string          `json:"errors,omitempty"`
+	Conditions          []Condition          `json:"conditions"`
+	Expression          *ConditionExpression `json:"expression,omitempty"`
+	DataSources         []string             `json:"data_sources,omitempty"`         // Table/source names referenced by the query
+	LetStatements       []LetStatement       `json:"let_statements,omitempty"`       // KQL let variable definitions
+	ComputedFields      map[string]string    `json:"computed_fields,omitempty"`      // Map of computed field name -> source field (from extend)
+	ComputedExpressions map[string]string    `json:"computed_expressions,omitempty"` // Map of computed field name -> source expression
+	GroupByFields       []string             `json:"group_by_fields,omitempty"`      // Fields from summarize BY clauses
+	Commands            []string             `json:"commands,omitempty"`             // List of commands used in the query (summarize, extend, etc.)
+	ProjectedFields     []string             `json:"projected_fields,omitempty"`     // Fields selected by project operators
+	Joins               []JoinInfo           `json:"joins,omitempty"`
+	Errors              []string             `json:"errors,omitempty"`
 }
 
 // FieldProvenance indicates where a field originates relative to a join
@@ -182,17 +183,6 @@ func normalizeQuery(query string) string {
 	// Rename reserved keywords used as field names
 	// "pattern" is a reserved word in the grammar but used as a field name in some queries
 	normalized = renameReservedFieldNames(normalized)
-
-	// Convert case-sensitive IN operators to standard forms
-	// in~ -> in (case-insensitive IN becomes regular IN for parsing)
-	// !in~ -> !in (case-insensitive NOT IN becomes regular NOT IN)
-	normalized = strings.ReplaceAll(normalized, "!in~", "!in")
-	normalized = strings.ReplaceAll(normalized, " in~ ", " in ")
-	normalized = strings.ReplaceAll(normalized, "\tin~\t", "\tin\t")
-	normalized = strings.ReplaceAll(normalized, "\tin~ ", "\tin ")
-	normalized = strings.ReplaceAll(normalized, " in~\t", " in\t")
-	normalized = strings.ReplaceAll(normalized, "\nin~", "\nin")
-	normalized = strings.ReplaceAll(normalized, "in~(", "in(")
 
 	// Convert make_set and make_list aliases used by existing parser fixtures.
 	// Handle both make_set( and make_set ( with space.
@@ -1143,7 +1133,7 @@ func normalizeUnicodeWhitespace(query string) string {
 		}
 
 		switch {
-		case r == 0x200b || r == 0x200c || r == 0x200d || r == 0xfeff:
+		case r == 0x200b || r == 0x200c || r == 0x200d || r == 0x2060 || r == 0xfeff:
 			// Drop zero-width formatting characters outside string literals.
 		case unicode.IsSpace(r):
 			result.WriteByte(' ')
@@ -1185,7 +1175,7 @@ func handleUnicodeEscape(hex string, result *strings.Builder) {
 	}
 	// Replace certain problematic Unicode chars with space or skip them
 	switch codepoint {
-	case 0x200b, 0x200c, 0x200d, 0xfeff: // zero-width chars
+	case 0x200b, 0x200c, 0x200d, 0x2060, 0xfeff: // zero-width chars
 		// Skip these entirely
 	case 0x202f, 0x00a0: // narrow no-break space, no-break space
 		result.WriteByte(' ')
@@ -1375,22 +1365,30 @@ func normalizeLookupSubquery(query string) string {
 	searchFrom := 0
 
 	for {
-		// Find "lookup " or "lookup("
-		idx := strings.Index(lowerQuery[searchFrom:], "lookup ")
-		idx2 := strings.Index(lowerQuery[searchFrom:], "lookup(")
-		if idx == -1 && idx2 == -1 {
+		idx := indexKeyword(lowerQuery, "lookup", searchFrom)
+		if idx == -1 {
 			break
 		}
-		// Pick the earliest match
-		if idx == -1 || (idx2 != -1 && idx2 < idx) {
-			idx = idx2
-		}
-		idx += searchFrom
 
 		// Find the opening paren
 		parenStart := idx + 6
-		for parenStart < len(query) && (query[parenStart] == ' ' || query[parenStart] == '\t') {
+		for parenStart < len(query) && (query[parenStart] == ' ' || query[parenStart] == '\t' || query[parenStart] == '\n' || query[parenStart] == '\r') {
 			parenStart++
+		}
+
+		if parenStart < len(query) && query[parenStart] != '(' {
+			optionStart := parenStart
+			for parenStart < len(query) && query[parenStart] != '(' && query[parenStart] != '|' && query[parenStart] != ' ' && query[parenStart] != '\t' && query[parenStart] != '\n' && query[parenStart] != '\r' {
+				parenStart++
+			}
+			optionText := strings.TrimSpace(lowerQuery[optionStart:parenStart])
+			if optionText == "" || !strings.HasPrefix(optionText, "kind=") {
+				searchFrom = idx + 6
+				continue
+			}
+			for parenStart < len(query) && (query[parenStart] == ' ' || query[parenStart] == '\t') {
+				parenStart++
+			}
 		}
 
 		if parenStart >= len(query) || query[parenStart] != '(' {
@@ -1840,19 +1838,56 @@ func normalizeDistinctColumnList(columns string) string {
 
 		// Check if followed by = (alias assignment: Alias = Field)
 		if i < len(columns) && columns[i] == '=' {
-			// Skip the alias and = sign, read the actual field
+			// Skip the alias and = sign, read the actual expression until the
+			// next top-level comma. The RHS can be a wrapper function such as
+			// tostring(Device.Name), not only a bare identifier.
 			i++ // skip =
 			// Skip whitespace after =
 			for i < len(columns) && (columns[i] == ' ' || columns[i] == '\t') {
 				i++
 			}
-			// Now read the actual field identifier
-			fieldStart := i
-			for i < len(columns) && (isIdentChar(columns[i]) || columns[i] == '.') {
+			exprStart := i
+			depth := 0
+			var quote byte
+			for i < len(columns) {
+				ch := columns[i]
+				if quote != 0 {
+					if ch == '\\' && i+1 < len(columns) {
+						i += 2
+						continue
+					}
+					if ch == quote {
+						quote = 0
+					}
+					i++
+					continue
+				}
+				if ch == '"' || ch == '\'' {
+					quote = ch
+					i++
+					continue
+				}
+				switch ch {
+				case '(':
+					depth++
+				case ')':
+					if depth > 0 {
+						depth--
+					}
+				case ',':
+					if depth == 0 {
+						goto writeAliasExpression
+					}
+				}
 				i++
 			}
-			fieldName := columns[fieldStart:i]
-			result.WriteString(fieldName)
+		writeAliasExpression:
+			expression := strings.TrimSpace(columns[exprStart:i])
+			if expression == "" {
+				result.WriteString("_distinct_col_")
+			} else {
+				result.WriteString(normalizeDistinctColumnList(expression))
+			}
 			continue
 		}
 
@@ -1883,15 +1918,15 @@ func normalizeDistinctColumnList(columns string) string {
 			// Extract the first argument from any function call
 			// For distinct, the grammar doesn't support function calls at all
 			if parenDepth == 0 {
-				// Get content inside parentheses
+				// Get content inside parentheses. Only unwrap single-argument
+				// wrappers; multi-argument calls carry semantics we must keep.
 				content := columns[argStart : i-1]
-				// Find first argument (before first comma if multi-arg)
-				firstArg := content
-				commaPos := strings.Index(content, ",")
-				if commaPos >= 0 {
-					firstArg = content[:commaPos]
+				args := splitCommaList(content)
+				if len(args) != 1 {
+					result.WriteString(columns[start:i])
+					continue
 				}
-				firstArg = strings.TrimSpace(firstArg)
+				firstArg := strings.TrimSpace(stripOuterParens(args[0]))
 
 				// Check if first arg is a simple identifier (optionally with dots)
 				isSimple := len(firstArg) > 0
@@ -2143,6 +2178,7 @@ func normalizeTrailingDecimals(query string) string {
 					if i+1 < len(query) && query[i+1] == stringChar {
 						result.WriteByte(c)
 						i++
+						result.WriteByte(query[i])
 						continue
 					}
 					inString = false
@@ -3667,12 +3703,8 @@ func replaceArgFunction(query string) string {
 
 		// Check it's at word boundary
 		if idx > 0 && isIdentChar(query[idx-1]) {
-			// Not at word boundary, skip this occurrence — replace "arg" with "___" in output
-			b.WriteString(query[lastCopied:idx])
-			b.WriteString("___")
-			lastCopied = idx + 3
-			searchFrom = idx + 4
-			changed = true
+			// Not a standalone arg(...) call; leave the identifier unchanged.
+			searchFrom = idx + len("arg")
 			continue
 		}
 
@@ -4727,23 +4759,41 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 	allErrors = append(allErrors, extractor.errors...)
 
 	// Post-process to group OR conditions on same field
-	conditions := groupORConditions(extractor.conditions)
+	rawConditions := append([]Condition(nil), extractor.conditions...)
+	conditions, conditionIndexMap := groupORConditionsWithIndexMap(extractor.conditions)
+	expression := remapConditionExpression(buildConditionExpression(tree, rawConditions), conditionIndexMap)
 	if !hasPortableFieldConditions(conditions) {
 		var note string
 		var extracted []Condition
 		extracted, note = extractPortableConditions(query, normalizedQuery)
+		portableStart := len(conditions)
 		for _, condition := range extracted {
 			if !containsCondition(conditions, condition) {
 				conditions = append(conditions, condition)
 			}
 		}
+		if expression != nil && len(conditions) > portableStart {
+			expression = appendConditionRangeExpression(expression, portableStart, len(conditions))
+		}
 		if note != "" {
 			allErrors = append(allErrors, note)
+		}
+	}
+	if keyword := extractLeadingSearchKeyword(query); keyword != "" {
+		condition := portableKeywordCondition(keyword)
+		if !containsCondition(conditions, condition) {
+			portableStart := len(conditions)
+			conditions = append(conditions, condition)
+			if expression != nil {
+				expression = appendConditionRangeExpression(expression, portableStart, len(conditions))
+			}
+			allErrors = append(allErrors, portableKeywordExtractionNote)
 		}
 	}
 
 	return &ParseResult{
 		Conditions:          conditions,
+		Expression:          expression,
 		DataSources:         extractPortableDataSources(query, normalizedQuery),
 		LetStatements:       extractLetStatements(query),
 		ComputedFields:      extractor.computedFields,
@@ -5009,18 +5059,17 @@ func (e *conditionExtractor) EnterAggregationItem(ctx *AggregationItemContext) {
 	if ctx.ASSIGN() != nil || ctx.AS() != nil {
 		sourceField := ""
 		if ctx.AggregationFunction() != nil {
-			// Try to extract source field from the aggregation function's expression
-			if ctx.AggregationFunction().FunctionCall() != nil {
-				fc := ctx.AggregationFunction().FunctionCall()
-				if fc.Identifier() != nil {
-					// The function name itself (count, sum, avg, etc.)
-					funcName := strings.ToLower(fc.Identifier().GetText())
-					sourceField = funcName
-				}
-			}
+			sourceField = aggregationFunctionText(ctx.AggregationFunction())
 		}
 		e.computedFields[strings.ToLower(alias)] = sourceField
 	}
+}
+
+func aggregationFunctionText(ctx IAggregationFunctionContext) string {
+	if ctx == nil || ctx.FunctionCall() == nil {
+		return ""
+	}
+	return ctx.FunctionCall().GetText()
 }
 
 // EnterGroupByItem extracts field names from summarize BY clauses.
@@ -5226,7 +5275,11 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 		if len(addExprs) >= 1 && ctx.ExpressionList() != nil {
 			leftText := addExprs[0].GetText()
 			isNegated := (hasNOT_IN || hasNOT_IN_CS) != e.negated
-			e.handleInOperator(leftText, ctx.ExpressionList(), isNegated)
+			operator := "in"
+			if hasIN_CS || hasNOT_IN_CS || strings.Contains(strings.ToLower(ctx.GetText()), "in~") {
+				operator = "in~"
+			}
+			e.handleInOperator(leftText, ctx.ExpressionList(), operator, isNegated)
 		}
 		return
 	}
@@ -5281,23 +5334,29 @@ func (e *conditionExtractor) handleComparison(left, op, right string) {
 
 	// Extract value (remove quotes if present)
 	value := extractValue(right)
+	valueReference := ""
+	if kqlValueIsFieldReference(right, value) {
+		valueReference = value
+		value = ""
+	}
 
 	cond := Condition{
-		Field:       left,
-		Operator:    normalizedOp,
-		Value:       value,
-		Negated:     e.negated,
-		PipeStage:   e.currentStage,
-		LogicalOp:   e.lastLogicalOp,
-		IsComputed:  isComputed,
-		SourceField: sourceField,
+		Field:          left,
+		Operator:       normalizedOp,
+		Value:          value,
+		ValueReference: valueReference,
+		Negated:        e.negated,
+		PipeStage:      e.currentStage,
+		LogicalOp:      e.lastLogicalOp,
+		IsComputed:     isComputed,
+		SourceField:    sourceField,
 	}
 	e.conditions = append(e.conditions, cond)
 	e.lastLogicalOp = "AND" // reset to default
 }
 
 // handleInOperator processes IN operator conditions
-func (e *conditionExtractor) handleInOperator(field string, exprList IExpressionListContext, negated bool) {
+func (e *conditionExtractor) handleInOperator(field string, exprList IExpressionListContext, operator string, negated bool) {
 	if !isValidFieldName(field) {
 		return
 	}
@@ -5316,7 +5375,7 @@ func (e *conditionExtractor) handleInOperator(field string, exprList IExpression
 	}
 	cond := Condition{
 		Field:        field,
-		Operator:     "in",
+		Operator:     operator,
 		Value:        values[0],
 		Negated:      negated,
 		PipeStage:    e.currentStage,
@@ -5531,6 +5590,25 @@ func extractValue(s string) string {
 	}
 
 	return s
+}
+
+func kqlValueIsFieldReference(raw, value string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	if strings.HasPrefix(raw, `"`) || strings.HasPrefix(raw, `'`) || strings.HasPrefix(raw, `@"`) || strings.HasPrefix(raw, `@'`) {
+		return false
+	}
+	value = strings.TrimSpace(value)
+	if !isSimpleIdentifier(value) {
+		return false
+	}
+	switch strings.ToLower(value) {
+	case "true", "false", "null":
+		return false
+	}
+	return true
 }
 
 func extractPortableDataSources(originalQuery, normalizedQuery string) []string {
@@ -5912,13 +5990,17 @@ func extractPortableConditions(originalQuery, normalizedQuery string) ([]Conditi
 	if keyword == "" {
 		return nil, ""
 	}
-	return []Condition{{
+	return []Condition{portableKeywordCondition(keyword)}, portableKeywordExtractionNote
+}
+
+func portableKeywordCondition(keyword string) Condition {
+	return Condition{
 		Field:     "_keyword_",
 		Operator:  "contains",
 		Value:     keyword,
 		PipeStage: 1,
 		LogicalOp: "AND",
-	}}, portableKeywordExtractionNote
+	}
 }
 
 func extractPortablePredicates(query string) []Condition {
@@ -6511,6 +6593,9 @@ func extractPortableKeyword(query string) string {
 	if isTrivialPortableQuery(query) {
 		return ""
 	}
+	if term := extractLeadingSearchKeyword(query); term != "" {
+		return term
+	}
 	if term := extractSearchKeyword(query); term != "" {
 		return term
 	}
@@ -6520,7 +6605,10 @@ func extractPortableKeyword(query string) string {
 	if ident := extractFinalIdentifier(query); ident != "" {
 		return ident
 	}
-	if literal := firstStringLiteral(query); literal != "" && !looksLikeURL(literal) {
+	if literal := firstStringLiteral(query); literal != "" {
+		if looksLikeURL(literal) {
+			return ""
+		}
 		return literal
 	}
 	return compactKeyword(query)
@@ -6560,14 +6648,52 @@ func extractSearchKeyword(query string) string {
 	return ""
 }
 
-func extractExternalDataAlias(query string) string {
-	for _, line := range strings.Split(normalizeNewlines(query), "\n") {
-		name, rhs, ok := parseLetAssignment(strings.TrimSpace(line))
-		if ok && strings.Contains(strings.ToLower(rhs), "externaldata") {
-			return name
-		}
+func extractLeadingSearchKeyword(query string) string {
+	trimmed := strings.TrimSpace(query)
+	if len(trimmed) < len("search") {
+		return ""
 	}
-	return ""
+	lower := strings.ToLower(trimmed)
+	if !strings.HasPrefix(lower, "search") {
+		return ""
+	}
+	if len(trimmed) > len("search") && isIdentChar(trimmed[len("search")]) {
+		return ""
+	}
+
+	rest := strings.TrimSpace(trimmed[len("search"):])
+	if rest == "" {
+		return ""
+	}
+	lowerRest := strings.ToLower(rest)
+	if strings.HasPrefix(lowerRest, "kind=") {
+		end := strings.IndexAny(rest, " \t\r\n")
+		if end < 0 {
+			return ""
+		}
+		rest = strings.TrimSpace(rest[end:])
+		lowerRest = strings.ToLower(rest)
+	}
+
+	if strings.HasPrefix(lowerRest, "in ") || strings.HasPrefix(lowerRest, "in(") {
+		open := strings.Index(rest, "(")
+		if open < 0 {
+			return ""
+		}
+		close := findMatchingParen(rest, open)
+		if close <= open {
+			return ""
+		}
+		rest = strings.TrimSpace(rest[close+1:])
+	}
+	if rest == "" || strings.HasPrefix(rest, "|") {
+		return ""
+	}
+	value, _, ok := parseStringLiteral(rest)
+	if !ok || looksLikeURL(value) {
+		return ""
+	}
+	return value
 }
 
 func parseLetAssignment(line string) (string, string, bool) {
@@ -6777,17 +6903,26 @@ func extractExpressionListValues(ctx IExpressionListContext) []string {
 
 // groupORConditions groups consecutive OR conditions on the same field
 func groupORConditions(conditions []Condition) []Condition {
+	grouped, _ := groupORConditionsWithIndexMap(conditions)
+	return grouped
+}
+
+func groupORConditionsWithIndexMap(conditions []Condition) ([]Condition, []int) {
 	if len(conditions) == 0 {
-		return conditions
+		return conditions, nil
 	}
 
 	result := make([]Condition, 0, len(conditions))
+	indexMap := make([]int, len(conditions))
+	for i := range indexMap {
+		indexMap[i] = -1
+	}
 
 	for i := 0; i < len(conditions); i++ {
 		cond := conditions[i]
 
 		// Look ahead for OR conditions on the same field
-		if i+1 < len(conditions) && conditions[i+1].LogicalOp == "OR" && sameConditionGroup(cond, conditions[i+1]) {
+		if i+1 < len(conditions) && conditions[i+1].LogicalOp == "OR" && sameConditionGroup(cond, conditions[i+1]) && canMergeAlternativeGroup(conditions, i) {
 			alternatives := conditionAlternatives(cond)
 
 			j := i + 1
@@ -6803,22 +6938,42 @@ func groupORConditions(conditions []Condition) []Condition {
 
 			if len(alternatives) > 1 {
 				cond.Alternatives = deduplicateConditionValues(alternatives)
+				groupedIndex := len(result)
 				result = append(result, cond)
+				for rawIndex := i; rawIndex < j; rawIndex++ {
+					indexMap[rawIndex] = groupedIndex
+				}
+				if j < len(conditions) && strings.EqualFold(conditions[j].LogicalOp, "OR") {
+					conditions[j].LogicalOp = "AND"
+				}
 				i = j - 1 // skip the grouped conditions
 				continue
 			}
 		}
 
+		indexMap[i] = len(result)
 		result = append(result, cond)
 	}
 
-	return result
+	return result, indexMap
+}
+
+func canMergeAlternativeGroup(conditions []Condition, index int) bool {
+	if index == 0 || strings.EqualFold(conditions[index].LogicalOp, "OR") {
+		return true
+	}
+	j := index + 1
+	for j < len(conditions) && strings.EqualFold(conditions[j].LogicalOp, "OR") && sameConditionGroup(conditions[index], conditions[j]) {
+		j++
+	}
+	return j == len(conditions) || strings.EqualFold(conditions[j].LogicalOp, "OR")
 }
 
 func sameConditionGroup(a, b Condition) bool {
 	return strings.EqualFold(a.Field, b.Field) &&
 		a.Operator == b.Operator &&
-		a.Negated == b.Negated &&
+		!a.Negated &&
+		!b.Negated &&
 		a.IsComputed == b.IsComputed &&
 		strings.EqualFold(a.SourceField, b.SourceField)
 }
@@ -6907,6 +7062,9 @@ func DeduplicateConditions(conditions []Condition) []Condition {
 // IsStatisticalQuery checks if the parse result contains aggregation commands
 // (summarize) that create computed fields making static analysis unreliable
 func IsStatisticalQuery(result *ParseResult) bool {
+	if result == nil {
+		return false
+	}
 	for _, cmd := range result.Commands {
 		if cmd == "summarize" {
 			return true
@@ -6918,6 +7076,9 @@ func IsStatisticalQuery(result *ParseResult) bool {
 // HasUnmappedComputedFields checks if any computed field used in conditions
 // could not be traced back to a source field
 func HasUnmappedComputedFields(result *ParseResult) bool {
+	if result == nil {
+		return false
+	}
 	for _, cond := range result.Conditions {
 		if cond.IsComputed && cond.SourceField == "" {
 			return true
@@ -6929,6 +7090,9 @@ func HasUnmappedComputedFields(result *ParseResult) bool {
 // HasComplexWhereConditions checks if the query has where clauses with complex functions
 // (regex matching, CIDR matching, etc.) that can't be validated statically
 func HasComplexWhereConditions(result *ParseResult) bool {
+	if result == nil {
+		return false
+	}
 	// Check if "where" command is used
 	hasWhere := false
 	for _, cmd := range result.Commands {
@@ -6968,6 +7132,9 @@ func HasComplexWhereConditions(result *ParseResult) bool {
 // GetEventTypeFromConditions detects Windows Event types based on EventID conditions
 // Returns event type strings like "windows_4688", "sysmon_1", etc.
 func GetEventTypeFromConditions(result *ParseResult) string {
+	if result == nil {
+		return ""
+	}
 	var eventID string
 
 	for _, cond := range result.Conditions {
