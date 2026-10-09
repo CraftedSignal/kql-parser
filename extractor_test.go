@@ -620,8 +620,15 @@ func TestExtractConditions_PortablePredicateExtractionComputedWhere(t *testing.T
 	if !containsString(result.DataSources, "CopilotActivity") {
 		t.Fatalf("expected CopilotActivity datasource, got %v", result.DataSources)
 	}
-	if !containsString(result.Errors, portablePredicateExtractionNote) {
-		t.Fatalf("expected parser-native portable predicate extraction note, got %v", result.Errors)
+	// The tree walker reports the filter on the computed column, so the text
+	// fallback, which cannot tell computed columns from raw ones, adds nothing.
+	for _, condition := range result.Conditions {
+		if condition.Field == "XPIADetected" && !condition.IsComputed {
+			t.Fatalf("filter on computed column XPIADetected reported as a raw column: %+v", result.Conditions)
+		}
+	}
+	if containsString(result.Errors, portablePredicateExtractionNote) {
+		t.Fatalf("fallback added no conditions but reported %q", portablePredicateExtractionNote)
 	}
 }
 

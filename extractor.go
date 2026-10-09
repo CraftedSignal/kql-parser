@@ -33,6 +33,7 @@ type Condition struct {
 	Alternatives   []string `json:"alternatives,omitempty"` // For OR conditions on same field
 	IsComputed     bool     `json:"is_computed,omitempty"`  // True if field was created by extend/project
 	SourceField    string   `json:"source_field,omitempty"` // Original field before transformation (for computed fields)
+	Pipeline       int      `json:"pipeline"`               // Index in ParseResult.Pipelines of the pipeline the condition filters
 }
 
 // ParseResult contains all conditions extracted from the query
@@ -44,10 +45,35 @@ type ParseResult struct {
 	ComputedFields      map[string]string    `json:"computed_fields,omitempty"`      // Map of computed field name -> source field (from extend)
 	ComputedExpressions map[string]string    `json:"computed_expressions,omitempty"` // Map of computed field name -> source expression
 	GroupByFields       []string             `json:"group_by_fields,omitempty"`      // Fields from summarize BY clauses
+	GroupByExpressions  []string             `json:"group_by_expressions,omitempty"` // Unaliased summarize BY expressions that are not plain columns, e.g. bin(TimeGenerated,1h)
+	Aggregations        []Aggregation        `json:"aggregations,omitempty"`         // Aggregations computed by summarize, in query order
+	Pipelines           []Pipeline           `json:"pipelines,omitempty"`            // Tabular pipelines of the query, in query order
 	Commands            []string             `json:"commands,omitempty"`             // List of commands used in the query (summarize, extend, etc.)
 	ProjectedFields     []string             `json:"projected_fields,omitempty"`     // Fields selected by project operators
 	Joins               []JoinInfo           `json:"joins,omitempty"`
 	Errors              []string             `json:"errors,omitempty"`
+}
+
+// Aggregation is one summarize aggregation and the column it outputs.
+// Conditions with a higher PipeStage filter the summarized rows.
+type Aggregation struct {
+	Function  string `json:"function"`        // Lower-case aggregation function, e.g. count, dcount, sum
+	Field     string `json:"field,omitempty"` // Aggregated column when the first argument is a plain column
+	Column    string `json:"column"`          // Output column: the alias, or KQL's default name such as count_ or dcount_Field
+	PipeStage int    `json:"pipe_stage"`      // Pipeline stage of the summarize operator
+	Pipeline  int    `json:"pipeline"`        // Index in ParseResult.Pipelines of the pipeline it aggregates
+}
+
+// Pipeline is a tabular pipeline: the query, or a pipeline nested in
+// another, such as a union input. Pipe stages count across the whole query,
+// so a stage orders operators only along the chain of pipelines that feed
+// each other.
+type Pipeline struct {
+	Parent    int    `json:"parent"`             // Enclosing pipeline, -1 for the query
+	Operator  string `json:"operator,omitempty"` // How it nests: union, join, lookup or subquery; empty for the query and parenthesized sources
+	PipeStage int    `json:"pipe_stage"`         // Stage of the nesting operator in Parent
+	Operators int    `json:"operators"`          // Tabular operators the pipeline applies to its source
+	Source    string `json:"source,omitempty"`   // Table or let name the pipeline reads, as written; empty when it reads an expression
 }
 
 // FieldProvenance indicates where a field originates relative to a join
@@ -106,6 +132,12 @@ type conditionExtractor struct {
 	computedFields      map[string]string // Fields created by extend/project: computed field -> source field
 	computedExpressions map[string]string // Fields created by extend/project: computed field -> expression
 	groupByFields       []string          // Fields from summarize BY clauses
+	groupByExpressions  []string          // Unaliased summarize BY expressions that are not plain columns
+	aggregations        []Aggregation     // Aggregations computed by summarize
+	pipelines           []Pipeline        // Tabular pipelines, in query order
+	pipelineStack       []int             // Pipelines enclosing the current tree position
+	operatorStages      []int             // Stages of the tabular operators enclosing the current tree position
+	queryPipeline       int               // The query's own pipeline, or -1
 	commands            []string          // Commands used in the query
 	projectedFields     []string          // Fields selected by project operators
 	joins               []JoinInfo
@@ -156,6 +188,10 @@ func normalizeQuery(query string) string {
 	// Strip declare query_parameters(...) statements
 	// These define query parameters but aren't needed for condition extraction
 	normalized = stripDeclareStatements(normalized)
+
+	// Inline lets that bind constants before later steps rewrite their
+	// literals, so a condition reads a let's value as an inline literal.
+	normalized = inlineLetConstants(normalized, extractLetStatements(normalized))
 
 	// Replace parameterized placeholders with dummy values
 	// e.g., {TimeRange} -> 1d, {SourceTable} -> DummyTable
@@ -2432,6 +2468,11 @@ func indexByteOutsideStrings(s string, needle byte, start int) int {
 	return indexOutsideStrings(s, string(needle), start, false)
 }
 
+// SubqueryPlaceholder is the value of a membership condition whose values
+// come from a subquery, as in Account in (SigninLogs | project Account): the
+// parser does not evaluate the subquery.
+const SubqueryPlaceholder = "SubqueryResult"
+
 func normalizeInSubqueries(query string) string {
 	var b strings.Builder
 	b.Grow(len(query))
@@ -2484,7 +2525,7 @@ func normalizeInSubqueries(query string) string {
 		}
 
 		b.WriteString(query[lastCopied : i+1])
-		b.WriteString("SubqueryResult")
+		b.WriteString(SubqueryPlaceholder)
 		lastCopied = close
 		changed = true
 		i = close
@@ -4749,6 +4790,7 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 		computedExpressions: make(map[string]string), // computed field -> expression
 		commands:            make([]string, 0),
 		joins:               make([]JoinInfo, 0),
+		queryPipeline:       -1,
 		lastLogicalOp:       "AND", // default
 		originalQuery:       normalizedQuery,
 	}
@@ -4774,6 +4816,13 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 		extracted, note = extractPortableConditions(query, normalizedQuery)
 		portableStart := len(conditions)
 		for _, condition := range extracted {
+			// The tree walker already captured conditions on computed
+			// columns, marked as computed; the text fallback cannot tell
+			// them from raw columns.
+			if _, computed := extractor.computedFields[strings.ToLower(condition.Field)]; computed {
+				continue
+			}
+			condition.Pipeline = extractor.queryPipeline
 			if !containsCondition(conditions, condition) {
 				conditions = append(conditions, condition)
 			}
@@ -4781,12 +4830,13 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 		if expression != nil && len(conditions) > portableStart {
 			expression = appendConditionRangeExpression(expression, portableStart, len(conditions))
 		}
-		if note != "" {
+		if note != "" && len(conditions) > portableStart {
 			allErrors = append(allErrors, note)
 		}
 	}
 	if keyword := extractLeadingSearchKeyword(query); keyword != "" {
 		condition := portableKeywordCondition(keyword)
+		condition.Pipeline = extractor.queryPipeline
 		if !containsCondition(conditions, condition) {
 			portableStart := len(conditions)
 			conditions = append(conditions, condition)
@@ -4805,6 +4855,9 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 		ComputedFields:      extractor.computedFields,
 		ComputedExpressions: extractor.computedExpressions,
 		GroupByFields:       extractor.groupByFields,
+		GroupByExpressions:  extractor.groupByExpressions,
+		Aggregations:        extractor.aggregations,
+		Pipelines:           extractor.pipelines,
 		Commands:            extractor.commands,
 		ProjectedFields:     extractor.projectedFields,
 		Joins:               extractor.joins,
@@ -4989,9 +5042,77 @@ func ClassifyFieldProvenance(result *ParseResult, field string) FieldProvenance 
 	return ProvenanceAmbiguous
 }
 
+// EnterTabularOperator records the stage of the operator, which pipelines
+// nested in it, such as union inputs, are fed into.
+func (e *conditionExtractor) EnterTabularOperator(ctx *TabularOperatorContext) {
+	e.operatorStages = append(e.operatorStages, e.currentStage)
+}
+
 // ExitTabularOperator increments the stage counter after processing each operator
 func (e *conditionExtractor) ExitTabularOperator(ctx *TabularOperatorContext) {
+	e.operatorStages = e.operatorStages[:len(e.operatorStages)-1]
 	e.currentStage++
+	if pipeline := e.currentPipeline(); pipeline >= 0 {
+		e.pipelines[pipeline].Operators++
+	}
+}
+
+// EnterTabularExpression starts a pipeline: the query, or one nested in the
+// current pipeline.
+func (e *conditionExtractor) EnterTabularExpression(ctx *TabularExpressionContext) {
+	operator := "subquery"
+	switch ctx.GetParent().(type) {
+	case *QueryContext, *TabularSourceContext, *MaterializeExpressionContext:
+		operator = ""
+	case *UnionTableContext:
+		operator = "union"
+	case *JoinOperatorContext:
+		operator = "join"
+	case *LookupOperatorContext:
+		operator = "lookup"
+	}
+	source := ""
+	if ctx.TabularSource() != nil && ctx.TabularSource().TableName() != nil {
+		source = ctx.TabularSource().TableName().GetText()
+	}
+	e.pushPipeline(operator, source)
+	if _, ok := ctx.GetParent().(*QueryContext); ok {
+		e.queryPipeline = e.currentPipeline()
+	}
+}
+
+// ExitTabularExpression ends the current pipeline.
+func (e *conditionExtractor) ExitTabularExpression(ctx *TabularExpressionContext) {
+	e.pipelineStack = e.pipelineStack[:len(e.pipelineStack)-1]
+}
+
+// EnterUnionTable records a union input that names a table as a pipeline
+// without operators; a parenthesized input starts its own pipeline.
+func (e *conditionExtractor) EnterUnionTable(ctx *UnionTableContext) {
+	if ctx.TableName() != nil {
+		e.pushPipeline("union", ctx.TableName().GetText())
+		e.pipelineStack = e.pipelineStack[:len(e.pipelineStack)-1]
+	}
+}
+
+func (e *conditionExtractor) pushPipeline(operator, source string) {
+	// A source feeds its pipeline before the first operator; other nested
+	// pipelines feed the operator that contains them.
+	stage := e.currentStage
+	if n := len(e.operatorStages); operator != "" && n > 0 {
+		stage = e.operatorStages[n-1]
+	}
+	e.pipelines = append(e.pipelines, Pipeline{Parent: e.currentPipeline(), Operator: operator, PipeStage: stage, Source: source})
+	e.pipelineStack = append(e.pipelineStack, len(e.pipelines)-1)
+}
+
+// currentPipeline is the innermost pipeline at the current tree position, or
+// -1 outside any.
+func (e *conditionExtractor) currentPipeline() int {
+	if len(e.pipelineStack) == 0 {
+		return -1
+	}
+	return e.pipelineStack[len(e.pipelineStack)-1]
 }
 
 // EnterFunctionCall tracks when we enter a function call (countif, sumif, etc.)
@@ -5053,22 +5174,25 @@ func (e *conditionExtractor) EnterLetStatement(ctx *LetStatementContext) {
 // This prevents post-aggregation filters (| where FailedAttempts > 5) from being
 // treated as required raw data fields in test validation.
 func (e *conditionExtractor) EnterAggregationItem(ctx *AggregationItemContext) {
-	if ctx.Identifier() == nil {
-		return
-	}
-
-	alias := ctx.Identifier().GetText()
-
 	// Two grammar forms:
 	//   identifier ASSIGN aggregationFunction   (e.g., EventCount = count())
 	//   aggregationFunction AS identifier        (e.g., count() as EventCount)
-	if ctx.ASSIGN() != nil || ctx.AS() != nil {
+	alias := ""
+	if ctx.Identifier() != nil && (ctx.ASSIGN() != nil || ctx.AS() != nil) {
+		alias = ctx.Identifier().GetText()
 		sourceField := ""
 		if ctx.AggregationFunction() != nil {
 			sourceField = aggregationFunctionText(ctx.AggregationFunction())
 		}
 		e.computedFields[strings.ToLower(alias)] = sourceField
 	}
+
+	if e.inSubquery > 0 {
+		return
+	}
+	aggregation := newAggregation(ctx.AggregationFunction(), alias, e.currentStage)
+	aggregation.Pipeline = e.currentPipeline()
+	e.aggregations = append(e.aggregations, aggregation)
 }
 
 func aggregationFunctionText(ctx IAggregationFunctionContext) string {
@@ -5076,6 +5200,50 @@ func aggregationFunctionText(ctx IAggregationFunctionContext) string {
 		return ""
 	}
 	return ctx.FunctionCall().GetText()
+}
+
+// newAggregation describes one summarize aggregation and the column it outputs.
+func newAggregation(ctx IAggregationFunctionContext, alias string, stage int) Aggregation {
+	aggregation := Aggregation{Column: alias, PipeStage: stage}
+	if ctx == nil || ctx.FunctionCall() == nil || ctx.FunctionCall().Identifier() == nil {
+		return aggregation
+	}
+	call := ctx.FunctionCall()
+	aggregation.Function = strings.ToLower(call.Identifier().GetText())
+	// normalizeQuery rewrites make_set and make_list to their legacy spellings.
+	switch aggregation.Function {
+	case "makeset":
+		aggregation.Function = "make_set"
+	case "makelist":
+		aggregation.Function = "make_list"
+	}
+	if call.ArgumentList() != nil {
+		if arguments := call.ArgumentList().AllArgument(); len(arguments) > 0 && arguments[0].ASSIGN() == nil && arguments[0].Expression() != nil {
+			if text := arguments[0].Expression().GetText(); isValidFieldName(text) {
+				aggregation.Field = text
+			}
+		}
+	}
+	if aggregation.Column == "" {
+		aggregation.Column = defaultAggregationColumn(aggregation.Function, aggregation.Field)
+	}
+	return aggregation
+}
+
+// defaultAggregationColumn is the column KQL names an aggregation without an
+// alias: count_ for count(), set_Field and list_Field for make_set and
+// make_list, and function_Field otherwise (function_ when the first argument is
+// not a plain column).
+func defaultAggregationColumn(function, field string) string {
+	switch function {
+	case "count":
+		return "count_"
+	case "make_set":
+		function = "set"
+	case "make_list":
+		function = "list"
+	}
+	return function + "_" + field
 }
 
 // EnterGroupByItem extracts field names from summarize BY clauses.
@@ -5096,6 +5264,8 @@ func (e *conditionExtractor) EnterGroupByItem(ctx *GroupByItemContext) {
 		text := ctx.Expression().GetText()
 		if isValidFieldName(text) {
 			e.groupByFields = append(e.groupByFields, text)
+		} else {
+			e.groupByExpressions = append(e.groupByExpressions, text)
 		}
 	}
 }
@@ -5225,7 +5395,13 @@ func (e *conditionExtractor) EnterProjectItem(ctx *ProjectItemContext) {
 	if ctx.Identifier() != nil && (ctx.ASSIGN() != nil || ctx.AS() != nil) {
 		// Aliased project item: project NewName = expr or project expr AS NewName
 		field := ctx.Identifier().GetText()
-		e.computedFields[strings.ToLower(field)] = ""
+		sourceField, expression := "", ""
+		if ctx.Expression() != nil {
+			expression = ctx.Expression().GetText()
+			sourceField = extractFirstFieldFromExpression(ctx.Expression())
+		}
+		e.computedFields[strings.ToLower(field)] = sourceField
+		e.computedExpressions[strings.ToLower(field)] = expression
 		e.projectedFields = append(e.projectedFields, field)
 	} else if ctx.Expression() != nil {
 		// Simple project item: project FieldName
@@ -5235,6 +5411,21 @@ func (e *conditionExtractor) EnterProjectItem(ctx *ProjectItemContext) {
 			e.projectedFields = append(e.projectedFields, text)
 		}
 	}
+}
+
+// EnterRenameItem tracks project-rename columns as computed from the column
+// they rename.
+func (e *conditionExtractor) EnterRenameItem(ctx *RenameItemContext) {
+	if e.inSubquery > 0 {
+		return
+	}
+	identifiers := ctx.AllIdentifier()
+	if len(identifiers) != 2 {
+		return
+	}
+	field, source := identifiers[0].GetText(), identifiers[1].GetText()
+	e.computedFields[strings.ToLower(field)] = source
+	e.computedExpressions[strings.ToLower(field)] = source
 }
 
 // EnterComparisonExpression extracts field comparisons
@@ -5353,6 +5544,7 @@ func (e *conditionExtractor) handleComparison(left, op, right string) {
 		ValueReference: valueReference,
 		Negated:        e.negated,
 		PipeStage:      e.currentStage,
+		Pipeline:       e.currentPipeline(),
 		LogicalOp:      e.lastLogicalOp,
 		IsComputed:     isComputed,
 		SourceField:    sourceField,
@@ -5385,6 +5577,7 @@ func (e *conditionExtractor) handleInOperator(field string, exprList IExpression
 		Value:        values[0],
 		Negated:      negated,
 		PipeStage:    e.currentStage,
+		Pipeline:     e.currentPipeline(),
 		LogicalOp:    e.lastLogicalOp,
 		Alternatives: values,
 		IsComputed:   isComputed,
@@ -5418,6 +5611,7 @@ func (e *conditionExtractor) handleBetweenOperator(field, lowValue, highValue st
 		Value:       extractValue(lowValue),
 		Negated:     negated,
 		PipeStage:   e.currentStage,
+		Pipeline:    e.currentPipeline(),
 		LogicalOp:   e.lastLogicalOp,
 		IsComputed:  isComputed,
 		SourceField: sourceField,
@@ -5431,6 +5625,7 @@ func (e *conditionExtractor) handleBetweenOperator(field, lowValue, highValue st
 		Value:       extractValue(highValue),
 		Negated:     negated,
 		PipeStage:   e.currentStage,
+		Pipeline:    e.currentPipeline(),
 		LogicalOp:   "AND",
 		IsComputed:  isComputed,
 		SourceField: sourceField,
@@ -5470,6 +5665,7 @@ func (e *conditionExtractor) handleHasAnyAllOperator(field, op string, exprList 
 			Value:       value,
 			Negated:     e.negated,
 			PipeStage:   e.currentStage,
+			Pipeline:    e.currentPipeline(),
 			LogicalOp:   logOp,
 			IsComputed:  isComputed,
 			SourceField: sourceField,
