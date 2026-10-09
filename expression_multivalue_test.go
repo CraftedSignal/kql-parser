@@ -120,3 +120,15 @@ func requireConditionIndex(t *testing.T, expression *ConditionExpression, index 
 		t.Fatalf("expected condition index %d, got %#v", index, expression)
 	}
 }
+
+// Alternatives group only within one OR: (a1 or a2) and (b1 or b2) on the
+// same field stays two conditions joined by AND.
+func TestExpressionKeepsSameFieldOrGroupsSeparateAcrossAnd(t *testing.T) {
+	result := ExtractConditions(`events | where (CommandLine contains "a1" or CommandLine contains "a2") and (CommandLine contains "b1" or CommandLine contains "b2")`)
+	if len(result.Conditions) != 2 || len(result.Conditions[0].Alternatives) != 2 || len(result.Conditions[1].Alternatives) != 2 {
+		t.Fatalf("expected two two-value groups, got %#v", result.Conditions)
+	}
+	if result.Expression == nil || result.Expression.Operator != BooleanAnd || len(result.Expression.Children) != 2 {
+		t.Fatalf("expected AND over the two groups, got %#v", result.Expression)
+	}
+}

@@ -4758,10 +4758,16 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 	allErrors := append(lexerErrors.errors, parserErrors.errors...)
 	allErrors = append(allErrors, extractor.errors...)
 
-	// Post-process to group OR conditions on same field
+	// Post-process to group OR conditions on same field. The expression tree
+	// knows the grouping; the flat operator sequence cannot tell
+	// "x and (a or b)" from "(x and a) or b", so it is only a fallback.
 	rawConditions := append([]Condition(nil), extractor.conditions...)
-	conditions, conditionIndexMap := groupORConditionsWithIndexMap(extractor.conditions)
-	expression := remapConditionExpression(buildConditionExpression(tree, rawConditions), conditionIndexMap)
+	rawExpression := buildConditionExpression(tree, rawConditions)
+	conditions, conditionIndexMap, grouped := groupORConditionsByExpression(rawConditions, rawExpression)
+	if !grouped {
+		conditions, conditionIndexMap = groupORConditionsWithIndexMap(extractor.conditions)
+	}
+	expression := remapConditionExpression(rawExpression, conditionIndexMap)
 	if !hasPortableFieldConditions(conditions) {
 		var note string
 		var extracted []Condition
@@ -5495,14 +5501,17 @@ func (e *conditionExtractor) EnterOrExpression(ctx *OrExpressionContext) {
 	}
 }
 
-// ExitAndExpression sets logical op for next condition after AND expressions
+// ExitAndExpression links the next condition with OR when another OR branch
+// follows this one. After the last branch the operator around the whole OR
+// expression applies: in (a or b) and c, c is ANDed.
 func (e *conditionExtractor) ExitAndExpression(ctx *AndExpressionContext) {
-	// Check parent to see if we're in an OR context
-	parent := ctx.GetParent()
-	if orCtx, ok := parent.(*OrExpressionContext); ok {
-		if len(orCtx.AllAndExpression()) > 1 {
-			e.lastLogicalOp = "OR"
-		}
+	orCtx, ok := ctx.GetParent().(*OrExpressionContext)
+	if !ok {
+		return
+	}
+	branches := orCtx.AllAndExpression()
+	if len(branches) > 1 && branches[len(branches)-1] != ctx {
+		e.lastLogicalOp = "OR"
 	}
 }
 
@@ -6899,6 +6908,56 @@ func extractExpressionListValues(ctx IExpressionListContext) []string {
 		values = append(values, extractValue(expr.GetText()))
 	}
 	return values
+}
+
+// groupORConditionsByExpression merges same-field conditions that are
+// adjacent children of one OR node in expression into a single condition
+// with Alternatives, returning the merged list and a raw-to-merged index
+// map. It returns false when there is no expression to group by.
+func groupORConditionsByExpression(conditions []Condition, expression *ConditionExpression) ([]Condition, []int, bool) {
+	if expression == nil {
+		return nil, nil, false
+	}
+	groupStart := make([]int, len(conditions))
+	for i := range groupStart {
+		groupStart[i] = i
+	}
+	var visit func(*ConditionExpression)
+	visit = func(node *ConditionExpression) {
+		if node == nil {
+			return
+		}
+		if node.Operator == BooleanOr {
+			for i := 1; i < len(node.Children); i++ {
+				prev, child := node.Children[i-1], node.Children[i]
+				if prev.Operator != BooleanCondition || child.Operator != BooleanCondition {
+					continue
+				}
+				first, index := groupStart[prev.ConditionIndex], child.ConditionIndex
+				if index == prev.ConditionIndex+1 && index < len(conditions) && sameConditionGroup(conditions[first], conditions[index]) {
+					groupStart[index] = first
+				}
+			}
+		}
+		for _, child := range node.Children {
+			visit(child)
+		}
+	}
+	visit(expression)
+
+	result := make([]Condition, 0, len(conditions))
+	indexMap := make([]int, len(conditions))
+	for i, condition := range conditions {
+		if start := groupStart[i]; start != i {
+			merged := &result[indexMap[start]]
+			merged.Alternatives = deduplicateConditionValues(append(conditionAlternatives(*merged), conditionAlternatives(condition)...))
+			indexMap[i] = indexMap[start]
+			continue
+		}
+		indexMap[i] = len(result)
+		result = append(result, condition)
+	}
+	return result, indexMap, true
 }
 
 // groupORConditions groups consecutive OR conditions on the same field
