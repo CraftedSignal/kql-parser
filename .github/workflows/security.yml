@@ -31,7 +31,7 @@ jobs:
           go-version: ${{ steps.vars.outputs.go_version }}
 
       - name: Run govulncheck
-        uses: golang/govulncheck-action@b625fbe08f3bccbe446d94fbf87fcc875a4f50ee
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f
         with:
           go-version-input: ${{ steps.vars.outputs.go_version }}
           go-package: ./...
