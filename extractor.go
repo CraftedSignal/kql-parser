@@ -163,6 +163,14 @@ func (l *errorListener) SyntaxError(recognizer antlr.Recognizer, offendingSymbol
 // normalizeQuery preprocesses a KQL query to normalize operators and functions that the parser doesn't handle well.
 // This converts case-sensitive operators and special functions to their standard forms for parsing purposes.
 func normalizeQuery(query string) string {
+	return normalize(query, false)
+}
+
+// normalize rewrites constructs the grammar does not support into ones it
+// does. Unless strict, it also rescues text that is not a single query: a
+// write-up before the query, escaped newlines, workbook parameters, a second
+// query after the first, or a query that starts with an operator.
+func normalize(query string, strict bool) string {
 	normalized := query
 
 	// Remove line continuation backslashes (backslash followed by newline)
@@ -172,7 +180,9 @@ func normalizeQuery(query string) string {
 
 	// Fix escaped newlines from JSON extraction - but only outside of string literals
 	// This handles queries extracted from YAML/JSON where \r\n became literal characters
-	normalized = normalizeEscapeSequences(normalized)
+	if !strict {
+		normalized = normalizeEscapeSequences(normalized)
+	}
 
 	// Normalize actual UTF-8 whitespace runes that the lexer does not treat as WS.
 	// Sentinel exports occasionally contain NBSP after query text.
@@ -180,10 +190,12 @@ func normalizeQuery(query string) string {
 
 	// Strip documentation preambles like "Description:...Query:..."
 	// These are common in documentation templates where the actual query follows "Query:"
-	normalized = stripDocumentationPreamble(normalized)
+	if !strict {
+		normalized = stripDocumentationPreamble(normalized)
+	}
 
 	// Strip leading comments to get to the actual query
-	normalized = stripLeadingComments(normalized)
+	normalized = stripLeadingComments(normalized, strict)
 
 	// Strip declare query_parameters(...) statements
 	// These define query parameters but aren't needed for condition extraction
@@ -195,7 +207,9 @@ func normalizeQuery(query string) string {
 
 	// Replace parameterized placeholders with dummy values
 	// e.g., {TimeRange} -> 1d, {SourceTable} -> DummyTable
-	normalized = replaceParameters(normalized)
+	if !strict {
+		normalized = replaceParameters(normalized)
+	}
 
 	// Convert ASIM functions to dummy table names (these are parser functions that return tables)
 	// Handle both simple calls (imAuthentication) and parameterized calls (_Im_Dns(param=value))
@@ -240,6 +254,10 @@ func normalizeQuery(query string) string {
 	// Normalize timespan literals without space: 0min -> 0 min, 30min -> 30 min
 	// The lexer expects space or recognizes combined form only for certain patterns
 	normalized = normalizeTimespanLiterals(normalized)
+	normalized = normalizeDatetimeLiterals(normalized)
+	normalized = joinAdjacentStringLiterals(normalized)
+	normalized = normalizeMakeGraphEdges(normalized)
+	normalized = stripGraphMatchStages(normalized)
 
 	// Normalize trailing decimals: 1000. -> 1000.0
 	// The grammar requires at least one digit after the decimal point
@@ -280,8 +298,7 @@ func normalizeQuery(query string) string {
 
 	// Normalize join condition 'and' to comma (grammar expects comma-separated conditions)
 	// on $left.A == $right.B and $left.C == $right.D -> on $left.A == $right.B, $left.C == $right.D
-	normalized = strings.ReplaceAll(normalized, " and $left.", ", $left.")
-	normalized = strings.ReplaceAll(normalized, " and $right.", ", $right.")
+	normalized = joinConditionAndRe.ReplaceAllString(normalized, ", $$$1.")
 
 	// Strip all hint.xxx=value patterns (hint.strategy=broadcast, hint.shufflekey=x, etc.)
 	// The grammar doesn't support these join hints
@@ -321,28 +338,11 @@ func normalizeQuery(query string) string {
 
 	// Extract main query from let statements (parse only the final query for conditions)
 	// This MUST happen before union normalization so (union ...) after lets is handled
-	normalized = extractMainQuery(normalized)
-
-	// Handle queries that start with a pipe (workbook queries)
-	normalized = strings.TrimLeft(normalized, " \t")
-	if strings.HasPrefix(normalized, "|") {
-		normalized = "DummyTable " + normalized
-	}
-
-	// Handle queries that start with operators but no table name
-	// Azure Resource Graph queries can start with "where", workbook queries with "extend", etc.
-	lowerNorm := strings.ToLower(normalized)
-	operatorPrefixes := []string{
-		"where ", "where\t", "where\n",
-		"extend ", "extend\t", "extend\n",
-		"project ", "project\t", "project\n",
-		"summarize ", "summarize\t", "summarize\n",
-	}
-	for _, prefix := range operatorPrefixes {
-		if strings.HasPrefix(lowerNorm, prefix) {
-			normalized = "DummyTable | " + normalized
-			break
-		}
+	if strict {
+		normalized = normalized[skipLetStatements(normalized):]
+	} else {
+		normalized = extractMainQuery(normalized)
+		normalized = rescueOperatorFirstQuery(normalized)
 	}
 
 	// Strip function parameters in union statements (grammar doesn't support them)
@@ -363,6 +363,7 @@ func normalizeQuery(query string) string {
 	// Handle union inside join parentheses: join (union ...) -> join (DummyTable | union ...)
 	// The grammar requires a tabularSource before union, even inside join
 	normalized = normalizeJoinUnion(normalized)
+	normalized = normalizeBracketedUnion(normalized)
 
 	// Handle find operator: find in (Table1, Table2, ...) where ... -> extract conditions from where clause
 	// The find operator isn't in the grammar, so convert to table + where
@@ -399,13 +400,28 @@ func normalizeQuery(query string) string {
 	return normalized
 }
 
-// extractMainQuery extracts the main query from a let statement sequence
-// For "let x = ...; let y = ...; Table | where ...", returns "Table | where ..."
-func extractMainQuery(query string) string {
-	// Find the position after all let statements
+// rescueOperatorFirstQuery gives a query that starts with a pipe (workbook
+// queries) or an operator (Azure Resource Graph queries start with "where",
+// workbook queries with "extend") a placeholder table to filter.
+func rescueOperatorFirstQuery(query string) string {
+	query = strings.TrimLeft(query, " \t")
+	if strings.HasPrefix(query, "|") {
+		return "DummyTable " + query
+	}
+	lower := strings.ToLower(query)
+	for _, operator := range []string{"where", "extend", "project", "summarize"} {
+		if strings.HasPrefix(lower, operator) && len(lower) > len(operator) && strings.ContainsRune(" \t\n", rune(lower[len(operator)])) {
+			return "DummyTable | " + query
+		}
+	}
+	return query
+}
+
+// skipLetStatements returns the index where the query after its leading let
+// statements and comments starts.
+func skipLetStatements(query string) int {
 	i := 0
 	n := len(query)
-
 	for i < n {
 		// Skip whitespace and newlines
 		for i < n && (query[i] == ' ' || query[i] == '\t' || query[i] == '\n' || query[i] == '\r') {
@@ -434,7 +450,14 @@ func extractMainQuery(query string) string {
 		// Not a let statement, this is the start of the main query
 		break
 	}
+	return i
+}
 
+// extractMainQuery extracts the main query from a let statement sequence
+// For "let x = ...; let y = ...; Table | where ...", returns "Table | where ..."
+func extractMainQuery(query string) string {
+	n := len(query)
+	i := skipLetStatements(query)
 	if i >= n {
 		return query // No main query found
 	}
@@ -445,7 +468,9 @@ func extractMainQuery(query string) string {
 
 	// Scan to find a new query starting after blank lines
 	// A new query starts with: let statement, or table name (after optional comments)
+	// outside any brackets: blank lines inside a subquery do not end the query.
 	j := i
+	depth := 0
 	for j < n {
 		// Skip whitespace
 		wsStart := j
@@ -463,7 +488,7 @@ func extractMainQuery(query string) string {
 		}
 
 		// After blank lines, check what comes next
-		if nlCount >= 2 {
+		if nlCount >= 2 && depth == 0 {
 			// Skip any comments and whitespace
 			checkPos := j
 			for checkPos < n {
@@ -510,14 +535,42 @@ func extractMainQuery(query string) string {
 
 		// Skip to next line
 		if nlCount == 0 {
-			// No newline, advance to next newline or end
-			for j < n && query[j] != '\n' {
-				j++
-			}
+			j = skipLineTrackingDepth(query, j, &depth)
 		}
 	}
 
 	return query[mainQueryStart:mainQueryEnd]
+}
+
+// skipLineTrackingDepth advances from i to the end of the line, or past a
+// string literal that spans lines, and updates depth for the brackets outside
+// strings and comments. It returns the index of the newline or len(query).
+func skipLineTrackingDepth(query string, i int, depth *int) int {
+	for i < len(query) && query[i] != '\n' {
+		switch c := query[i]; {
+		case c == '/' && i+1 < len(query) && query[i+1] == '/':
+			for i < len(query) && query[i] != '\n' {
+				i++
+			}
+			return i
+		case isStringLiteralStart(query, i):
+			end := stringLiteralEnd(query, i)
+			if end < 0 {
+				for i < len(query) && query[i] != '\n' {
+					i++
+				}
+				return i
+			}
+			i = end
+			continue
+		case c == '(' || c == '[' || c == '{':
+			*depth++
+		case (c == ')' || c == ']' || c == '}') && *depth > 0:
+			*depth--
+		}
+		i++
+	}
+	return i
 }
 
 // skipLetStatement skips a let statement starting at position i and returns position after the semicolon
@@ -677,8 +730,9 @@ func convertBracketAccess(query string) string {
 				if end < len(query) && end+1 < len(query) && query[end] == quote && query[end+1] == ']' {
 					// Extract the key
 					key := query[i+2 : end]
-					// Check if key is a valid identifier (alphanumeric + underscore only)
-					if isValidPropertyKey(key) {
+					// Check if key is a valid identifier (alphanumeric + underscore
+					// only) the grammar does not read as a keyword
+					if isValidPropertyKey(key) && !grammarReservedWords[strings.ToLower(key)] {
 						if precededByIdent {
 							result.WriteByte('.')
 						}
@@ -830,6 +884,14 @@ func fixNumericIdentifiers(query string) string {
 				}
 			}
 			i++
+			continue
+		}
+
+		// Copy datetime literals, whose time part (2026-02-04T10:00) starts
+		// with digits followed by letters, unchanged
+		if loc := datetimeLiteralRe.FindStringIndex(query[i:]); loc != nil && loc[0] == 0 && (i == 0 || !isIdentChar(query[i-1])) {
+			result.WriteString(query[i : i+loc[1]])
+			i += loc[1]
 			continue
 		}
 
@@ -2013,29 +2075,24 @@ func stripTrailingSemicolonsAndComments(query string) string {
 			break
 		}
 
-		// Check for trailing line comment (find last // not in a string)
+		// Check for trailing line comment (find last // not in a string or
+		// in a comment)
 		lastCommentIdx := -1
-		inString := false
-		stringChar := byte(0)
-		for i := 0; i < len(result); i++ {
-			ch := result[i]
-			if inString {
-				if ch == '\\' && i+1 < len(result) {
-					i++ // Skip escaped char
-					continue
+		for i := 0; i < len(result); {
+			switch {
+			case isStringLiteralStart(result, i):
+				end := stringLiteralEnd(result, i)
+				if end < 0 {
+					end = len(result)
 				}
-				if ch == stringChar {
-					inString = false
-				}
-				continue
-			}
-			if ch == '"' || ch == '\'' {
-				inString = true
-				stringChar = ch
-				continue
-			}
-			if i+1 < len(result) && ch == '/' && result[i+1] == '/' {
+				i = end
+			case result[i] == '/' && i+1 < len(result) && result[i+1] == '/':
 				lastCommentIdx = i
+				for i < len(result) && result[i] != '\n' {
+					i++
+				}
+			default:
+				i++
 			}
 		}
 
@@ -2628,6 +2685,14 @@ func normalizeStringOperatorAliases(query string) string {
 			continue
 		}
 
+		if alias, ok := legacyNegatedContains(query, i); ok {
+			b.WriteString(query[lastCopied:i])
+			b.WriteString(alias.replacement)
+			i += len(alias.token) - 1
+			lastCopied = i + 1
+			changed = true
+			continue
+		}
 		if hasOperatorTokenAt(query, i, "!containscs") {
 			b.WriteString(query[lastCopied:i])
 			b.WriteString("!contains_cs")
@@ -2650,6 +2715,20 @@ func normalizeStringOperatorAliases(query string) string {
 	}
 	b.WriteString(query[lastCopied:])
 	return b.String()
+}
+
+// legacyNegatedContains matches notcontains and notcontainscs, the legacy
+// spellings of !contains and !contains_cs, at query[i].
+func legacyNegatedContains(query string, i int) (struct{ token, replacement string }, bool) {
+	for _, alias := range []struct{ token, replacement string }{
+		{"notcontainscs", "!contains_cs"},
+		{"notcontains", "!contains"},
+	} {
+		if hasOperatorTokenAt(query, i, alias.token) {
+			return alias, true
+		}
+	}
+	return struct{ token, replacement string }{}, false
 }
 
 func hasOperatorTokenAt(query string, idx int, token string) bool {
@@ -2750,6 +2829,7 @@ func normalizeUnionParameters(query string) string {
 
 	// Remove withsource=... parameter
 	result = removeUnionParam(result, "withsource", 10)
+	result = removeUnionParam(result, "with_source", 11)
 
 	// Also handle kind= parameter in union
 	{
@@ -3342,8 +3422,8 @@ func stripUnionFunctionParams(query string) string {
 	result := query
 	lowerResult := strings.ToLower(result)
 
-	// Find "union" keyword followed by any whitespace (space, tab, newline)
-	idx := indexKeyword(lowerResult, "union", 0)
+	// Find "union" keyword, outside strings, followed by any whitespace
+	idx := indexKeywordOutsideStrings(lowerResult, "union", 0)
 	if idx == -1 {
 		return result
 	}
@@ -3436,7 +3516,7 @@ func stripUnionFunctionParams(query string) string {
 			// But don't treat as function call if:
 			// - It's right after = (it's a value in key=value, like isfuzzy=true)
 			// - It's a KQL keyword like true/false
-			isValueOrKeyword := afterEquals || lowerIdent == "true" || lowerIdent == "false"
+			isValueOrKeyword := afterEquals || lowerIdent == "true" || lowerIdent == "false" || lowerIdent == "union"
 			if i < len(result) && result[i] == '(' && !isValueOrKeyword {
 				// This is a function call - skip the parameters
 				depth := 1
@@ -4118,8 +4198,10 @@ func stripDeclareStatements(query string) string {
 	return strings.TrimLeft(b.String(), " \t\n\r")
 }
 
-// stripLeadingComments removes leading // and # comments and URLs from a query
-func stripLeadingComments(query string) string {
+// stripLeadingComments removes leading // comments from a query. Unless
+// strict, it also removes what is not KQL: leading # comments and URL lines,
+// and /| lines (a mistyped // commenting out a pipe stage).
+func stripLeadingComments(query string, strict bool) string {
 	lines := strings.Split(query, "\n")
 	var result []string
 	foundCode := false
@@ -4128,7 +4210,15 @@ func stripLeadingComments(query string) string {
 		trimmed := strings.TrimSpace(line)
 		// Skip empty lines, comment lines (// and #), and URL lines at the start
 		if !foundCode {
-			if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#") {
+			if trimmed == "" || strings.HasPrefix(trimmed, "//") {
+				continue
+			}
+			if strict {
+				foundCode = true
+				result = append(result, line)
+				continue
+			}
+			if strings.HasPrefix(trimmed, "#") {
 				continue
 			}
 			// Skip lines that are URLs (http:// or https://)
@@ -4142,7 +4232,7 @@ func stripLeadingComments(query string) string {
 		// After we've found code, also strip commented-out code lines
 		// that start with /| (common mistake: / instead of // to comment out a pipe statement)
 		trimmedLine := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmedLine, "/|") {
+		if !strict && strings.HasPrefix(trimmedLine, "/|") {
 			// This is a commented-out pipe statement, skip it
 			continue
 		}

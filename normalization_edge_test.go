@@ -397,7 +397,7 @@ func TestKQLPreambleCommentAndProvenanceEdges(t *testing.T) {
 		t.Fatalf("stripDocumentationPreamble() parenthesized = %q, want %q", got, want)
 	}
 	comments := "// heading\nhttps://example.invalid/doc\nSecurityEvent\n/| commented pipe\n| where EventID == 4688"
-	if got, want := stripLeadingComments(comments), "SecurityEvent\n| where EventID == 4688"; got != want {
+	if got, want := stripLeadingComments(comments, false), "SecurityEvent\n| where EventID == 4688"; got != want {
 		t.Fatalf("stripLeadingComments() = %q, want %q", got, want)
 	}
 
