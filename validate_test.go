@@ -23,6 +23,7 @@ func TestValidate_AcceptsQueries(t *testing.T) {
 		"graph-match":                    "ExposureGraphEdges\n| make-graph SourceNodeId --> TargetNodeId with ExposureGraphNodes on NodeId\n| graph-match (SourceNode)-[anyEdge*1..3]->(TargetNode)\n    project IncomingNodeName = SourceNode.NodeName,\n    Edges = anyEdge.EdgeLabel\n| where isnotempty(IncomingNodeName)",
 		"nested union":                   "union (union (A | where x == 1), (B | where y == 1)), (C | where z == 1)",
 		"reserved words in brackets":     `T | where ['limit'] == 100 and host['scan'].vuln == 1`,
+		"output keyword in brackets":     `T | where ['output'] matches regex "payload.*" and ['output.tokens'] >= 100`,
 		"with_source":                    "union with_source=TableName SecurityEvent, WindowsEvent | where EventID == 4625",
 	} {
 		t.Run(name, func(t *testing.T) {

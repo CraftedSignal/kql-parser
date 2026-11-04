@@ -178,7 +178,7 @@ var grammarReservedWords = map[string]bool{
 	"find": true, "first": true, "fork": true, "getschema": true, "has": true, "hint": true,
 	"iff": true, "iif": true, "in": true, "invoke": true, "isfuzzy": true, "last": true,
 	"limit": true, "materialize": true, "matches": true, "not": true, "null": true, "nulls": true,
-	"or": true, "order": true, "pack": true, "partition": true, "pattern": true, "restrict": true,
+	"or": true, "order": true, "output": true, "pack": true, "partition": true, "pattern": true, "restrict": true,
 	"sample": true, "scan": true, "serialize": true, "startswith": true, "toscalar": true,
 	"typeof": true, "view": true, "withsource": true,
 }
