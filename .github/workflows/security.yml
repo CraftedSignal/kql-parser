@@ -53,3 +53,4 @@ jobs:
           format: 'table'
           severity: 'CRITICAL,HIGH,MEDIUM'
           ignore-unfixed: true
+          cache: false
