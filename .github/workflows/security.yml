@@ -25,18 +25,13 @@ jobs:
           goVersion=$(grep '^FROM go' .github/go/Dockerfile | cut -d ' ' -f 2 | cut -d ':' -f 2)
           echo "go_version=${goVersion}" >> $GITHUB_OUTPUT
 
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
-        with:
-          go-version: ${{ steps.vars.outputs.go_version }}
-          cache: false
-
       - name: Run govulncheck
         uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f
         with:
           go-version-input: ${{ steps.vars.outputs.go_version }}
           go-package: ./...
           repo-checkout: false
+          cache: false
 
   trivy:
     name: trivy
