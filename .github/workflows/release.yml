@@ -26,6 +26,7 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
           go-version: ${{ steps.vars.outputs.go_version }}
+          cache: false
 
       - name: Semantic Release
         id: semver
