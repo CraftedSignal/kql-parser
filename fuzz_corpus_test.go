@@ -1181,15 +1181,9 @@ func TestFuzzKQLParserTotalCoverage(t *testing.T) {
 		query string
 	}, 0, totalQueries)
 
-	for _, q := range realWorldKQLQueries {
-		allQueries = append(allQueries, q)
-	}
-	for _, q := range additionalRealWorldQueries {
-		allQueries = append(allQueries, q)
-	}
-	for _, q := range edgeCaseKQLQueries {
-		allQueries = append(allQueries, q)
-	}
+	allQueries = append(allQueries, realWorldKQLQueries...)
+	allQueries = append(allQueries, additionalRealWorldQueries...)
+	allQueries = append(allQueries, edgeCaseKQLQueries...)
 
 	for _, tt := range allQueries {
 		result := ExtractConditions(tt.query)

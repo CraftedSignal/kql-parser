@@ -806,12 +806,13 @@ func convertBracketAccess(query string) string {
 			for end < len(query) && depth > 0 {
 				c := query[end]
 				if !inStr {
-					if c == '"' || c == '\'' {
+					switch c {
+					case '"', '\'':
 						inStr = true
 						strCh = c
-					} else if c == '[' {
+					case '[':
 						depth++
-					} else if c == ']' {
+					case ']':
 						depth--
 					}
 				} else {
@@ -953,9 +954,10 @@ func convertTupleUnpacking(query string) string {
 			end := i + 1
 			parenDepth := 1
 			for end < len(query) && parenDepth > 0 {
-				if query[end] == '(' {
+				switch query[end] {
+				case '(':
 					parenDepth++
-				} else if query[end] == ')' {
+				case ')':
 					parenDepth--
 				}
 				end++
@@ -1008,11 +1010,11 @@ func looksLikeTupleUnpacking(s string) bool {
 		// Check if it's a valid identifier
 		for i, c := range part {
 			if i == 0 {
-				if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+				if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && c != '_' {
 					return false
 				}
 			} else {
-				if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+				if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '_' {
 					return false
 				}
 			}
@@ -1029,11 +1031,11 @@ func isValidPropertyKey(s string) bool {
 	}
 	for i, c := range s {
 		if i == 0 {
-			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+			if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && c != '_' {
 				return false
 			}
 		} else {
-			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+			if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '_' {
 				return false
 			}
 		}
@@ -1069,10 +1071,6 @@ func normalizeEscapeSequences(query string) string {
 
 		// Track string literal boundaries
 		if !inString && (c == '"' || c == '\'') {
-			// Check for verbatim string (@"..." or @'...')
-			if i > 0 && query[i-1] == '@' {
-				// Already wrote @, now in verbatim string
-			}
 			inString = true
 			stringChar = c
 			result.WriteByte(c)
@@ -1250,7 +1248,7 @@ func isValidHex(s string) bool {
 		return false
 	}
 	for _, c := range s {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
 			return false
 		}
 	}
@@ -1264,11 +1262,11 @@ func handleUnicodeEscape(hex string, result *strings.Builder) {
 	for _, h := range hex {
 		codepoint *= 16
 		if h >= '0' && h <= '9' {
-			codepoint += rune(h - '0')
+			codepoint += h - '0'
 		} else if h >= 'a' && h <= 'f' {
-			codepoint += rune(h - 'a' + 10)
+			codepoint += h - 'a' + 10
 		} else if h >= 'A' && h <= 'F' {
-			codepoint += rune(h - 'A' + 10)
+			codepoint += h - 'A' + 10
 		}
 	}
 	// Replace certain problematic Unicode chars with space or skip them
@@ -1353,9 +1351,9 @@ func stripReturnTypeAnnotations(query string) string {
 				break
 			}
 			if query[i] != ' ' && query[i] != '\t' && query[i] != '\n' &&
-				!((query[i] >= 'a' && query[i] <= 'z') ||
-					(query[i] >= 'A' && query[i] <= 'Z') ||
-					query[i] == '_') {
+				((query[i] < 'a' || query[i] > 'z') &&
+					(query[i] < 'A' || query[i] > 'Z') &&
+					query[i] != '_') {
 				break
 			}
 		}
@@ -1373,12 +1371,13 @@ func stripReturnTypeAnnotations(query string) string {
 		for parenEnd < len(query) && depth > 0 {
 			c := query[parenEnd]
 			if !inString {
-				if c == '"' || c == '\'' {
+				switch c {
+				case '"', '\'':
 					inString = true
 					stringChar = c
-				} else if c == '(' {
+				case '(':
 					depth++
-				} else if c == ')' {
+				case ')':
 					depth--
 				}
 			} else {
@@ -1424,9 +1423,10 @@ func stripReturnTypeAnnotations(query string) string {
 		depth = 1
 		typeEnd := typeStart + 1
 		for typeEnd < len(query) && depth > 0 {
-			if query[typeEnd] == '(' {
+			switch query[typeEnd] {
+			case '(':
 				depth++
-			} else if query[typeEnd] == ')' {
+			case ')':
 				depth--
 			}
 			typeEnd++
@@ -1500,9 +1500,10 @@ func normalizeLookupSubquery(query string) string {
 		depth := 1
 		parenEnd := parenStart + 1
 		for parenEnd < len(query) && depth > 0 {
-			if query[parenEnd] == '(' {
+			switch query[parenEnd] {
+			case '(':
 				depth++
-			} else if query[parenEnd] == ')' {
+			case ')':
 				depth--
 			}
 			parenEnd++
@@ -1592,12 +1593,13 @@ func stripMvApplySubquery(query string) string {
 		for parenEnd < len(query) && depth > 0 {
 			c := query[parenEnd]
 			if !inString {
-				if c == '"' || c == '\'' {
+				switch c {
+				case '"', '\'':
 					inString = true
 					stringChar = c
-				} else if c == '(' {
+				case '(':
 					depth++
-				} else if c == ')' {
+				case ')':
 					depth--
 				}
 			} else {
@@ -1687,13 +1689,14 @@ func stripParseStatements(query string) string {
 		for i := 0; i < idx; i++ {
 			c := query[i]
 			if !inStrInit {
-				if c == '"' || c == '\'' {
+				switch c {
+				case '"', '\'':
 					inStrInit = true
 					strCharInit = c
 					isVerbatimInit = i > 0 && query[i-1] == '@'
-				} else if c == '(' {
+				case '(':
 					parenDepth++
-				} else if c == ')' {
+				case ')':
 					parenDepth--
 				}
 			} else {
@@ -1836,7 +1839,6 @@ func normalizeDistinctColumns(query string) string {
 			break
 		}
 		distinctStart := searchFrom + pos + 9 // Position after "distinct "
-		searchFrom = distinctStart
 
 		// Find the end of the distinct clause (next pipe, newline, or end)
 		endPos := len(query)
@@ -1855,7 +1857,6 @@ func normalizeDistinctColumns(query string) string {
 		b.WriteString(query[lastCopied:distinctStart])
 		b.WriteString(normalizedCols)
 		lastCopied = endPos
-		searchFrom = distinctStart + len(normalizedCols)
 		// Adjust searchFrom relative to what's been written vs original
 		// Since we're searching lowerQuery (original), we need to advance past endPos
 		searchFrom = endPos
@@ -1996,11 +1997,12 @@ func normalizeDistinctColumnList(columns string) string {
 			argStart := i + 1
 			i++
 			for i < len(columns) && parenDepth > 0 {
-				if columns[i] == '(' {
+				switch columns[i] {
+				case '(':
 					parenDepth++
-				} else if columns[i] == ')' {
+				case ')':
 					parenDepth--
-				} else if columns[i] == '"' || columns[i] == '\'' {
+				case '"', '\'':
 					// Skip string literal
 					quote := columns[i]
 					i++
@@ -3027,9 +3029,10 @@ func stripJoinHints(query string) string {
 			depth := 1
 			endIdx++
 			for endIdx < len(query) && depth > 0 {
-				if query[endIdx] == '(' {
+				switch query[endIdx] {
+				case '(':
 					depth++
-				} else if query[endIdx] == ')' {
+				case ')':
 					depth--
 				}
 				endIdx++
@@ -3340,9 +3343,10 @@ func normalizeMakeSeries(query string) string {
 				rpDepth := 1
 				rangeEnd := actualRangeStart
 				for rangeEnd < endPos && rpDepth > 0 {
-					if query[rangeEnd] == '(' {
+					switch query[rangeEnd] {
+					case '(':
 						rpDepth++
-					} else if query[rangeEnd] == ')' {
+					case ')':
 						rpDepth--
 					}
 					rangeEnd++
@@ -3524,12 +3528,13 @@ func stripUnionFunctionParams(query string) string {
 				for i < len(result) && depth > 0 {
 					ch := result[i]
 					if !inString {
-						if ch == '"' || ch == '\'' {
+						switch ch {
+						case '"', '\'':
 							inString = true
 							stringChar = ch
-						} else if ch == '(' {
+						case '(':
 							depth++
-						} else if ch == ')' {
+						case ')':
 							depth--
 						}
 					} else {
@@ -3659,9 +3664,10 @@ func replaceASIMFunctions(query string) string {
 				depth := 1
 				closeParen := parenPos + 1
 				for closeParen < qLen && depth > 0 {
-					if query[closeParen] == '(' {
+					switch query[closeParen] {
+					case '(':
 						depth++
-					} else if query[closeParen] == ')' {
+					case ')':
 						depth--
 					}
 					closeParen++
@@ -3738,9 +3744,10 @@ func replaceDatatableWithData(query string) string {
 		depth := 1
 		closeParen := openParen + 1
 		for closeParen < len(query) && depth > 0 {
-			if query[closeParen] == '(' {
+			switch query[closeParen] {
+			case '(':
 				depth++
-			} else if query[closeParen] == ')' {
+			case ')':
 				depth--
 			}
 			closeParen++
@@ -3766,12 +3773,13 @@ func replaceDatatableWithData(query string) string {
 			for dataEnd < len(query) && bracketDepth > 0 {
 				c := query[dataEnd]
 				if !inString {
-					if c == '"' || c == '\'' {
+					switch c {
+					case '"', '\'':
 						inString = true
 						stringChar = c
-					} else if c == '[' {
+					case '[':
 						bracketDepth++
-					} else if c == ']' {
+					case ']':
 						bracketDepth--
 					}
 				} else {
@@ -3834,11 +3842,12 @@ func replaceArgFunction(query string) string {
 		depth := 1
 		closeParen := openParen + 1
 		for closeParen < len(query) && depth > 0 {
-			if query[closeParen] == '(' {
+			switch query[closeParen] {
+			case '(':
 				depth++
-			} else if query[closeParen] == ')' {
+			case ')':
 				depth--
-			} else if query[closeParen] == '"' {
+			case '"':
 				// Skip string
 				closeParen++
 				for closeParen < len(query) && query[closeParen] != '"' {
@@ -3917,9 +3926,10 @@ func replaceExternalData(query string) string {
 			bracketDepth := 1
 			end++
 			for end < len(query) && bracketDepth > 0 {
-				if query[end] == '[' {
+				switch query[end] {
+				case '[':
 					bracketDepth++
-				} else if query[end] == ']' {
+				case ']':
 					bracketDepth--
 				}
 				end++
@@ -4167,9 +4177,10 @@ func stripDeclareStatements(query string) string {
 		depth := 1
 		parenEnd := parenStart + 1
 		for parenEnd < len(query) && depth > 0 {
-			if query[parenEnd] == '(' {
+			switch query[parenEnd] {
+			case '(':
 				depth++
-			} else if query[parenEnd] == ')' {
+			case ')':
 				depth--
 			}
 			parenEnd++
@@ -4766,9 +4777,10 @@ func normalizeSearchOperator(query string) string {
 			depth := 1
 			closeIdx := openIdx + 1
 			for closeIdx < len(rest) && depth > 0 {
-				if rest[closeIdx] == '(' {
+				switch rest[closeIdx] {
+				case '(':
 					depth++
-				} else if rest[closeIdx] == ')' {
+				case ')':
 					depth--
 				}
 				closeIdx++
@@ -4806,7 +4818,7 @@ func isValidParamName(s string) bool {
 		return false
 	}
 	for _, c := range s {
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == ':') {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '_' && c != ':' {
 			return false
 		}
 	}
@@ -5780,12 +5792,7 @@ func (e *conditionExtractor) ExitNotExpression(ctx *NotExpressionContext) {
 }
 
 // EnterOrExpression handles OR in expressions
-func (e *conditionExtractor) EnterOrExpression(ctx *OrExpressionContext) {
-	// If there are multiple andExpressions, they're connected by OR
-	if len(ctx.AllAndExpression()) > 1 {
-		// The next condition after an OR will have OR logical op
-	}
-}
+func (e *conditionExtractor) EnterOrExpression(_ *OrExpressionContext) {}
 
 // ExitAndExpression links the next condition with OR when another OR branch
 // follows this one. After the last branch the operator around the whole OR
@@ -5822,13 +5829,13 @@ func isValidFieldName(s string) bool {
 
 	// Must start with letter or underscore
 	first := s[0]
-	if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || first == '_') {
+	if (first < 'a' || first > 'z') && (first < 'A' || first > 'Z') && first != '_' {
 		return false
 	}
 
 	// Check for nested field access (e.g., Properties.Result)
 	for _, c := range s[1:] {
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.') {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '_' && c != '.' {
 			return false
 		}
 	}
@@ -6394,7 +6401,7 @@ func splitPipeSegments(query string) []string {
 // splitTopLevelPipeSegments splits on pipes at paren depth zero only, so a
 // parenthesised subquery stays intact. Data-source extraction needs this:
 // "T | join (U | where x) on k" must keep "(U | where x)" together, otherwise
-// the join operand is torn in half and U is never recognised as a source.
+// the join operand is torn in half and U is never recognized as a source.
 func splitTopLevelPipeSegments(query string) []string {
 	var segments []string
 	start := 0
@@ -7028,7 +7035,7 @@ func extractFinalIdentifier(query string) string {
 func firstStringLiteral(query string) string {
 	for i := 0; i < len(query); i++ {
 		ch := query[i]
-		if ch != '"' && ch != '\'' && !(ch == '@' && i+1 < len(query) && (query[i+1] == '"' || query[i+1] == '\'')) {
+		if ch != '"' && ch != '\'' && (ch != '@' || i+1 >= len(query) || query[i+1] != '"' && query[i+1] != '\'') {
 			continue
 		}
 		if value, _, ok := parseStringLiteral(query[i:]); ok {
