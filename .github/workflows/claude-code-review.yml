@@ -2,20 +2,26 @@ name: Claude Security Review
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
 
 concurrency:
   group: claude-security-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+# Add the claude-review label to request this optional review.
+permissions:
+  contents: read
+
 jobs:
   claude-security-analysis:
     name: claude-security-analysis
-    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository }}
+    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && github.actor != 'dependabot[bot]' && contains(github.event.pull_request.labels.*.name, 'claude-review') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       pull-requests: read
+      id-token: write
     outputs:
       review: ${{ steps.claude-review.outputs.structured_output }}
     steps:
@@ -78,11 +84,12 @@ jobs:
     needs: claude-security-analysis
     if: ${{ always() && needs.claude-security-analysis.result != 'skipped' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: write
     steps:
-      - name: Publish review and enforce result
+      - name: Publish advisory review
         env:
           GH_TOKEN: ${{ github.token }}
           REVIEW_OUTPUT: ${{ needs.claude-security-analysis.outputs.review }}
@@ -108,10 +115,10 @@ jobs:
 
           comments="$(jq -c '[.findings[] | {path: .path, line: .line, side: "RIGHT", body: ("**" + .title + "**\n\n" + .body)}]' <<< "$REVIEW_OUTPUT")"
           body="$(jq -r --arg count "$count" '.summary as $summary | "Claude Security Review found \($count) blocking finding(s).\n\n\($summary)\n\nSee the inline review comments on the affected diff lines."' <<< "$REVIEW_OUTPUT")"
-          payload="$(jq -n --arg commit "$HEAD_SHA" --arg body "$body" --argjson comments "$comments" '{commit_id: $commit, event: "REQUEST_CHANGES", body: $body, comments: $comments}')"
+          payload="$(jq -n --arg commit "$HEAD_SHA" --arg body "$body" --argjson comments "$comments" '{commit_id: $commit, event: "COMMENT", body: $body, comments: $comments}')"
 
           if ! gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews" --method POST --input - <<< "$payload"; then
-            fallback="$(jq -n --arg commit "$HEAD_SHA" --arg body "$body" '{commit_id: $commit, event: "REQUEST_CHANGES", body: $body}')"
+            fallback="$(jq -n --arg commit "$HEAD_SHA" --arg body "$body" '{commit_id: $commit, event: "COMMENT", body: $body}')"
             gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews" --method POST --input - <<< "$fallback"
           fi
 
