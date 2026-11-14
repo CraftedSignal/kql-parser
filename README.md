@@ -32,6 +32,11 @@ retained. Consumers must handle or reject these leaves: search no longer emits
 fabricated `_keyword_` Conditions. See the migration guide for failure semantics
 and the distinction from normalized ordinary scalar predicates.
 
+OR grouping and `DeduplicateConditions` now distinguish case-sensitive column
+names, right-hand field references, stages, and pipelines. Literal equality to
+`"*"` is retained. The dedup helper keeps only the latest stage for each exact
+field and pipeline in source order; use `Expression` for Boolean semantics.
+
 ## Usage
 
 ### Basic Condition Extraction

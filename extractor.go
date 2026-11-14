@@ -7657,12 +7657,19 @@ func canMergeAlternativeGroup(conditions []Condition, index int) bool {
 }
 
 func sameConditionGroup(a, b Condition) bool {
-	return strings.EqualFold(a.Field, b.Field) &&
+	// Alternatives encode literal values on one field. References and computed
+	// expressions need their complete predicates, even when names look alike.
+	return a.Field == b.Field &&
 		a.Operator == b.Operator &&
 		!a.Negated &&
 		!b.Negated &&
-		a.IsComputed == b.IsComputed &&
-		strings.EqualFold(a.SourceField, b.SourceField)
+		!a.IsComputed &&
+		!b.IsComputed &&
+		a.ValueReference == "" &&
+		b.ValueReference == "" &&
+		a.SourceField == b.SourceField &&
+		a.PipeStage == b.PipeStage &&
+		a.Pipeline == b.Pipeline
 }
 
 func conditionAlternatives(cond Condition) []string {
@@ -7684,65 +7691,60 @@ func deduplicateConditionValues(values []string) []string {
 	return result
 }
 
-func conditionDedupKey(cond Condition) string {
-	return strings.ToLower(cond.Field) + "|" +
-		cond.Operator + "|" +
-		cond.Value + "|" +
-		boolKey(cond.Negated) + "|" +
-		boolKey(cond.IsComputed) + "|" +
-		strings.ToLower(cond.SourceField) + "|" +
-		strings.Join(cond.Alternatives, "\x00")
+type conditionIdentity struct {
+	field, operator, value, valueReference string
+	logicalOp, sourceField, alternatives   string
+	negated, isComputed, alternativesNil   bool
+	pipeStage, pipeline, alternativesLen   int
 }
 
-func boolKey(value bool) string {
-	if value {
-		return "1"
+func conditionDedupKey(cond Condition) conditionIdentity {
+	var alternatives strings.Builder
+	for _, value := range cond.Alternatives {
+		alternatives.WriteString(strconv.Itoa(len(value)))
+		alternatives.WriteByte(':')
+		alternatives.WriteString(value)
 	}
-	return "0"
+	return conditionIdentity{
+		field: cond.Field, operator: cond.Operator, value: cond.Value,
+		valueReference: cond.ValueReference, logicalOp: cond.LogicalOp,
+		sourceField: cond.SourceField, alternatives: alternatives.String(),
+		negated: cond.Negated, isComputed: cond.IsComputed,
+		alternativesNil: cond.Alternatives == nil,
+		pipeStage:       cond.PipeStage, pipeline: cond.Pipeline,
+		alternativesLen: len(cond.Alternatives),
+	}
 }
 
-// DeduplicateConditions removes duplicate conditions, keeping the latest pipe stage
+// DeduplicateConditions projects each exact field and pipeline to its latest
+// pipe stage, then removes only identical conditions in original source order.
 func DeduplicateConditions(conditions []Condition) []Condition {
 	if len(conditions) == 0 {
 		return conditions
 	}
-
-	// Group by field (case-insensitive)
-	fieldConditions := make(map[string][]Condition)
+	type fieldPipeline struct {
+		field    string
+		pipeline int
+	}
+	latest := make(map[fieldPipeline]int, len(conditions))
 	for _, cond := range conditions {
-		// Skip pure wildcards
-		if cond.Value == "*" {
+		key := fieldPipeline{cond.Field, cond.Pipeline}
+		if stage, ok := latest[key]; !ok || cond.PipeStage > stage {
+			latest[key] = cond.PipeStage
+		}
+	}
+	result := make([]Condition, 0, len(conditions))
+	seen := make(map[conditionIdentity]bool, len(conditions))
+	for _, cond := range conditions {
+		if cond.PipeStage != latest[fieldPipeline{cond.Field, cond.Pipeline}] {
 			continue
 		}
-		fieldLower := strings.ToLower(cond.Field)
-		fieldConditions[fieldLower] = append(fieldConditions[fieldLower], cond)
-	}
-
-	// Keep only conditions from the latest pipe stage for each field
-	result := make([]Condition, 0)
-	seen := make(map[string]bool)
-
-	for _, conds := range fieldConditions {
-		// Find max pipe stage
-		maxStage := -1
-		for _, c := range conds {
-			if c.PipeStage > maxStage {
-				maxStage = c.PipeStage
-			}
-		}
-
-		// Keep only conditions from max stage
-		for _, cond := range conds {
-			if cond.PipeStage == maxStage {
-				key := conditionDedupKey(cond)
-				if !seen[key] {
-					seen[key] = true
-					result = append(result, cond)
-				}
-			}
+		key := conditionDedupKey(cond)
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, cond)
 		}
 	}
-
 	return result
 }
 

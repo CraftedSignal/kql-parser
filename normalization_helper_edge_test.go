@@ -92,7 +92,7 @@ func TestKQLPortableKeywordAndDedupAdditionalEdges(t *testing.T) {
 		t.Fatalf("deduped conditions = %#v", deduped)
 	}
 	if !containsCondition(deduped, Condition{Field: "account", Operator: "==", Value: "alice", PipeStage: 2}) ||
-		!containsCondition(deduped, Condition{Field: "Account", Operator: "!=", Value: "alice", PipeStage: 2}) {
+		!containsCondition(deduped, Condition{Field: "Account", Operator: "==", Value: "*", PipeStage: 3}) {
 		t.Fatalf("latest distinct conditions not retained: %#v", deduped)
 	}
 }

@@ -88,3 +88,17 @@ an explicit table scope return failure-only results, consistently with Validate.
 There is no first-term keyword or partial-where recovery for these searches.
 Bare `not term` is retained as a local compatibility form; this does not assert
 that Kusto services accept it. No consumer dependency is updated by this change.
+
+## Condition postprocessing identity correction
+
+OR alternatives now combine only literal predicates with the same exact column,
+operator, source field, pipe stage, and pipeline. Case-distinct columns and
+right-hand field references remain separate expression leaves. This corrects
+previously lossy grouping such as `User == "a" or user == "b"` and
+`x == y or x == z`.
+
+`DeduplicateConditions` uses complete condition identity and keeps source order.
+Its existing latest-stage projection now runs independently for each exact
+field and pipeline. It preserves literal equality to `"*"`; that value is a
+literal, not an unrestricted search. This helper projects flat conditions and
+does not replace the expression tree or simplify its Boolean semantics.
