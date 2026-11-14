@@ -45,7 +45,7 @@ func TestSemanticInternalExtractionBuildsLogicalOpsAndClones(t *testing.T) {
 		ComputedFields: map[string]string{"Alias": "CommandLine"},
 	}
 
-	semantic := semanticFromExtraction(result)
+	semantic := semanticFromExtraction(result, nil)
 	if semantic == nil {
 		t.Fatal("expected semantic query")
 	}
@@ -79,7 +79,7 @@ func TestSemanticInternalExtractionPreservesNestedJoinSubqueries(t *testing.T) {
 			},
 			ExposedFields: []string{"ResultType"},
 		}},
-	})
+	}, nil)
 	if semantic == nil || len(semantic.Joins) != 1 {
 		t.Fatalf("semantic joins = %#v, want one join", semantic)
 	}
@@ -96,7 +96,7 @@ func TestSemanticInternalExtractionPreservesNestedJoinSubqueries(t *testing.T) {
 }
 
 func TestSemanticExpressionConversionEdges(t *testing.T) {
-	if got := semanticFromExtraction(nil); got != nil {
+	if got := semanticFromExtraction(nil, nil); got != nil {
 		t.Fatalf("nil parse result converted to %#v", got)
 	}
 
@@ -124,7 +124,7 @@ func TestSemanticExpressionConversionEdges(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if got := semanticExpressionFromParseExpression(expression, conditions); got != nil {
+			if got := semanticExpressionFromParseExpression(expression, conditions, nil); got != nil {
 				t.Fatalf("invalid expression converted to %#v", got)
 			}
 		})
@@ -132,16 +132,16 @@ func TestSemanticExpressionConversionEdges(t *testing.T) {
 
 	leafA := &SemanticExpression{Operator: BooleanCondition, Condition: &conditions[0]}
 	leafB := &SemanticExpression{Operator: BooleanCondition, Condition: &conditions[1]}
-	if got := combineSemanticExpressions(BooleanAnd, nil, leafA); got != leafA {
+	if got := combineSemanticExpressions(BooleanAnd, nil, leafA, nil); got != leafA {
 		t.Fatalf("nil left combine = %#v, want leafA", got)
 	}
-	if got := combineSemanticExpressions(BooleanAnd, leafA, nil); got != leafA {
+	if got := combineSemanticExpressions(BooleanAnd, leafA, nil, nil); got != leafA {
 		t.Fatalf("nil right combine = %#v, want leafA", got)
 	}
 	combined := combineSemanticExpressions(
 		BooleanAnd,
 		&SemanticExpression{Operator: BooleanAnd, Children: []*SemanticExpression{leafA}},
-		&SemanticExpression{Operator: BooleanAnd, Children: []*SemanticExpression{leafB}},
+		&SemanticExpression{Operator: BooleanAnd, Children: []*SemanticExpression{leafB}}, nil,
 	)
 	if combined.Operator != BooleanAnd || len(combined.Children) != 2 {
 		t.Fatalf("flattened combine = %#v, want AND with two children", combined)

@@ -41,7 +41,7 @@ func TestFunctionPredicatesPreserveBooleanGrouping(t *testing.T) {
 				if result.Expression == nil {
 					t.Fatal("missing condition expression")
 				}
-				if got, want := predicateSemanticShape(semanticFromExtraction(result).Expression), fmt.Sprintf(tc.shape, function); got != want {
+				if got, want := predicateSemanticShape(semanticFromExtraction(result, nil).Expression), fmt.Sprintf(tc.shape, function); got != want {
 					t.Fatalf("semantic shape = %s, want %s", got, want)
 				}
 			})
@@ -137,7 +137,7 @@ func TestFunctionPredicatesCarryFilterMetadata(t *testing.T) {
 	if last.LogicalOp != "AND" || last.PipeStage <= predicate.PipeStage || last.Pipeline != predicate.Pipeline {
 		t.Fatalf("following predicate metadata = %#v, previous = %#v", last, predicate)
 	}
-	if got := predicateSemanticShape(semanticFromExtraction(result).Expression); got != "and(or(a:==:false,Copied:isnotempty:false),c:isnull:false)" {
+	if got := predicateSemanticShape(semanticFromExtraction(result, nil).Expression); got != "and(or(a:==:false,Copied:isnotempty:false),c:isnull:false)" {
 		t.Fatalf("pipeline semantic shape = %s", got)
 	}
 }

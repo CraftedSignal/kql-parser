@@ -1,6 +1,7 @@
 package kql
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -12,8 +13,8 @@ import (
 	"github.com/antlr4-go/antlr/v4"
 )
 
-// MaxParseTime is the maximum time allowed for parsing a single query.
-// Queries that exceed this are returned with an error.
+// MaxParseTime caps cooperative parsing checks. ANTLR may continue inside a
+// prediction between checks; this is not a hard wall-clock or memory bound.
 var MaxParseTime = 5 * time.Second
 
 const (
@@ -127,6 +128,7 @@ var kqlKeywords = map[string]bool{
 
 // conditionExtractor walks the parse tree to extract conditions
 type conditionExtractor struct {
+	budget *parseBudget
 	*BaseKQLParserListener
 	conditions          []Condition
 	computedFields      map[string]string // Fields created by extend/project: computed field -> source field
@@ -154,9 +156,19 @@ type conditionExtractor struct {
 type errorListener struct {
 	*antlr.DefaultErrorListener
 	errors []string
+	budget *parseBudget
 }
 
 func (l *errorListener) SyntaxError(recognizer antlr.Recognizer, offendingSymbol interface{}, line, column int, msg string, e antlr.RecognitionException) {
+	if l.budget != nil {
+		l.budget.step()
+		if len(l.errors) >= 32 {
+			l.budget.reject("syntax error count")
+		}
+		if len(msg) > 1024 {
+			msg = msg[:1024]
+		}
+	}
 	l.errors = append(l.errors, msg)
 }
 
@@ -171,231 +183,381 @@ func normalizeQuery(query string) string {
 // write-up before the query, escaped newlines, workbook parameters, a second
 // query after the first, or a query that starts with an operator.
 func normalize(query string, strict bool) string {
+	return normalizeBudgeted(query, strict, nil)
+}
+
+func normalizeBudgeted(query string, strict bool, budget *parseBudget) string {
+	budget.input(query)
+	budget.step()
 	normalized := query
 
 	// Remove line continuation backslashes (backslash followed by newline)
 	// Common in PowerShell-style queries copied from scripts
 	normalized = strings.ReplaceAll(normalized, "\\\n", "\n")
+	budget.input(normalized)
+	budget.step()
 	normalized = strings.ReplaceAll(normalized, "\\\r\n", "\r\n")
+	budget.input(normalized)
+	budget.step()
 
 	// Fix escaped newlines from JSON extraction - but only outside of string literals
 	// This handles queries extracted from YAML/JSON where \r\n became literal characters
 	if !strict {
 		normalized = normalizeEscapeSequences(normalized)
+		budget.input(normalized)
+		budget.step()
 	}
 
 	// Normalize actual UTF-8 whitespace runes that the lexer does not treat as WS.
 	// Sentinel exports occasionally contain NBSP after query text.
 	normalized = normalizeUnicodeWhitespace(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Strip documentation preambles like "Description:...Query:..."
 	// These are common in documentation templates where the actual query follows "Query:"
 	if !strict {
 		normalized = stripDocumentationPreamble(normalized)
+		budget.input(normalized)
+		budget.step()
 	}
 
 	// Strip leading comments to get to the actual query
 	normalized = stripLeadingComments(normalized, strict)
+	budget.input(normalized)
+	budget.step()
 
 	// Strip declare query_parameters(...) statements
 	// These define query parameters but aren't needed for condition extraction
 	normalized = stripDeclareStatements(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Inline lets that bind constants before later steps rewrite their
 	// literals, so a condition reads a let's value as an inline literal.
-	normalized = inlineLetConstants(normalized, extractLetStatements(normalized))
+	normalized = inlineLetConstants(normalized, extractLetStatements(normalized), budget)
+	budget.input(normalized)
+	budget.step()
 
 	// Replace parameterized placeholders with dummy values
 	// e.g., {TimeRange} -> 1d, {SourceTable} -> DummyTable
 	if !strict {
 		normalized = replaceParameters(normalized)
+		budget.input(normalized)
+		budget.step()
 	}
 
 	// Convert ASIM functions to dummy table names (these are parser functions that return tables)
 	// Handle both simple calls (imAuthentication) and parameterized calls (_Im_Dns(param=value))
 	normalized = replaceASIMFunctions(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Handle externaldata operator by replacing with dummy table
 	normalized = replaceExternalData(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Handle datatable with inline data by replacing with dummy table
 	normalized = replaceDatatableWithData(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Handle arg() cross-workspace function: arg("...").Table -> Table
 	// Azure Resource Graph queries use arg("sub-id").Resources pattern
 	normalized = replaceArgFunction(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Handle materialize by stripping it (handles both with and without space)
 	normalized = strings.ReplaceAll(normalized, "materialize(", "(")
+	budget.input(normalized)
+	budget.step()
 	normalized = strings.ReplaceAll(normalized, "materialize (", "(")
+	budget.input(normalized)
+	budget.step()
 	normalized = strings.ReplaceAll(normalized, "materialize  (", "(")
+	budget.input(normalized)
+	budget.step()
 
 	// Rename reserved keywords used as field names
 	// "pattern" is a reserved word in the grammar but used as a field name in some queries
 	normalized = renameReservedFieldNames(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Convert make_set and make_list aliases used by existing parser fixtures.
 	// Handle both make_set( and make_set ( with space.
 	normalized = strings.ReplaceAll(normalized, "make_set(", "makeset(")
+	budget.input(normalized)
+	budget.step()
 	normalized = strings.ReplaceAll(normalized, "make_set (", "makeset(")
+	budget.input(normalized)
+	budget.step()
 	normalized = strings.ReplaceAll(normalized, "make_list(", "makelist(")
+	budget.input(normalized)
+	budget.step()
 	normalized = strings.ReplaceAll(normalized, "make_list (", "makelist(")
+	budget.input(normalized)
+	budget.step()
 
 	// Normalize string operator aliases commonly found in Sentinel content.
 	normalized = normalizeStringOperatorAliases(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Handle summarize without aggregation (summarize by x -> summarize count() by x)
 	// The grammar requires aggregation before BY, but KQL allows just "summarize by"
 	normalized = normalizeSummarizeBy(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Convert SQL-style <> to KQL != (handle all spacing variations)
 	normalized = normalizeNotEqualOperator(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Normalize timespan literals without space: 0min -> 0 min, 30min -> 30 min
 	// The lexer expects space or recognizes combined form only for certain patterns
 	normalized = normalizeTimespanLiterals(normalized)
+	budget.input(normalized)
+	budget.step()
 	normalized = normalizeDatetimeLiterals(normalized)
+	budget.input(normalized)
+	budget.step()
 	normalized = joinAdjacentStringLiterals(normalized)
+	budget.input(normalized)
+	budget.step()
 	normalized = normalizeMakeGraphEdges(normalized)
+	budget.input(normalized)
+	budget.step()
 	normalized = stripGraphMatchStages(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Normalize trailing decimals: 1000. -> 1000.0
 	// The grammar requires at least one digit after the decimal point
 	normalized = normalizeTrailingDecimals(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Normalize \0 escape sequences to \x00 (null character)
 	// The grammar only supports \x hex escapes, not bare \0
 	normalized = normalizeNullEscapes(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Convert operator aliases to standard forms
 	normalized = strings.ReplaceAll(normalized, "| mvexpand ", "| mv-expand ")
+	budget.input(normalized)
+	budget.step()
 	normalized = strings.ReplaceAll(normalized, "\nmvexpand ", "\nmv-expand ")
+	budget.input(normalized)
+	budget.step()
 	normalized = strings.ReplaceAll(normalized, "| mvapply ", "| mv-apply ")
+	budget.input(normalized)
+	budget.step()
 
 	// Convert "filter" to "where" (filter is a legacy alias)
 	normalized = strings.ReplaceAll(normalized, "| filter ", "| where ")
+	budget.input(normalized)
+	budget.step()
 	normalized = strings.ReplaceAll(normalized, "\nfilter ", "\nwhere ")
+	budget.input(normalized)
+	budget.step()
 
 	// Strip kind= from lookup operator (grammar doesn't support it)
 	normalized = strings.ReplaceAll(normalized, "lookup kind=leftouter ", "lookup ")
+	budget.input(normalized)
+	budget.step()
 	normalized = strings.ReplaceAll(normalized, "lookup kind=inner ", "lookup ")
+	budget.input(normalized)
+	budget.step()
 	normalized = strings.ReplaceAll(normalized, "lookup kind=rightouter ", "lookup ")
+	budget.input(normalized)
+	budget.step()
 	normalized = strings.ReplaceAll(normalized, "lookup kind=fullouter ", "lookup ")
+	budget.input(normalized)
+	budget.step()
 
 	// Normalize lookup subqueries: lookup (union ...) -> lookup (LookupTable)
 	// The grammar doesn't support complex expressions inside lookup
 	normalized = normalizeLookupSubquery(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Normalize make-series: convert "in range(...)" to "from ... to ... step ..."
 	// and add default step if missing
 	normalized = normalizeMakeSeries(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Normalize join kind aliases (grammar supports leftanti/rightsemi but not combined forms)
 	normalized = strings.ReplaceAll(normalized, "kind=leftantisemi", "kind=leftanti")
+	budget.input(normalized)
+	budget.step()
 	normalized = strings.ReplaceAll(normalized, "kind=rightantisemi", "kind=rightanti")
+	budget.input(normalized)
+	budget.step()
 	normalized = strings.ReplaceAll(normalized, "kind=leftsemijoin", "kind=leftsemi")
+	budget.input(normalized)
+	budget.step()
 	normalized = strings.ReplaceAll(normalized, "kind=rightsemijoin", "kind=rightsemi")
+	budget.input(normalized)
+	budget.step()
 
 	// Normalize join condition 'and' to comma (grammar expects comma-separated conditions)
 	// on $left.A == $right.B and $left.C == $right.D -> on $left.A == $right.B, $left.C == $right.D
 	normalized = joinConditionAndRe.ReplaceAllString(normalized, ", $$$1.")
+	budget.input(normalized)
+	budget.step()
 
 	// Strip all hint.xxx=value patterns (hint.strategy=broadcast, hint.shufflekey=x, etc.)
 	// The grammar doesn't support these join hints
 	normalized = stripJoinHints(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Strip mv-apply subqueries: mv-apply x on (subquery) -> mv-apply x
 	// The subquery isn't needed for condition extraction
 	normalized = stripMvApplySubquery(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Strip parse statements: parse field with pattern -> (removed)
 	// The parse operator extracts substrings but isn't needed for condition extraction
 	normalized = stripParseStatements(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Strip return type annotations from evaluate: evaluate func(x) : (col:type) -> evaluate func(x)
 	normalized = stripReturnTypeAnnotations(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Normalize dot-bracket pattern: obj.[0] -> obj[0], obj.["key"] -> obj["key"]
 	// This unusual KQL syntax isn't handled by our grammar
 	normalized = replaceAllOutsideStrings(normalized, ".[", "[")
+	budget.input(normalized)
+	budget.step()
 
 	// Convert bracket property access to dot notation
 	// obj['key'] -> obj._key_ (the lexer's QUOTED_IDENTIFIER conflicts with bracket access)
 	normalized = convertBracketAccess(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Reduce "field in (Tabular | project X)" to a scalar placeholder so
 	// expression parsing can continue. Portable extraction still sees the
 	// original query for table and predicate discovery.
 	normalized = normalizeInSubqueries(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Fix identifiers that start with numbers by prepending underscore
 	// e.g., 3plogTime -> _3plogTime
 	normalized = fixNumericIdentifiers(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Convert tuple unpacking to single assignment
 	// (a, b, c) = func() -> _tuple_result = func()
 	normalized = convertTupleUnpacking(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Extract main query from let statements (parse only the final query for conditions)
 	// This MUST happen before union normalization so (union ...) after lets is handled
 	if strict {
 		normalized = normalized[skipLetStatements(normalized):]
+		budget.input(normalized)
+		budget.step()
 	} else {
 		normalized = extractMainQuery(normalized)
+		budget.input(normalized)
+		budget.step()
 		normalized = rescueOperatorFirstQuery(normalized)
+		budget.input(normalized)
+		budget.step()
 	}
 
 	// Strip function parameters in union statements (grammar doesn't support them)
 	// union Func('a'), Func2('b') -> union Func, Func2
 	normalized = stripUnionFunctionParams(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Handle union with withsource and isfuzzy parameters
 	// union withsource=... -> union
 	// union isfuzzy=true -> union
 	// Also handles (union ...) wrapped queries
 	normalized = normalizeUnionParameters(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Handle queries that start with union (grammar requires union to follow a table reference)
 	if hasKeywordPrefix(strings.TrimLeft(strings.ToLower(normalized), " \t\r\n"), "union") {
 		normalized = "DummyTable | " + normalized
+		budget.input(normalized)
+		budget.step()
 	}
 
 	// Handle union inside join parentheses: join (union ...) -> join (DummyTable | union ...)
 	// The grammar requires a tabularSource before union, even inside join
 	normalized = normalizeJoinUnion(normalized)
+	budget.input(normalized)
+	budget.step()
 	normalized = normalizeBracketedUnion(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Handle find operator: find in (Table1, Table2, ...) where ... -> extract conditions from where clause
 	// The find operator isn't in the grammar, so convert to table + where
 	normalized = normalizeFindOperator(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Handle search operator: search in (Table1, Table2) "pattern" -> simplified form
 	// The search operator needs special handling
 	normalized = normalizeSearchOperator(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Normalize top-nested operator: top-nested N of X by count() -> summarize count() by X
 	// The grammar doesn't support the "of" keyword in top-nested
 	normalized = normalizeTopNested(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Normalize partition bodies that start with an operator rather than a table
 	// source, e.g. `partition by aid (top 1 by TimeGenerated desc)`.
 	normalized = normalizePartitionOperator(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Strip named parameters from function calls: func(param=value) -> func()
 	// These are common in user-defined function calls like parser(pack=true)
 	normalized = stripNamedFunctionParams(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Normalize distinct clauses: distinct a, tostring(b) -> distinct a, b
 	// The grammar doesn't support function calls in distinct column lists
 	normalized = normalizeDistinctColumns(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Strip render operator parameters: render areachart kind=stacked -> render areachart
 	// The grammar doesn't support all render parameter forms
 	normalized = stripRenderParameters(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	// Strip trailing semicolons and comments (common in saved queries and function definitions)
 	// Must handle cases like "| where x == 1; // comment" -> "| where x == 1"
 	normalized = stripTrailingSemicolonsAndComments(normalized)
+	budget.input(normalized)
+	budget.step()
 
 	return normalized
 }
@@ -4831,55 +4993,39 @@ func NormalizeQueryForDebug(query string) string {
 }
 
 // ExtractConditions parses a KQL query and extracts all field conditions.
-// Uses a timeout (MaxParseTime) to abort queries that cause the parser to hang
-// on deeply nested expressions. Recovers from panics.
+// Applies bounded input, syntax nesting and cooperative work limits.
 func ExtractConditions(query string) *ParseResult {
-	ch := make(chan *ParseResult, 1)
-	go func() {
-		ch <- extractConditionsInternal(query)
-	}()
-
-	select {
-	case result := <-ch:
-		return result
-	case <-time.After(MaxParseTime):
-		return &ParseResult{
-			Conditions:  []Condition{},
-			DataSources: []string{},
-			Commands:    []string{},
-			Errors:      []string{fmt.Sprintf("parser timeout: query took longer than %s to parse", MaxParseTime)},
-		}
-	}
+	return ExtractConditionsContext(context.Background(), query)
 }
 
-func extractConditionsInternal(query string) (result *ParseResult) {
+// ExtractConditionsContext applies caller cancellation and MaxParseTime at
+// cooperative boundaries. No parsing goroutine outlives this call.
+func ExtractConditionsContext(ctx context.Context, query string) *ParseResult {
+	return extractConditionsContext(ctx, query, defaultParseLimits())
+}
+
+func extractConditionsContext(ctx context.Context, query string, limits parseLimits) (result *ParseResult) {
 	defer func() {
-		if r := recover(); r != nil {
-			result = &ParseResult{
-				Conditions:  []Condition{},
-				DataSources: []string{},
-				Commands:    []string{},
-				Errors:      []string{fmt.Sprintf("parser panic: %v", r)},
-			}
+		if value := recover(); value != nil {
+			result = &ParseResult{Conditions: []Condition{}, Commands: []string{}, Errors: []string{parseFailure(value).Error()}}
 		}
 	}()
+	budget, cancel := newParseBudget(ctx, limits)
+	defer cancel()
+	return extractConditionsInternal(query, budget)
+}
 
-	// Normalize the query to handle operators the parser doesn't fully support
-	normalizedQuery := normalizeQuery(query)
-	input := antlr.NewInputStream(normalizedQuery)
-	lexer := NewKQLLexer(input)
-
-	// Remove default error listener and add our own
-	lexer.RemoveErrorListeners()
-	lexerErrors := &errorListener{}
-	lexer.AddErrorListener(lexerErrors)
-
-	stream := antlr.NewCommonTokenStream(lexer, antlr.TokenDefaultChannel)
-	parser := NewKQLParser(stream)
+func extractConditionsInternal(query string, budget *parseBudget) (result *ParseResult) {
+	budget.input(query)
+	preflight(query, budget, false, nil)
+	normalizedQuery := normalizeBudgeted(query, false, budget)
+	lexerErrors := &errorListener{budget: budget}
+	stream := preflight(normalizedQuery, budget, true, lexerErrors)
+	parser := NewKQLParser(&budgetTokenStream{CommonTokenStream: stream, budget: budget})
 
 	// Remove default error listener and add our own
 	parser.RemoveErrorListeners()
-	parserErrors := &errorListener{}
+	parserErrors := &errorListener{budget: budget}
 	parser.AddErrorListener(parserErrors)
 
 	// Parse the query
@@ -4887,6 +5033,7 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 
 	// Walk the tree to extract conditions
 	extractor := &conditionExtractor{
+		budget:              budget,
 		conditions:          make([]Condition, 0),
 		computedFields:      make(map[string]string), // computed field -> source field
 		computedExpressions: make(map[string]string), // computed field -> expression
@@ -4897,6 +5044,8 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 		originalQuery:       normalizedQuery,
 	}
 	antlr.ParseTreeWalkerDefault.Walk(extractor, tree)
+	budget.check()
+	extractor.checkOutput()
 
 	// Combine errors
 	allErrors := append(lexerErrors.errors, parserErrors.errors...)
@@ -4907,7 +5056,7 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 	// knows the grouping; the flat operator sequence cannot tell
 	// "x and (a or b)" from "(x and a) or b", so it is only a fallback.
 	rawConditions := append([]Condition(nil), extractor.conditions...)
-	rawExpression := buildConditionExpression(tree, rawConditions)
+	rawExpression := buildConditionExpression(tree, rawConditions, budget)
 	conditions, conditionIndexMap, grouped := groupORConditionsByExpression(rawConditions, rawExpression)
 	if !grouped {
 		conditions, conditionIndexMap = groupORConditionsWithIndexMap(extractor.conditions)
@@ -4917,7 +5066,7 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 		var note string
 		var extracted []Condition
 		allowGenericKeyword := len(lexerErrors.errors) != 0 || len(parserErrors.errors) != 0 ||
-			(!hasStructuredKQLQuery(tree) && len(letStatements) == 0)
+			(!hasStructuredKQLQuery(tree, budget) && len(letStatements) == 0)
 		extracted, note = extractPortableConditions(query, normalizedQuery, allowGenericKeyword)
 		portableStart := len(conditions)
 		for _, condition := range extracted {
@@ -4929,6 +5078,7 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 			}
 			condition.Pipeline = extractor.queryPipeline
 			if !containsCondition(conditions, condition) {
+				budget.reserveOutput(1 + len(condition.Alternatives))
 				conditions = append(conditions, condition)
 			}
 		}
@@ -4941,12 +5091,13 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 	}
 	keyword := extractLeadingSearchKeyword(query[skipLetStatements(query):])
 	if keyword == "" {
-		keyword = extractParsedKQLSearchKeyword(tree)
+		keyword = extractParsedKQLSearchKeyword(tree, budget)
 	}
 	if keyword != "" {
 		condition := portableKeywordCondition(keyword)
 		condition.Pipeline = extractor.queryPipeline
 		if !containsCondition(conditions, condition) {
+			budget.reserveOutput(1 + len(condition.Alternatives))
 			portableStart := len(conditions)
 			conditions = append(conditions, condition)
 			if expression != nil {
@@ -4956,10 +5107,14 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 		}
 	}
 
+	dataSources := extractPortableDataSources(query, normalizedQuery)
+	budget.outputSize(len(conditions))
+	budget.check()
+
 	return &ParseResult{
 		Conditions:          conditions,
 		Expression:          expression,
-		DataSources:         extractPortableDataSources(query, normalizedQuery),
+		DataSources:         dataSources,
 		LetStatements:       letStatements,
 		ComputedFields:      extractor.computedFields,
 		ComputedExpressions: extractor.computedExpressions,
@@ -5015,7 +5170,7 @@ func (e *conditionExtractor) EnterJoinOperator(ctx *JoinOperatorContext) {
 		// Subquery: join kind=inner (SubQuery | where ...) on field
 		subText := e.extractTabularExpressionText(ctx.TabularExpression())
 		if subText != "" {
-			info.Subsearch = ExtractConditions(subText)
+			info.Subsearch = extractConditionsInternal(subText, e.budget)
 			allJoinFields := append(info.JoinFields, info.LeftFields...)
 			info.ExposedFields = deriveExposedFields(info.Subsearch, allJoinFields)
 		}
@@ -5516,12 +5671,12 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 		return
 	}
 
-	if hasKQLFunctionPredicateAncestor(ctx) {
+	if hasKQLFunctionPredicateAncestor(ctx, e.budget) {
 		return
 	}
-	if predicate, ok := kqlFilterFunctionPredicate(ctx); ok {
+	if predicate, ok := kqlFilterFunctionPredicate(ctx, e.budget); ok {
 		sourceField, isComputed := e.computedFields[strings.ToLower(predicate.field)]
-		e.conditions = append(e.conditions, Condition{
+		e.appendCondition(Condition{
 			Field:       predicate.field,
 			Operator:    predicate.operator,
 			Negated:     e.negated != predicate.negated,
@@ -5536,7 +5691,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 	}
 	// A recognized predicate in extend/project/etc. is a computed value,
 	// including when a boolean literal appears on the left of a comparison.
-	if _, ok := recognizeKQLFunctionPredicate(ctx); ok {
+	if _, ok := recognizeKQLFunctionPredicate(ctx, e.budget); ok {
 		return
 	}
 
@@ -5648,7 +5803,7 @@ func (e *conditionExtractor) handleComparison(left, op, right string) {
 		IsComputed:     isComputed,
 		SourceField:    sourceField,
 	}
-	e.conditions = append(e.conditions, cond)
+	e.appendCondition(cond)
 	e.lastLogicalOp = "AND" // reset to default
 }
 
@@ -5685,7 +5840,7 @@ func (e *conditionExtractor) handleInOperator(field string, exprList IExpression
 	if len(values) == 1 && isSimpleIdentifier(values[0]) {
 		cond.ValueReference = values[0]
 	}
-	e.conditions = append(e.conditions, cond)
+	e.appendCondition(cond)
 	e.lastLogicalOp = "AND"
 }
 
@@ -5715,7 +5870,7 @@ func (e *conditionExtractor) handleBetweenOperator(field, lowValue, highValue st
 		IsComputed:  isComputed,
 		SourceField: sourceField,
 	}
-	e.conditions = append(e.conditions, cond1)
+	e.appendCondition(cond1)
 
 	// Add upper bound condition
 	cond2 := Condition{
@@ -5729,7 +5884,7 @@ func (e *conditionExtractor) handleBetweenOperator(field, lowValue, highValue st
 		IsComputed:  isComputed,
 		SourceField: sourceField,
 	}
-	e.conditions = append(e.conditions, cond2)
+	e.appendCondition(cond2)
 	e.lastLogicalOp = "AND"
 }
 
@@ -5769,7 +5924,7 @@ func (e *conditionExtractor) handleHasAnyAllOperator(field, op string, exprList 
 			IsComputed:  isComputed,
 			SourceField: sourceField,
 		}
-		e.conditions = append(e.conditions, cond)
+		e.appendCondition(cond)
 	}
 	e.lastLogicalOp = "AND"
 }
@@ -6300,7 +6455,8 @@ func extractPortableConditions(originalQuery, normalizedQuery string, allowGener
 // A successfully parsed structured query can legitimately have no row filters.
 // Keep generic keyword recovery for bare terms and unparsed input instead of
 // inventing a search from computed values, aggregates, or an entire pipeline.
-func hasStructuredKQLQuery(query IQueryContext) bool {
+func hasStructuredKQLQuery(query IQueryContext, budget *parseBudget) bool {
+	budget.step()
 	if len(query.AllStatement()) != 0 {
 		return true
 	}
@@ -6313,9 +6469,11 @@ func hasStructuredKQLQuery(query IQueryContext) bool {
 
 // Read explicit piped searches from the parse tree, rather than treating an
 // arbitrary string literal (or search-like text in a comment) as a filter.
-func extractParsedKQLSearchKeyword(query IQueryContext) string {
+func extractParsedKQLSearchKeyword(query IQueryContext, budget *parseBudget) string {
+	budget.step()
 	if tabular := query.TabularExpression(); tabular != nil {
 		for _, operator := range tabular.AllTabularOperator() {
+			budget.step()
 			if search := operator.SearchOperator(); search != nil && search.Expression() != nil {
 				if keyword, _, ok := parseStringLiteral(search.Expression().GetText()); ok && !looksLikeURL(keyword) {
 					return keyword

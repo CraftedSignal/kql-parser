@@ -28,13 +28,13 @@ func TestKQLExpressionBuilderHelperEdges(t *testing.T) {
 	}
 	builder := &kqlExpressionBuilder{conditions: conditions}
 
-	if got := buildConditionExpression(nil, conditions); got != nil {
+	if got := buildConditionExpression(nil, conditions, nil); got != nil {
 		t.Fatalf("nil tree returned expression %#v", got)
 	}
-	if got := buildConditionExpression(kqlParserForTest(t, `SecurityEvent | where a == 1`).Query(), conditions[:1]); got != nil {
+	if got := buildConditionExpression(kqlParserForTest(t, `SecurityEvent | where a == 1`).Query(), conditions[:1], nil); got != nil {
 		t.Fatalf("single condition returned expression %#v", got)
 	}
-	if got := collectKQLWhereOperators(nil); got != nil {
+	if got := collectKQLWhereOperators(nil, nil); got != nil {
 		t.Fatalf("nil tree where collection returned %#v", got)
 	}
 	if got := builder.expression(nil); got != nil {
