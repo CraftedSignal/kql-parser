@@ -151,3 +151,70 @@ func TestFunctionPredicateArgumentDoesNotChangeFilterLogicalOp(t *testing.T) {
 		t.Fatalf("following comparison = %#v; argument OR must not link row filters", result.Conditions[1])
 	}
 }
+
+func TestFunctionPredicatesWithoutRowFilters(t *testing.T) {
+	for _, function := range []string{"isnull", "isnotnull", "isempty", "isnotempty"} {
+		for _, operator := range []string{"extend", "project", "summarize"} {
+			expression := function + "(b)"
+			if operator == "summarize" {
+				expression = "countif(" + expression + ")"
+			}
+			query := "T | " + operator + " p=" + expression
+			t.Run(query, func(t *testing.T) {
+				result := ExtractConditions(query)
+				if len(result.Conditions) != 0 || len(result.Errors) != 0 || result.Expression != nil {
+					t.Fatalf("query only computes values: conditions=%#v expression=%#v errors=%v", result.Conditions, result.Expression, result.Errors)
+				}
+				if len(result.Pipelines) != 1 || result.Pipelines[0].Source != "T" {
+					t.Fatalf("missing pipeline source: %#v", result.Pipelines)
+				}
+				if operator == "summarize" {
+					if len(result.Aggregations) != 1 || result.Aggregations[0].Function != "countif" || result.Aggregations[0].Column != "p" || result.ComputedFields["p"] != expression {
+						t.Fatalf("missing countif aggregation: %#v", result.Aggregations)
+					}
+				} else if result.ComputedFields["p"] != "b" || result.ComputedExpressions["p"] != expression {
+					t.Fatalf("computed source = %#v, expressions = %#v, want p from b", result.ComputedFields, result.ComputedExpressions)
+				}
+				if operator == "project" && !containsString(result.ProjectedFields, "p") {
+					t.Fatalf("projected fields = %#v, want p", result.ProjectedFields)
+				}
+			})
+		}
+	}
+}
+
+func TestStructuredQueriesDoNotBecomeFallbackKeywords(t *testing.T) {
+	for _, query := range []string{
+		`T | extend label="not a search term"`,
+		`T | project label="not a search term"`,
+		`T | summarize count()`,
+		`let p=isnull(b); T`,
+		`print label="not a search term"`,
+		`T | extend label="search in (T) 'not a search term'"`,
+		`T | extend p=isnull(b) // | search "not a search term"`,
+	} {
+		t.Run(query, func(t *testing.T) {
+			result := ExtractConditions(query)
+			if len(result.Conditions) != 0 || len(result.Errors) != 0 {
+				t.Fatalf("nonfilter query emitted conditions=%#v errors=%v", result.Conditions, result.Errors)
+			}
+		})
+	}
+}
+
+func TestStructuredQueriesRetainSearchKeywordFilters(t *testing.T) {
+	for _, query := range []string{
+		`search "needle" | extend p=isnull(b)`,
+		`search in (T) "needle" | project p=isempty(b)`,
+		`T | search "needle" | summarize p=countif(isnotempty(b))`,
+		`T | extend label="unrelated" | search "needle" | project p=isnotnull(b)`,
+		`let p=isnull(b); search in (T) "needle"`,
+	} {
+		t.Run(query, func(t *testing.T) {
+			result := ExtractConditions(query)
+			if len(result.Conditions) != 1 || result.Conditions[0].Field != "_keyword_" || result.Conditions[0].Value != "needle" {
+				t.Fatalf("search condition missing: %#v errors=%v", result.Conditions, result.Errors)
+			}
+		})
+	}
+}

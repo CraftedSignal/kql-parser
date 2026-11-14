@@ -4901,6 +4901,7 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 	// Combine errors
 	allErrors := append(lexerErrors.errors, parserErrors.errors...)
 	allErrors = append(allErrors, extractor.errors...)
+	letStatements := extractLetStatements(query)
 
 	// Post-process to group OR conditions on same field. The expression tree
 	// knows the grouping; the flat operator sequence cannot tell
@@ -4915,7 +4916,9 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 	if !hasPortableFieldConditions(conditions) {
 		var note string
 		var extracted []Condition
-		extracted, note = extractPortableConditions(query, normalizedQuery)
+		allowGenericKeyword := len(lexerErrors.errors) != 0 || len(parserErrors.errors) != 0 ||
+			(!hasStructuredKQLQuery(tree) && len(letStatements) == 0)
+		extracted, note = extractPortableConditions(query, normalizedQuery, allowGenericKeyword)
 		portableStart := len(conditions)
 		for _, condition := range extracted {
 			// The tree walker already captured conditions on computed
@@ -4936,7 +4939,11 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 			allErrors = append(allErrors, note)
 		}
 	}
-	if keyword := extractLeadingSearchKeyword(query); keyword != "" {
+	keyword := extractLeadingSearchKeyword(query[skipLetStatements(query):])
+	if keyword == "" {
+		keyword = extractParsedKQLSearchKeyword(tree)
+	}
+	if keyword != "" {
 		condition := portableKeywordCondition(keyword)
 		condition.Pipeline = extractor.queryPipeline
 		if !containsCondition(conditions, condition) {
@@ -4953,7 +4960,7 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 		Conditions:          conditions,
 		Expression:          expression,
 		DataSources:         extractPortableDataSources(query, normalizedQuery),
-		LetStatements:       extractLetStatements(query),
+		LetStatements:       letStatements,
 		ComputedFields:      extractor.computedFields,
 		ComputedExpressions: extractor.computedExpressions,
 		GroupByFields:       extractor.groupByFields,
@@ -6270,14 +6277,14 @@ func findMatchingParen(s string, open int) int {
 
 // extractPortableConditions extracts translatable conditions from KQL shapes
 // that parse successfully but do not produce portable predicates in the tree walker.
-func extractPortableConditions(originalQuery, normalizedQuery string) ([]Condition, string) {
+func extractPortableConditions(originalQuery, normalizedQuery string, allowGenericKeyword bool) ([]Condition, string) {
 	if conditions := extractPortablePredicates(originalQuery); len(conditions) > 0 {
 		return conditions, portablePredicateExtractionNote
 	}
 	if conditions := extractPortablePredicates(normalizedQuery); len(conditions) > 0 {
 		return conditions, portablePredicateExtractionNote
 	}
-	if containsExternalDataLet(originalQuery) {
+	if containsExternalDataLet(originalQuery) || !allowGenericKeyword {
 		return nil, ""
 	}
 	keyword := extractPortableKeyword(originalQuery)
@@ -6288,6 +6295,35 @@ func extractPortableConditions(originalQuery, normalizedQuery string) ([]Conditi
 		return nil, ""
 	}
 	return []Condition{portableKeywordCondition(keyword)}, portableKeywordExtractionNote
+}
+
+// A successfully parsed structured query can legitimately have no row filters.
+// Keep generic keyword recovery for bare terms and unparsed input instead of
+// inventing a search from computed values, aggregates, or an entire pipeline.
+func hasStructuredKQLQuery(query IQueryContext) bool {
+	if len(query.AllStatement()) != 0 {
+		return true
+	}
+	if tabular := query.TabularExpression(); tabular != nil {
+		return len(tabular.AllTabularOperator()) != 0 ||
+			(tabular.TabularSource() != nil && tabular.TabularSource().TableName() == nil)
+	}
+	return false
+}
+
+// Read explicit piped searches from the parse tree, rather than treating an
+// arbitrary string literal (or search-like text in a comment) as a filter.
+func extractParsedKQLSearchKeyword(query IQueryContext) string {
+	if tabular := query.TabularExpression(); tabular != nil {
+		for _, operator := range tabular.AllTabularOperator() {
+			if search := operator.SearchOperator(); search != nil && search.Expression() != nil {
+				if keyword, _, ok := parseStringLiteral(search.Expression().GetText()); ok && !looksLikeURL(keyword) {
+					return keyword
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func portableKeywordCondition(keyword string) Condition {
