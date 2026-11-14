@@ -19,13 +19,13 @@ type ConditionExpression struct {
 	Children       []*ConditionExpression `json:"children,omitempty"`
 }
 
-func buildConditionExpression(tree antlr.Tree, conditions []Condition) *ConditionExpression {
+func buildConditionExpression(tree antlr.Tree, conditions []Condition, budget *parseBudget) *ConditionExpression {
 	if tree == nil || len(conditions) < 2 {
 		return nil
 	}
-	builder := &kqlExpressionBuilder{conditions: conditions}
+	builder := &kqlExpressionBuilder{conditions: conditions, budget: budget}
 	var expression *ConditionExpression
-	for _, where := range collectKQLWhereOperators(tree) {
+	for _, where := range collectKQLWhereOperators(tree, budget) {
 		expression = combineConditionExpressions(BooleanAnd, expression, builder.expression(where.Expression()))
 	}
 	if expression != nil && builder.next == len(conditions) {
@@ -35,14 +35,16 @@ func buildConditionExpression(tree antlr.Tree, conditions []Condition) *Conditio
 }
 
 type kqlExpressionBuilder struct {
+	budget     *parseBudget
 	conditions []Condition
 	next       int
 }
 
-func collectKQLWhereOperators(tree antlr.Tree) []IWhereOperatorContext {
+func collectKQLWhereOperators(tree antlr.Tree, budget *parseBudget) []IWhereOperatorContext {
 	var wheres []IWhereOperatorContext
 	var visit func(antlr.Tree)
 	visit = func(node antlr.Tree) {
+		budget.step()
 		if node == nil {
 			return
 		}
@@ -58,6 +60,7 @@ func collectKQLWhereOperators(tree antlr.Tree) []IWhereOperatorContext {
 }
 
 func (b *kqlExpressionBuilder) expression(ctx IExpressionContext) *ConditionExpression {
+	b.budget.step()
 	if ctx == nil || ctx.OrExpression() == nil {
 		return nil
 	}
@@ -65,6 +68,7 @@ func (b *kqlExpressionBuilder) expression(ctx IExpressionContext) *ConditionExpr
 }
 
 func (b *kqlExpressionBuilder) orExpression(ctx IOrExpressionContext) *ConditionExpression {
+	b.budget.step()
 	var expression *ConditionExpression
 	for _, and := range ctx.AllAndExpression() {
 		expression = combineConditionExpressions(BooleanOr, expression, b.andExpression(and))
@@ -73,6 +77,7 @@ func (b *kqlExpressionBuilder) orExpression(ctx IOrExpressionContext) *Condition
 }
 
 func (b *kqlExpressionBuilder) andExpression(ctx IAndExpressionContext) *ConditionExpression {
+	b.budget.step()
 	var expression *ConditionExpression
 	for _, not := range ctx.AllNotExpression() {
 		expression = combineConditionExpressions(BooleanAnd, expression, b.notExpression(not))
@@ -81,6 +86,7 @@ func (b *kqlExpressionBuilder) andExpression(ctx IAndExpressionContext) *Conditi
 }
 
 func (b *kqlExpressionBuilder) notExpression(ctx INotExpressionContext) *ConditionExpression {
+	b.budget.step()
 	if ctx == nil {
 		return nil
 	}
@@ -91,8 +97,12 @@ func (b *kqlExpressionBuilder) notExpression(ctx INotExpressionContext) *Conditi
 }
 
 func (b *kqlExpressionBuilder) comparisonExpression(ctx IComparisonExpressionContext) *ConditionExpression {
+	b.budget.step()
 	if ctx == nil {
 		return nil
+	}
+	if _, ok := kqlFilterFunctionPredicate(ctx, b.budget); ok {
+		return b.condition()
 	}
 	if ctx.HAS_ANY() != nil || ctx.HAS_ALL() != nil {
 		operator := BooleanOr
@@ -147,6 +157,7 @@ func firstNestedKQLExpression(tree antlr.Tree) IExpressionContext {
 }
 
 func (b *kqlExpressionBuilder) condition() *ConditionExpression {
+	b.budget.step()
 	if b.next >= len(b.conditions) {
 		return nil
 	}
@@ -156,6 +167,7 @@ func (b *kqlExpressionBuilder) condition() *ConditionExpression {
 }
 
 func (b *kqlExpressionBuilder) multiValueCondition(exprList IExpressionListContext, operator BooleanOperator) *ConditionExpression {
+	b.budget.step()
 	count := 1
 	if exprList != nil {
 		if values := extractExpressionListValues(exprList); len(values) > 0 {
@@ -166,6 +178,7 @@ func (b *kqlExpressionBuilder) multiValueCondition(exprList IExpressionListConte
 }
 
 func (b *kqlExpressionBuilder) conditionGroup(count int, operator BooleanOperator) *ConditionExpression {
+	b.budget.step()
 	if count <= 1 {
 		return b.condition()
 	}

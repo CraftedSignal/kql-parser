@@ -1,12 +1,9 @@
 package kql
 
 import (
-	"fmt"
+	"context"
 	"regexp"
 	"strings"
-	"time"
-
-	"github.com/antlr4-go/antlr/v4"
 )
 
 // Validate reports the syntax errors Kusto would raise for a query. Unlike
@@ -15,41 +12,37 @@ import (
 // the first, a query that starts with an operator, or another language. The
 // bodies of let statements are not validated.
 func Validate(query string) []string {
-	ch := make(chan []string, 1)
-	go func() {
-		ch <- validate(query)
-	}()
-
-	select {
-	case errs := <-ch:
-		return errs
-	case <-time.After(MaxParseTime):
-		return []string{fmt.Sprintf("parser timeout: query took longer than %s to parse", MaxParseTime)}
-	}
+	return ValidateContext(context.Background(), query)
 }
 
-func validate(query string) (errs []string) {
+// ValidateContext validates within the same cooperative limits as extraction.
+func ValidateContext(ctx context.Context, query string) []string {
+	return validateContext(ctx, query, defaultParseLimits())
+}
+
+func validateContext(ctx context.Context, query string, limits parseLimits) (errs []string) {
 	defer func() {
-		if r := recover(); r != nil {
-			errs = []string{fmt.Sprintf("parser panic: %v", r)}
+		if value := recover(); value != nil {
+			errs = []string{parseFailure(value).Error()}
 		}
 	}()
-
+	budget, cancel := newParseBudget(ctx, limits)
+	defer cancel()
+	budget.input(query)
+	preflight(query, budget, false, nil)
 	if strings.TrimSpace(query) == "" {
 		return []string{"query is empty"}
 	}
-
-	lexer := NewKQLLexer(antlr.NewInputStream(normalize(query, true)))
-	listener := &errorListener{}
-	lexer.RemoveErrorListeners()
-	lexer.AddErrorListener(listener)
-
-	parser := NewKQLParser(antlr.NewCommonTokenStream(lexer, antlr.TokenDefaultChannel))
+	normalized := normalizeBudgeted(query, true, budget)
+	listener := &errorListener{budget: budget}
+	stream := preflight(normalized, budget, true, listener)
+	parser := NewKQLParser(&budgetTokenStream{CommonTokenStream: stream, budget: budget})
 	parser.RemoveErrorListeners()
 	parser.AddErrorListener(listener)
 	parser.Query()
-
+	budget.check()
 	for i, msg := range listener.errors {
+		budget.step()
 		listener.errors[i] = shortenSyntaxError(msg)
 	}
 	return listener.errors

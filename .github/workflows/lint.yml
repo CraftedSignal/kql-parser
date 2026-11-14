@@ -1,16 +1,22 @@
 name: lint
 
 on:
+  workflow_call:
   pull_request:
     branches: [main, master]
 
 permissions:
   contents: read
 
+concurrency:
+  group: lint-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   golangci:
     name: golangci-lint
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

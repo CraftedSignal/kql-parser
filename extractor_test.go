@@ -1472,12 +1472,12 @@ func TestIsnotempty_Extraction(t *testing.T) {
 
 	found := false
 	for _, c := range result.Conditions {
-		if c.Field == "InitiatingProcessFileName" && c.Operator == "isnotnull" {
+		if c.Field == "InitiatingProcessFileName" && c.Operator == "isnotempty" {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("Expected isnotnull condition for InitiatingProcessFileName, got %v", result.Conditions)
+		t.Errorf("Expected isnotempty condition for InitiatingProcessFileName, got %v", result.Conditions)
 	}
 }
 

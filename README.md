@@ -129,6 +129,14 @@ type Condition struct {
 
 ### Functions
 
+Null and empty filter functions retain their KQL names in `Condition.Operator`:
+`isnull`, `isnotnull`, `isempty`, and `isnotempty`. Empty checks include the
+empty string and are distinct from null checks. This corrects earlier output
+that mapped `isempty` to `isnull` and `isnotempty` to `isnotnull`; consumers
+matching operator names should handle all four. Boolean comparisons and `not`
+are reflected in `Condition.Negated`. Calls used to compute columns or aggregate
+values do not create row filters.
+
 ```go
 // ExtractConditions parses a KQL query and extracts all conditions
 func ExtractConditions(query string) *ExtractionResult
