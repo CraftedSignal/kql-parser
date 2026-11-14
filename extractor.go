@@ -211,7 +211,9 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 			query = query[:start] + extractMainQuery(query)
 		}
 	}
-	normalized, searches := protectSearchClauses(query, budget)
+	// Let bodies are intentionally outside the selected query. A search in the
+	// selected portion must survive every later normalization rewrite.
+	normalized, searches := protectSearchClauses(query, budget, skipLetStatements(query))
 
 	// Remove line continuation backslashes (backslash followed by newline)
 	// Common in PowerShell-style queries copied from scripts

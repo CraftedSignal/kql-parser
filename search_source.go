@@ -9,7 +9,10 @@ import (
 	"github.com/antlr4-go/antlr/v4"
 )
 
-type protectedSearchClause struct{ marker, source string }
+type protectedSearchClause struct {
+	marker, source string
+	selected       bool
+}
 type searchProtection struct {
 	clauses  []protectedSearchClause
 	restored int
@@ -79,6 +82,9 @@ func searchClauseSpans(tokens []antlr.Token, budget *parseBudget) []searchSpan {
 		case KQLLexerIN:
 			// IN can start a tabular subquery after its opening parentheses.
 			source, operator = true, false
+		case KQLLexerMATERIALIZE:
+			// Its argument is a tabular source, even when search leads it.
+			source, operator = true, false
 		case KQLLexerJOIN, KQLLexerUNION, KQLLexerLOOKUP:
 			source, operator = operator, false
 		case KQLLexerLPAREN:
@@ -104,9 +110,13 @@ func searchRuneBytes(query string, budget *parseBudget) []int {
 	return append(offsets, len(query))
 }
 
-func protectSearchClauses(query string, budget *parseBudget) (string, *searchProtection) {
+func protectSearchClauses(query string, budget *parseBudget, selectedStarts ...int) (string, *searchProtection) {
 	budget.step()
 	protection := &searchProtection{}
+	selectedStart := 0
+	if len(selectedStarts) != 0 {
+		selectedStart = selectedStarts[0]
+	}
 	tokens := searchTokens(query, budget)
 	spans := searchClauseSpans(tokens, budget)
 	if len(spans) == 0 {
@@ -129,7 +139,7 @@ func protectSearchClauses(query string, budget *parseBudget) (string, *searchPro
 		replacement := "search " + strconv.Quote(marker) + " "
 		reserveSearchBytes(out.Len()+start-last+len(replacement)+len(query)-end, budget)
 		budget.reserveOutput(1)
-		protection.clauses = append(protection.clauses, protectedSearchClause{marker: marker, source: query[start:end]})
+		protection.clauses = append(protection.clauses, protectedSearchClause{marker: marker, source: query[start:end], selected: start >= selectedStart})
 		out.WriteString(query[last:start])
 		out.WriteString(replacement)
 		last = end
@@ -183,5 +193,11 @@ func (p *searchProtection) restore(query string, budget *parseBudget) string {
 		last = end
 	}
 	out.WriteString(query[last:])
+	for _, entry := range p.clauses {
+		budget.step()
+		if entry.selected && !used[entry.marker] {
+			panic(budgetAbort{fmt.Errorf("search source preservation failed")})
+		}
+	}
 	return out.String()
 }

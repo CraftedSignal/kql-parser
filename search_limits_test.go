@@ -55,7 +55,7 @@ func TestSearchHelpersUseSharedWorkAndOutputBudgets(t *testing.T) {
 }
 
 func TestSearchRestorationChecksCumulativeBytesBeforeGrowth(t *testing.T) {
-	p := &searchProtection{clauses: []protectedSearchClause{{"a", `search "` + strings.Repeat("x", 35) + `" `}, {"b", `search "` + strings.Repeat("y", 35) + `"`}}}
+	p := &searchProtection{clauses: []protectedSearchClause{{marker: "a", source: `search "` + strings.Repeat("x", 35) + `" `}, {marker: "b", source: `search "` + strings.Repeat("y", 35) + `"`}}}
 	// Each source fits by itself; the two restored clauses together do not.
 	limits := defaultParseLimits()
 	limits.maxInputBytes = 70

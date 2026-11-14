@@ -30,6 +30,12 @@ func cloneSearchPredicate(search *SearchPredicate, budget *parseBudget) *SearchP
 
 func searchPredicateContext(ctx ISearchOperatorContext, budget *parseBudget) (*SearchPredicate, string) {
 	budget.step()
+	for parent := ctx.GetParent(); parent != nil; parent = parent.GetParent() {
+		budget.step()
+		if _, lookup := parent.(ILookupOperatorContext); lookup {
+			return nil, "search inside lookup is unsupported"
+		}
+	}
 	if ctx.SearchPredicate() == nil {
 		return nil, "malformed search predicate"
 	}
@@ -82,18 +88,26 @@ func searchPredicateContext(ctx ISearchOperatorContext, budget *parseBudget) (*S
 
 func validateKQLSearches(tree antlr.Tree, budget *parseBudget) (int, string) {
 	budget.step()
+	count := 0
+	outerSearch := false
 	if search, ok := tree.(ISearchOperatorContext); ok {
 		_, diagnostic := searchPredicateContext(search, budget)
-		return 1, diagnostic
+		if diagnostic != "" {
+			return 1, diagnostic
+		}
+		count, outerSearch = 1, true
 	}
-	count := 0
 	for i := 0; i < tree.GetChildCount(); i++ {
 		budget.step()
 		found, diagnostic := validateKQLSearches(tree.GetChild(i), budget)
 		if diagnostic != "" {
 			return count + found, diagnostic
 		}
-		count += found
+		if !outerSearch {
+			// The outer opaque Text owns descendant search syntax, but each
+			// descendant still needs its own mode and scope validation.
+			count += found
+		}
 	}
 	return count, ""
 }
