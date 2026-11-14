@@ -315,3 +315,45 @@ func TestRangeBoundsKeepTypedReferences(t *testing.T) {
 		}
 	}
 }
+
+func TestSyntheticSubqueryCannotBecomeCompleteScalar(t *testing.T) {
+	for _, predicate := range []string{
+		`tolower(Account) in ((SigninLogs | project Account))`,
+		`5 in ((T2 | project n))`,
+		`a == 1 and tolower(Account) in ((SigninLogs | project Account))`,
+		`tolower(Account) in ((SigninLogs | project Account)) or a == 1`,
+		`not(5 in ((T2 | project n)))`,
+		`isnull(tolower(Account) in ((SigninLogs | project Account)))`,
+		`"é" == "é" and 5 in ((T2 | project n))`,
+		`Account in ((SigninLogs | project Account)) and 5 in ((T2 | project n))`,
+	} {
+		query := `T | where ` + predicate
+		r := ExtractConditions(query)
+		if len(r.Errors) != 1 || r.Errors[0] != "unsupported scalar predicate: unresolved IN subquery" || len(r.Conditions) != 0 || r.Expression != nil {
+			t.Errorf("synthetic subquery looked complete: %s: %#v", query, r)
+		}
+		semantic := AnalyzeQuery(query)
+		if len(semantic.Errors) != 1 || semantic.Errors[0] != "unsupported scalar predicate: unresolved IN subquery" || len(semantic.Conditions) != 0 || semantic.Expression != nil {
+			t.Errorf("semantic extraction retained partial filters: %s: %#v", query, semantic)
+		}
+	}
+}
+
+func TestAuthoredSubqueryMarkerStringsRemainOrdinaryValues(t *testing.T) {
+	for _, predicate := range []string{
+		`tolower(Account) in ("SubqueryResult")`,
+		`5 in ("SubqueryResult")`,
+		`tolower(Account) in ("__kql_in_subquery_0__")`,
+		`tolower(Account) in ("SubqueryResult") and Account in ((SigninLogs | project Account))`,
+		`tolower(Account) in ("__kql_in_subquery_0__") and Account in ((SigninLogs | project Account))`,
+	} {
+		r := ExtractConditions(`T | where ` + predicate)
+		if leaves := scalarLeaves(r.Expression); len(r.Errors) != 0 || len(leaves) != 1 {
+			t.Errorf("authored string confused with synthetic marker: %s: %#v", predicate, r)
+		}
+	}
+	r := ExtractConditions(`T | where Account in ("SubqueryResult")`)
+	if len(r.Errors) != 0 || len(r.Conditions) != 1 || r.Conditions[0].Value != "SubqueryResult" || r.Conditions[0].ValueReference != "" {
+		t.Fatalf("authored literal changed: %#v", r)
+	}
+}

@@ -149,6 +149,8 @@ type conditionExtractor struct {
 	errors              []string
 	expressionLeaves    map[IComparisonExpressionContext]*ConditionExpression
 	letNames            map[string]bool
+	subqueryMarkers     []int // Rune offsets of synthetic unresolved IN-subquery literals
+	unsupportedSubquery bool
 	originalQuery       string // normalized query text for extracting subexpressions
 }
 
@@ -173,6 +175,10 @@ func normalizeQuery(query string) string {
 // write-up before the query, escaped newlines, workbook parameters, a second
 // query after the first, or a query that starts with an operator.
 func normalize(query string, strict bool) string {
+	return normalizeWithMetadata(query, strict, nil)
+}
+
+func normalizeWithMetadata(query string, strict bool, metadata *kqlNormalizationMetadata) string {
 	normalized := query
 
 	// Remove line continuation backslashes (backslash followed by newline)
@@ -328,7 +334,11 @@ func normalize(query string, strict bool) string {
 	// Reduce "field in (Tabular | project X)" to a scalar placeholder so
 	// expression parsing can continue. Portable extraction still sees the
 	// original query for table and predicate discovery.
-	normalized = normalizeInSubqueries(normalized)
+	placeholder := SubqueryPlaceholder
+	if metadata != nil {
+		placeholder = metadata.subqueryMarker
+	}
+	normalized = normalizeInSubqueriesWithPlaceholder(normalized, placeholder)
 
 	// Fix identifiers that start with numbers by prepending underscore
 	// e.g., 3plogTime -> _3plogTime
@@ -399,6 +409,9 @@ func normalize(query string, strict bool) string {
 	// Must handle cases like "| where x == 1; // comment" -> "| where x == 1"
 	normalized = stripTrailingSemicolonsAndComments(normalized)
 
+	if metadata != nil {
+		normalized = metadata.restoreSubqueryMarkers(normalized)
+	}
 	return normalized
 }
 
@@ -2555,6 +2568,10 @@ func indexByteOutsideStrings(s string, needle byte, start int) int {
 const SubqueryPlaceholder = "SubqueryResult"
 
 func normalizeInSubqueries(query string) string {
+	return normalizeInSubqueriesWithPlaceholder(query, SubqueryPlaceholder)
+}
+
+func normalizeInSubqueriesWithPlaceholder(query, placeholder string) string {
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
@@ -2608,7 +2625,7 @@ func normalizeInSubqueries(query string) string {
 		b.WriteString(query[lastCopied : i+1])
 		// A synthetic literal distinguishes this legacy unresolved marker
 		// from a genuine reference to a column named SubqueryResult.
-		b.WriteString(strconv.Quote(SubqueryPlaceholder))
+		b.WriteString(strconv.Quote(placeholder))
 		lastCopied = close
 		changed = true
 		i = close
@@ -4889,7 +4906,8 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 	}()
 
 	// Normalize the query to handle operators the parser doesn't fully support
-	normalizedQuery := normalizeQuery(query)
+	normalization := newKQLNormalizationMetadata(query)
+	normalizedQuery := normalizeWithMetadata(query, false, normalization)
 	input := antlr.NewInputStream(normalizedQuery)
 	lexer := NewKQLLexer(input)
 
@@ -4921,11 +4939,18 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 		originalQuery:       normalizedQuery,
 		expressionLeaves:    make(map[IComparisonExpressionContext]*ConditionExpression),
 		letNames:            make(map[string]bool),
+		subqueryMarkers:     normalization.subqueryOffsets,
 	}
 	for _, binding := range extractLetStatements(query) {
 		extractor.letNames[binding.Name] = true
 	}
 	antlr.ParseTreeWalkerDefault.Walk(extractor, tree)
+	if extractor.unsupportedSubquery {
+		return &ParseResult{
+			Conditions: []Condition{},
+			Errors:     []string{"unsupported scalar predicate: unresolved IN subquery"},
+		}
+	}
 
 	// Combine errors
 	allErrors := append(lexerErrors.errors, parserErrors.errors...)
@@ -5551,6 +5576,12 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 		e.expressionLeaves = make(map[IComparisonExpressionContext]*ConditionExpression)
 	}
 	scalar := func() {
+		for _, offset := range e.subqueryMarkers {
+			if ctx.GetStart().GetStart() <= offset && offset <= ctx.GetStop().GetStop() {
+				e.unsupportedSubquery = true
+				return
+			}
+		}
 		e.expressionLeaves[ctx] = &ConditionExpression{Operator: BooleanScalar, Scalar: &ScalarPredicate{Text: kqlSourceText(ctx), PipeStage: e.currentStage, Pipeline: e.currentPipeline()}}
 	}
 	start := len(e.conditions)

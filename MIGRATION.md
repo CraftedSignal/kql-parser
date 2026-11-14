@@ -49,6 +49,13 @@ quotes this synthetic marker to distinguish it from a genuine unquoted column
 reference named `SubqueryResult`, which remains scalar. A user-authored string
 literal `"SubqueryResult"` still collides with the public legacy marker; this
 schema has no provenance field to distinguish those cases.
+If that generated marker would instead become part of a scalar predicate
+(for example, `tolower(Account) in ((SigninLogs | project Account))`), extraction
+fails with `unsupported scalar predicate: unresolved IN subquery`, no conditions,
+and no expression. This also discards other filters in the query so callers
+cannot accidentally execute partial AND/OR semantics. Private normalization
+provenance distinguishes generated markers from user-authored strings; a scalar
+that explicitly contains the string `"SubqueryResult"` remains supported.
 
 This parser change does not update or release the platform dependency. Before
 adopting it, the platform adapter must handle scalar leaves or return an
