@@ -5217,43 +5217,9 @@ func (e *conditionExtractor) currentPipeline() int {
 	return e.pipelineStack[len(e.pipelineStack)-1]
 }
 
-// EnterFunctionCall tracks when we enter a function call (countif, sumif, etc.)
-// Conditions inside function calls are aggregation expressions, not filter conditions.
-// Special handling for existence-check functions: isnotempty, isnotnull, isnull, isempty.
+// EnterFunctionCall balances every function entry, including predicate calls.
+// Predicate leaves are emitted at their containing filter comparison instead.
 func (e *conditionExtractor) EnterFunctionCall(ctx *FunctionCallContext) {
-	if ctx.Identifier() != nil {
-		funcName := strings.ToLower(ctx.Identifier().GetText())
-		switch funcName {
-		case "isnotempty", "isnotnull":
-			if ctx.ArgumentList() != nil {
-				args := ctx.ArgumentList().AllArgument()
-				if len(args) >= 1 {
-					field := args[0].GetText()
-					e.conditions = append(e.conditions, Condition{
-						Field:    field,
-						Operator: "isnotnull",
-						Value:    "",
-						Negated:  e.negated,
-					})
-				}
-			}
-			return // Don't increment inFunctionCall
-		case "isnull", "isempty":
-			if ctx.ArgumentList() != nil {
-				args := ctx.ArgumentList().AllArgument()
-				if len(args) >= 1 {
-					field := args[0].GetText()
-					e.conditions = append(e.conditions, Condition{
-						Field:    field,
-						Operator: "isnull",
-						Value:    "",
-						Negated:  e.negated,
-					})
-				}
-			}
-			return // Don't increment inFunctionCall
-		}
-	}
 	e.inFunctionCall++
 }
 
@@ -5543,6 +5509,30 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 		return
 	}
 
+	if hasKQLFunctionPredicateAncestor(ctx) {
+		return
+	}
+	if predicate, ok := kqlFilterFunctionPredicate(ctx); ok {
+		sourceField, isComputed := e.computedFields[strings.ToLower(predicate.field)]
+		e.conditions = append(e.conditions, Condition{
+			Field:       predicate.field,
+			Operator:    predicate.operator,
+			Negated:     e.negated != predicate.negated,
+			PipeStage:   e.currentStage,
+			Pipeline:    e.currentPipeline(),
+			LogicalOp:   e.lastLogicalOp,
+			IsComputed:  isComputed,
+			SourceField: sourceField,
+		})
+		e.lastLogicalOp = "AND"
+		return
+	}
+	// A recognized predicate in extend/project/etc. is a computed value,
+	// including when a boolean literal appears on the left of a comparison.
+	if _, ok := recognizeKQLFunctionPredicate(ctx); ok {
+		return
+	}
+
 	// Handle comparison operators: field == value, field != value, etc.
 	if ctx.ComparisonOperator() != nil {
 		addExprs := ctx.AllAdditiveExpression()
@@ -5798,6 +5788,11 @@ func (e *conditionExtractor) EnterOrExpression(_ *OrExpressionContext) {}
 // follows this one. After the last branch the operator around the whole OR
 // expression applies: in (a or b) and c, c is ANDed.
 func (e *conditionExtractor) ExitAndExpression(ctx *AndExpressionContext) {
+	// Boolean expressions inside scalar/aggregation arguments do not connect
+	// the surrounding row filters.
+	if e.inFunctionCall > 0 {
+		return
+	}
 	orCtx, ok := ctx.GetParent().(*OrExpressionContext)
 	if !ok {
 		return

@@ -94,6 +94,9 @@ func (b *kqlExpressionBuilder) comparisonExpression(ctx IComparisonExpressionCon
 	if ctx == nil {
 		return nil
 	}
+	if _, ok := kqlFilterFunctionPredicate(ctx); ok {
+		return b.condition()
+	}
 	if ctx.HAS_ANY() != nil || ctx.HAS_ALL() != nil {
 		operator := BooleanOr
 		if ctx.HAS_ALL() != nil {
