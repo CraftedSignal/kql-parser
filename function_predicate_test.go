@@ -148,11 +148,14 @@ func TestFunctionPredicatesCarryFilterMetadata(t *testing.T) {
 
 func TestFunctionPredicateArgumentDoesNotChangeFilterLogicalOp(t *testing.T) {
 	result := ExtractConditions(`T | where isnull(b == 1 or c == 2) and a == 1`)
-	if len(result.Errors) != 0 || len(result.Conditions) != 2 {
+	if len(result.Errors) != 0 || len(result.Conditions) != 1 {
 		t.Fatalf("conditions = %#v, errors = %v", result.Conditions, result.Errors)
 	}
-	if result.Conditions[1].Field != "a" || result.Conditions[1].LogicalOp != "AND" {
-		t.Fatalf("following comparison = %#v; argument OR must not link row filters", result.Conditions[1])
+	if result.Conditions[0].Field != "a" || result.Conditions[0].LogicalOp != "AND" {
+		t.Fatalf("following comparison = %#v; argument OR must not link row filters", result.Conditions[0])
+	}
+	if leaves := scalarLeaves(result.Expression); len(leaves) != 1 || leaves[0].Text != `isnull(b == 1 or c == 2)` || result.Expression.Operator != BooleanAnd {
+		t.Fatalf("scalar function argument changed filter topology: %#v", result.Expression)
 	}
 }
 

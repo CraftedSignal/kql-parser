@@ -69,7 +69,9 @@ func recognizeKQLFunctionPredicate(tree antlr.Tree) (kqlFunctionPredicate, bool)
 		case "isnull", "isnotnull", "isempty", "isnotempty":
 			arguments := ctx.ArgumentList().AllArgument()
 			if len(arguments) == 1 && arguments[0].Expression() != nil {
-				return kqlFunctionPredicate{field: arguments[0].GetText(), operator: operator}, true
+				if operand := recognizeKQLOperand(arguments[0].Expression()); operand.reference {
+					return kqlFunctionPredicate{field: operand.text, operator: operator}, true
+				}
 			}
 		}
 		return kqlFunctionPredicate{}, false

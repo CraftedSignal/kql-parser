@@ -221,3 +221,31 @@ func TestQuotedLetColumnIntroductionsStayScalar(t *testing.T) {
 		}
 	}
 }
+
+func TestNullEmptyScalarArgumentsRemainCompletePredicates(t *testing.T) {
+	// These functions accept scalar expressions, not only column names:
+	// https://learn.microsoft.com/en-us/kusto/query/isnull-function
+	for _, function := range []string{"isnull", "isnotnull", "isempty", "isnotempty"} {
+		for _, argument := range []string{`5`, `""`, `int(null)`, `a + 1`, `tostring(rand())`} {
+			for _, predicate := range []string{function + `(` + argument + `)`, function + `(` + argument + `) == false`} {
+				t.Run(predicate, func(t *testing.T) {
+					r := ExtractConditions(`T | where ` + predicate)
+					leaves := scalarLeaves(r.Expression)
+					if len(r.Conditions) != 0 || len(leaves) != 1 || leaves[0].Text != predicate || r.Expression.Operator != BooleanScalar {
+						t.Fatalf("scalar argument fabricated a field: %#v / %#v", r, leaves)
+					}
+					semantic := AnalyzeQuery(`T | where ` + predicate)
+					if semantic.Expression == nil || semantic.Expression.Scalar == nil || semantic.Expression.Scalar.Text != predicate {
+						t.Fatalf("semantic scalar predicate lost: %#v", semantic)
+					}
+				})
+			}
+		}
+		for _, argument := range []string{`['5']`, `(['5'])`} {
+			r := ExtractConditions(`T | where ` + function + `(` + argument + `)`)
+			if len(r.Conditions) != 1 || r.Conditions[0].Field != "5" || r.Conditions[0].Operator != function {
+				t.Errorf("quoted argument not decoded: %s(%s): %#v", function, argument, r)
+			}
+		}
+	}
+}
