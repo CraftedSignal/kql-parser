@@ -18,9 +18,10 @@ type letConstant struct {
 // "x has_all (name)" lists the array's elements. Only operands of comparison
 // and list operators are replaced; lets that bind anything else, such as a
 // tabular expression, stay names.
-func inlineLetConstants(query string, lets []LetStatement) string {
+func inlineLetConstants(query string, lets []LetStatement, budget *parseBudget) string {
 	constants := make(map[string]letConstant, len(lets))
 	for _, let := range lets {
+		budget.step()
 		if constant, ok := parseLetConstant(let.Expression); ok {
 			constants[let.Name] = constant
 		}
@@ -30,8 +31,16 @@ func inlineLetConstants(query string, lets []LetStatement) string {
 	}
 
 	var b strings.Builder
+	write := func(value string) {
+		budget.step()
+		if budget != nil && len(value) > budget.limits.maxInputBytes-b.Len() {
+			budget.reject("normalized input bytes")
+		}
+		b.WriteString(value)
+	}
 	last := 0
 	for i := 0; i < len(query); {
+		budget.step()
 		ch := query[i]
 		switch {
 		case ch == '/' && i+1 < len(query) && query[i+1] == '/':
@@ -50,8 +59,8 @@ func inlineLetConstants(query string, lets []LetStatement) string {
 			}
 			if constant, ok := constants[query[i:end]]; ok {
 				if literal, ok := letConstantOperand(query, i, end, constant); ok {
-					b.WriteString(query[last:i])
-					b.WriteString(literal)
+					write(query[last:i])
+					write(literal)
 					last = end
 				}
 			}
@@ -63,7 +72,7 @@ func inlineLetConstants(query string, lets []LetStatement) string {
 	if last == 0 {
 		return query
 	}
-	b.WriteString(query[last:])
+	write(query[last:])
 	return b.String()
 }
 
