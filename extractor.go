@@ -336,6 +336,9 @@ func normalizeWithMetadata(query string, strict bool, metadata *kqlNormalization
 	// original query for table and predicate discovery.
 	placeholder := SubqueryPlaceholder
 	if metadata != nil {
+		// Earlier normalization can construct authored strings by joining
+		// adjacent literals. Select provenance markers only after that step.
+		*metadata = *newKQLNormalizationMetadata(normalized)
 		placeholder = metadata.subqueryMarker
 	}
 	normalized = normalizeInSubqueriesWithPlaceholder(normalized, placeholder)
@@ -4906,7 +4909,7 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 	}()
 
 	// Normalize the query to handle operators the parser doesn't fully support
-	normalization := newKQLNormalizationMetadata(query)
+	normalization := &kqlNormalizationMetadata{}
 	normalizedQuery := normalizeWithMetadata(query, false, normalization)
 	input := antlr.NewInputStream(normalizedQuery)
 	lexer := NewKQLLexer(input)

@@ -3,6 +3,7 @@ package kql
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -355,5 +356,39 @@ func TestAuthoredSubqueryMarkerStringsRemainOrdinaryValues(t *testing.T) {
 	r := ExtractConditions(`T | where Account in ("SubqueryResult")`)
 	if len(r.Errors) != 0 || len(r.Conditions) != 1 || r.Conditions[0].Value != "SubqueryResult" || r.Conditions[0].ValueReference != "" {
 		t.Fatalf("authored literal changed: %#v", r)
+	}
+}
+
+func TestJoinedAuthoredSubqueryMarkersRemainUnchanged(t *testing.T) {
+	r := ExtractConditions(`T | where a == "__kql_in_" "subquery_0__"`)
+	if len(r.Errors) != 0 || len(r.Conditions) != 1 || r.Conditions[0].Value != "__kql_in_subquery_0__" {
+		t.Errorf("joined authored value rewritten as synthetic marker: %#v", r)
+	}
+	r = ExtractConditions(`T | where tolower(Account) in ("__kql_in_" "subquery_0__")`)
+	if leaves := scalarLeaves(r.Expression); len(r.Errors) != 0 || len(leaves) != 1 || leaves[0].Text != `tolower(Account) in ("__kql_in_subquery_0__")` {
+		t.Fatalf("joined authored scalar rejected or rewritten: %#v", r)
+	}
+}
+
+func TestSubqueryProvenanceAfterStringJoining(t *testing.T) {
+	query := `T | where "é" == "é" and a == "__kql_in_" "subquery_0__" and b == "__kql_in_subquery_" "1__" and c == "SubqueryResult" and Account in ((SigninLogs | project Account)) and User in ((AuditLogs | project User))`
+	metadata := newKQLNormalizationMetadata(query)
+	normalized := normalizeWithMetadata(query, false, metadata)
+	if normalized != NormalizeQueryForDebug(query) || len(metadata.subqueryOffsets) != 2 {
+		t.Fatalf("normalization parity or generated provenance changed: %s / %#v", normalized, metadata)
+	}
+	for _, offset := range metadata.subqueryOffsets {
+		if suffix := string([]rune(normalized)[offset:]); !strings.HasPrefix(suffix, `"SubqueryResult")`) {
+			t.Errorf("generated marker rune offset points at authored source: %d: %s", offset, suffix)
+		}
+	}
+	r := ExtractConditions(query)
+	if len(r.Errors) != 0 || len(r.Conditions) != 5 || r.Conditions[0].Value != "__kql_in_subquery_0__" || r.Conditions[1].Value != "__kql_in_subquery_1__" || len(scalarLeaves(r.Expression)) != 1 {
+		t.Fatalf("mixed generated/authored markers changed: %#v", r)
+	}
+	query += ` and 5 in ((Other | project n))`
+	r = ExtractConditions(query)
+	if len(r.Errors) != 1 || r.Errors[0] != "unsupported scalar predicate: unresolved IN subquery" || len(r.Conditions) != 0 || r.Expression != nil {
+		t.Fatalf("actual synthetic scalar escaped guard: %#v", r)
 	}
 }
