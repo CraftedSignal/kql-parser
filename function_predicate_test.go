@@ -90,6 +90,9 @@ func TestFunctionPredicatesOnlyFilterRows(t *testing.T) {
 			"T | extend present=false == %s(b) | where a == 1",
 			"T | where coalesce(%s(b), false) or a == 1",
 			"T | where iff(%s(b), true, false) or a == 1",
+			"T | where a == (%s(b))",
+			"T | where a == (1 + (%s(b)))",
+			"T | where a == bag[(%s(b))]",
 		} {
 			query = fmt.Sprintf(query, function)
 			t.Run(query, func(t *testing.T) {

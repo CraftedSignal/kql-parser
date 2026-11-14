@@ -28,9 +28,16 @@ func isKQLFilterContext(tree antlr.Tree) bool {
 		switch parent.(type) {
 		case IWhereOperatorContext:
 			return true
-		case IFunctionCallContext, IArgumentContext, IIffExpressionContext, ICaseExpressionContext, IToScalarExpressionContext, ITabularExpressionContext:
-			return false
+		case IExpressionContext, IOrExpressionContext, IAndExpressionContext, INotExpressionContext:
+			// Boolean grouping and negation preserve a row-filter context.
+		default:
+			// A predicate used as a scalar operand, index, argument, or
+			// computed value is not itself a row filter.
+			if kqlTransparentScalarChild(parent) != tree {
+				return false
+			}
 		}
+		tree = parent
 	}
 	return false
 }
