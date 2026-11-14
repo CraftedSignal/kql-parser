@@ -5131,7 +5131,7 @@ func extractConditionsInternal(query string, budget *parseBudget) (result *Parse
 		var note string
 		var extracted []Condition
 		allowGenericKeyword := len(lexerErrors.errors) != 0 || len(parserErrors.errors) != 0 ||
-			(!hasStructuredKQLQuery(tree) && len(letStatements) == 0)
+			(!hasStructuredKQLQuery(tree, budget) && len(letStatements) == 0)
 		extracted, note = extractPortableConditions(query, normalizedQuery, allowGenericKeyword)
 		portableStart := len(conditions)
 		for _, condition := range extracted {
@@ -5156,7 +5156,7 @@ func extractConditionsInternal(query string, budget *parseBudget) (result *Parse
 	}
 	keyword := extractLeadingSearchKeyword(query[skipLetStatements(query):])
 	if keyword == "" {
-		keyword = extractParsedKQLSearchKeyword(tree)
+		keyword = extractParsedKQLSearchKeyword(tree, budget)
 	}
 	if keyword != "" {
 		condition := portableKeywordCondition(keyword)
@@ -6589,7 +6589,8 @@ func extractPortableConditions(originalQuery, normalizedQuery string, allowGener
 // A successfully parsed structured query can legitimately have no row filters.
 // Keep generic keyword recovery for bare terms and unparsed input instead of
 // inventing a search from computed values, aggregates, or an entire pipeline.
-func hasStructuredKQLQuery(query IQueryContext) bool {
+func hasStructuredKQLQuery(query IQueryContext, budget *parseBudget) bool {
+	budget.step()
 	if len(query.AllStatement()) != 0 {
 		return true
 	}
@@ -6602,9 +6603,11 @@ func hasStructuredKQLQuery(query IQueryContext) bool {
 
 // Read explicit piped searches from the parse tree, rather than treating an
 // arbitrary string literal (or search-like text in a comment) as a filter.
-func extractParsedKQLSearchKeyword(query IQueryContext) string {
+func extractParsedKQLSearchKeyword(query IQueryContext, budget *parseBudget) string {
+	budget.step()
 	if tabular := query.TabularExpression(); tabular != nil {
 		for _, operator := range tabular.AllTabularOperator() {
+			budget.step()
 			if search := operator.SearchOperator(); search != nil && search.Expression() != nil {
 				if keyword, _, ok := parseStringLiteral(search.Expression().GetText()); ok && !looksLikeURL(keyword) {
 					return keyword
