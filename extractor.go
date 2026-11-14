@@ -4901,6 +4901,7 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 	// Combine errors
 	allErrors := append(lexerErrors.errors, parserErrors.errors...)
 	allErrors = append(allErrors, extractor.errors...)
+	letStatements := extractLetStatements(query)
 
 	// Post-process to group OR conditions on same field. The expression tree
 	// knows the grouping; the flat operator sequence cannot tell
@@ -4915,7 +4916,9 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 	if !hasPortableFieldConditions(conditions) {
 		var note string
 		var extracted []Condition
-		extracted, note = extractPortableConditions(query, normalizedQuery)
+		allowGenericKeyword := len(lexerErrors.errors) != 0 || len(parserErrors.errors) != 0 ||
+			(!hasStructuredKQLQuery(tree) && len(letStatements) == 0)
+		extracted, note = extractPortableConditions(query, normalizedQuery, allowGenericKeyword)
 		portableStart := len(conditions)
 		for _, condition := range extracted {
 			// The tree walker already captured conditions on computed
@@ -4936,7 +4939,11 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 			allErrors = append(allErrors, note)
 		}
 	}
-	if keyword := extractLeadingSearchKeyword(query); keyword != "" {
+	keyword := extractLeadingSearchKeyword(query[skipLetStatements(query):])
+	if keyword == "" {
+		keyword = extractParsedKQLSearchKeyword(tree)
+	}
+	if keyword != "" {
 		condition := portableKeywordCondition(keyword)
 		condition.Pipeline = extractor.queryPipeline
 		if !containsCondition(conditions, condition) {
@@ -4953,7 +4960,7 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 		Conditions:          conditions,
 		Expression:          expression,
 		DataSources:         extractPortableDataSources(query, normalizedQuery),
-		LetStatements:       extractLetStatements(query),
+		LetStatements:       letStatements,
 		ComputedFields:      extractor.computedFields,
 		ComputedExpressions: extractor.computedExpressions,
 		GroupByFields:       extractor.groupByFields,
@@ -5217,43 +5224,9 @@ func (e *conditionExtractor) currentPipeline() int {
 	return e.pipelineStack[len(e.pipelineStack)-1]
 }
 
-// EnterFunctionCall tracks when we enter a function call (countif, sumif, etc.)
-// Conditions inside function calls are aggregation expressions, not filter conditions.
-// Special handling for existence-check functions: isnotempty, isnotnull, isnull, isempty.
+// EnterFunctionCall balances every function entry, including predicate calls.
+// Predicate leaves are emitted at their containing filter comparison instead.
 func (e *conditionExtractor) EnterFunctionCall(ctx *FunctionCallContext) {
-	if ctx.Identifier() != nil {
-		funcName := strings.ToLower(ctx.Identifier().GetText())
-		switch funcName {
-		case "isnotempty", "isnotnull":
-			if ctx.ArgumentList() != nil {
-				args := ctx.ArgumentList().AllArgument()
-				if len(args) >= 1 {
-					field := args[0].GetText()
-					e.conditions = append(e.conditions, Condition{
-						Field:    field,
-						Operator: "isnotnull",
-						Value:    "",
-						Negated:  e.negated,
-					})
-				}
-			}
-			return // Don't increment inFunctionCall
-		case "isnull", "isempty":
-			if ctx.ArgumentList() != nil {
-				args := ctx.ArgumentList().AllArgument()
-				if len(args) >= 1 {
-					field := args[0].GetText()
-					e.conditions = append(e.conditions, Condition{
-						Field:    field,
-						Operator: "isnull",
-						Value:    "",
-						Negated:  e.negated,
-					})
-				}
-			}
-			return // Don't increment inFunctionCall
-		}
-	}
 	e.inFunctionCall++
 }
 
@@ -5543,6 +5516,30 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 		return
 	}
 
+	if hasKQLFunctionPredicateAncestor(ctx) {
+		return
+	}
+	if predicate, ok := kqlFilterFunctionPredicate(ctx); ok {
+		sourceField, isComputed := e.computedFields[strings.ToLower(predicate.field)]
+		e.conditions = append(e.conditions, Condition{
+			Field:       predicate.field,
+			Operator:    predicate.operator,
+			Negated:     e.negated != predicate.negated,
+			PipeStage:   e.currentStage,
+			Pipeline:    e.currentPipeline(),
+			LogicalOp:   e.lastLogicalOp,
+			IsComputed:  isComputed,
+			SourceField: sourceField,
+		})
+		e.lastLogicalOp = "AND"
+		return
+	}
+	// A recognized predicate in extend/project/etc. is a computed value,
+	// including when a boolean literal appears on the left of a comparison.
+	if _, ok := recognizeKQLFunctionPredicate(ctx); ok {
+		return
+	}
+
 	// Handle comparison operators: field == value, field != value, etc.
 	if ctx.ComparisonOperator() != nil {
 		addExprs := ctx.AllAdditiveExpression()
@@ -5798,6 +5795,11 @@ func (e *conditionExtractor) EnterOrExpression(_ *OrExpressionContext) {}
 // follows this one. After the last branch the operator around the whole OR
 // expression applies: in (a or b) and c, c is ANDed.
 func (e *conditionExtractor) ExitAndExpression(ctx *AndExpressionContext) {
+	// Boolean expressions inside scalar/aggregation arguments do not connect
+	// the surrounding row filters.
+	if e.inFunctionCall > 0 {
+		return
+	}
 	orCtx, ok := ctx.GetParent().(*OrExpressionContext)
 	if !ok {
 		return
@@ -6275,14 +6277,14 @@ func findMatchingParen(s string, open int) int {
 
 // extractPortableConditions extracts translatable conditions from KQL shapes
 // that parse successfully but do not produce portable predicates in the tree walker.
-func extractPortableConditions(originalQuery, normalizedQuery string) ([]Condition, string) {
+func extractPortableConditions(originalQuery, normalizedQuery string, allowGenericKeyword bool) ([]Condition, string) {
 	if conditions := extractPortablePredicates(originalQuery); len(conditions) > 0 {
 		return conditions, portablePredicateExtractionNote
 	}
 	if conditions := extractPortablePredicates(normalizedQuery); len(conditions) > 0 {
 		return conditions, portablePredicateExtractionNote
 	}
-	if containsExternalDataLet(originalQuery) {
+	if containsExternalDataLet(originalQuery) || !allowGenericKeyword {
 		return nil, ""
 	}
 	keyword := extractPortableKeyword(originalQuery)
@@ -6293,6 +6295,35 @@ func extractPortableConditions(originalQuery, normalizedQuery string) ([]Conditi
 		return nil, ""
 	}
 	return []Condition{portableKeywordCondition(keyword)}, portableKeywordExtractionNote
+}
+
+// A successfully parsed structured query can legitimately have no row filters.
+// Keep generic keyword recovery for bare terms and unparsed input instead of
+// inventing a search from computed values, aggregates, or an entire pipeline.
+func hasStructuredKQLQuery(query IQueryContext) bool {
+	if len(query.AllStatement()) != 0 {
+		return true
+	}
+	if tabular := query.TabularExpression(); tabular != nil {
+		return len(tabular.AllTabularOperator()) != 0 ||
+			(tabular.TabularSource() != nil && tabular.TabularSource().TableName() == nil)
+	}
+	return false
+}
+
+// Read explicit piped searches from the parse tree, rather than treating an
+// arbitrary string literal (or search-like text in a comment) as a filter.
+func extractParsedKQLSearchKeyword(query IQueryContext) string {
+	if tabular := query.TabularExpression(); tabular != nil {
+		for _, operator := range tabular.AllTabularOperator() {
+			if search := operator.SearchOperator(); search != nil && search.Expression() != nil {
+				if keyword, _, ok := parseStringLiteral(search.Expression().GetText()); ok && !looksLikeURL(keyword) {
+					return keyword
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func portableKeywordCondition(keyword string) Condition {
