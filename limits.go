@@ -198,3 +198,12 @@ func (e *conditionExtractor) EnterEveryRule(_ antlr.ParserRuleContext) {
 	e.budget.step()
 	e.checkOutput()
 }
+
+// Internal syntax helpers accept an optional budget so direct parser-tree
+// fixtures remain usable. Production calls always carry the request budget.
+func suppliedBudget(budgets []*parseBudget) *parseBudget {
+	if len(budgets) == 0 {
+		return nil
+	}
+	return budgets[0]
+}

@@ -21,6 +21,9 @@ A production-ready Go parser for Kusto Query Language (KQL), built with ANTLR4. 
 go get github.com/craftedsignal/kql-parser
 ```
 
+See [scalar predicate migration](MIGRATION.md) before consuming expression trees
+or upgrading an adapter that uses only flat conditions.
+
 ## Usage
 
 ### Basic Condition Extraction

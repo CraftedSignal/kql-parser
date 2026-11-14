@@ -183,7 +183,7 @@ func TestExtractConditions_InSubqueryUsesPlaceholder(t *testing.T) {
 	result := ExtractConditions(`SecurityEvent | where Account in ((SigninLogs | where ResultType != 0 | project UserPrincipalName))`)
 	for _, condition := range result.Conditions {
 		if condition.Field == "Account" {
-			if condition.Value != SubqueryPlaceholder {
+			if condition.Value != SubqueryPlaceholder || condition.ValueReference != "" {
 				t.Fatalf("membership in a subquery = %+v, want value %q", condition, SubqueryPlaceholder)
 			}
 			return
@@ -227,8 +227,8 @@ SigninLogs
 	if got := byField["IPAddress"]; len(got) != 1 || !got[0].Negated || !reflect.DeepEqual(got[0].Alternatives, []string{"10.0.0.1", "10.0.0.2"}) || got[0].ValueReference != "" {
 		t.Errorf("list let in !in = %+v, want its values", got)
 	}
-	if got := byField["Account"]; len(got) != 1 || got[0].ValueReference != "failed" {
-		t.Errorf("tabular let = %+v, want the reference kept", got)
+	if got := byField["Account"]; len(got) != 0 || len(scalarLeaves(result.Expression)) != 1 {
+		t.Errorf("tabular let must remain a scalar predicate: %+v", result)
 	}
 	if got := byField["CommandLine"]; len(got) != 2 || got[0].Value != "cmd.exe" || got[1].Value != "powershell.exe" || got[1].LogicalOp != "AND" {
 		t.Errorf("list let in has_all = %+v, want one has per value, all required", got)

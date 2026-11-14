@@ -38,17 +38,29 @@ func TestLargeCorpusFuzz(t *testing.T) {
 	}
 
 	t.Logf("Loaded %d queries from corpus", len(queries))
+	if testing.Short() && len(queries) > 256 {
+		// Keep concurrent parsing in race runs without replaying the entire
+		// 51k corpus there. The full coverage step always tests every query.
+		sample := make([]QueryEntry, 256)
+		for i := range sample {
+			sample[i] = queries[i*(len(queries)-1)/(len(sample)-1)]
+		}
+		queries = sample
+		t.Logf("Short mode: testing %d evenly distributed queries", len(queries))
+	}
 
 	// Statistics
 	var (
-		totalQueries    int64
-		successCount    int64
-		partialCount    int64
-		failedCount     int64
-		panicCount      int64
-		totalConditions int64
-		totalParseTime  int64
-		longestQuery    int
+		totalQueries     int64
+		successCount     int64
+		partialCount     int64
+		failedCount      int64
+		scalarOnlyCount  int64
+		noPredicateCount int64
+		panicCount       int64
+		totalConditions  int64
+		totalParseTime   int64
+		longestQuery     int
 	)
 
 	for _, q := range queries {
@@ -87,8 +99,14 @@ func TestLargeCorpusFuzz(t *testing.T) {
 						atomic.AddInt64(&successCount, 1)
 					} else if len(result.Conditions) > 0 {
 						atomic.AddInt64(&partialCount, 1)
+					} else if len(result.Errors) == 0 && result.Expression != nil {
+						atomic.AddInt64(&scalarOnlyCount, 1)
+					} else if len(result.Errors) == 0 {
+						atomic.AddInt64(&noPredicateCount, 1)
 					} else {
-						atomic.AddInt64(&failedCount, 1)
+						if count := atomic.AddInt64(&failedCount, 1); count <= 5 {
+							t.Logf("Diagnostics for corpus entry %q (conditions=0, expression=%t): %v", q.Name, result.Expression != nil, result.Errors)
+						}
 					}
 
 					atomic.AddInt64(&totalConditions, int64(len(result.Conditions)))
@@ -112,7 +130,9 @@ func TestLargeCorpusFuzz(t *testing.T) {
 	t.Logf("Total queries tested: %d", totalQueries)
 	t.Logf("Full success (conditions, no errors): %d (%.1f%%)", successCount, float64(successCount)*100/float64(totalQueries))
 	t.Logf("Partial success (conditions with errors): %d (%.1f%%)", partialCount, float64(partialCount)*100/float64(totalQueries))
-	t.Logf("Failed (no conditions): %d (%.1f%%)", failedCount, float64(failedCount)*100/float64(totalQueries))
+	t.Logf("Scalar-only expression (no errors): %d (%.1f%%)", scalarOnlyCount, float64(scalarOnlyCount)*100/float64(totalQueries))
+	t.Logf("No predicate extracted (no errors): %d (%.1f%%)", noPredicateCount, float64(noPredicateCount)*100/float64(totalQueries))
+	t.Logf("Diagnostics without Conditions: %d (%.1f%%)", failedCount, float64(failedCount)*100/float64(totalQueries))
 	t.Logf("Panics: %d", panicCount)
 	t.Logf("Total conditions extracted: %d", totalConditions)
 	t.Logf("Average conditions per query: %.2f", float64(totalConditions)/float64(totalQueries))
@@ -127,8 +147,8 @@ func TestLargeCorpusFuzz(t *testing.T) {
 	}
 
 	// Warn if success rate is too low
-	successRate := float64(successCount+partialCount) * 100 / float64(totalQueries)
-	t.Logf("\nOverall success rate: %.1f%%", successRate)
+	successRate := float64(successCount+partialCount+scalarOnlyCount) * 100 / float64(totalQueries)
+	t.Logf("\nExtracted predicate rate (conditions or scalar expression): %.1f%%", successRate)
 }
 
 // TestLargeCorpusSample tests a random sample of queries for faster iteration
@@ -157,7 +177,7 @@ func TestLargeCorpusSample(t *testing.T) {
 
 	t.Logf("Testing sample of %d queries (from %d total)", sampleSize, len(queries))
 
-	var success, partial, failed, panics int
+	var success, partial, scalarOnly, noPredicate, failed, panics int
 	step := len(queries) / sampleSize
 
 	for i := 0; i < len(queries); i += step {
@@ -177,18 +197,23 @@ func TestLargeCorpusSample(t *testing.T) {
 				success++
 			} else if len(result.Conditions) > 0 {
 				partial++
+			} else if len(result.Errors) == 0 && result.Expression != nil {
+				scalarOnly++
+			} else if len(result.Errors) == 0 {
+				noPredicate++
 			} else {
 				failed++
 			}
 		}()
 	}
 
-	total := success + partial + failed + panics
+	total := success + partial + scalarOnly + noPredicate + failed + panics
 	t.Logf("Sample results: success=%d (%.1f%%), partial=%d (%.1f%%), failed=%d (%.1f%%), panics=%d",
 		success, float64(success)*100/float64(total),
 		partial, float64(partial)*100/float64(total),
 		failed, float64(failed)*100/float64(total),
 		panics)
+	t.Logf("Sample scalar-only expressions: %d; no predicate extracted (no errors): %d", scalarOnly, noPredicate)
 
 	if panics > 0 {
 		t.Errorf("Parser panicked on %d queries!", panics)

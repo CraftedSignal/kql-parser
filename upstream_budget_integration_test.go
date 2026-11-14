@@ -38,3 +38,26 @@ func TestFunctionPredicateReservesOutputBeforeAppending(t *testing.T) {
 	}()
 	extractor.EnterComparisonExpression(comparison.(*ComparisonExpressionContext))
 }
+
+func TestRecoveryScansUseSharedWorkBudget(t *testing.T) {
+	structured := kqlParserForTest(t, `T | project a`).Query()
+	search := kqlParserForTest(t, `T | search "needle"`).Query()
+	for _, fixture := range []struct {
+		name string
+		work int
+		scan func(*parseBudget)
+	}{
+		{"structured entry", 0, func(budget *parseBudget) { hasStructuredKQLQuery(structured, budget) }},
+		{"search entry", 0, func(budget *parseBudget) { extractParsedKQLSearchKeyword(search, budget) }},
+		{"search operator", 1, func(budget *parseBudget) { extractParsedKQLSearchKeyword(search, budget) }},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			limits := defaultParseLimits()
+			limits.maxWork = fixture.work
+			budget, cancel := newParseBudget(context.Background(), limits)
+			defer cancel()
+			defer requireBudgetAbort(t, "work budget")
+			fixture.scan(budget)
+		})
+	}
+}

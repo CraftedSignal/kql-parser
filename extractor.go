@@ -149,6 +149,10 @@ type conditionExtractor struct {
 	negated             bool
 	lastLogicalOp       string
 	errors              []string
+	expressionLeaves    map[IComparisonExpressionContext]*ConditionExpression
+	letNames            map[string]bool
+	subqueryMarkers     []int // Rune offsets of synthetic unresolved IN-subquery literals
+	unsupportedSubquery bool
 	originalQuery       string // normalized query text for extracting subexpressions
 }
 
@@ -186,7 +190,15 @@ func normalize(query string, strict bool) string {
 	return normalizeBudgeted(query, strict, nil)
 }
 
+func normalizeWithMetadata(query string, strict bool, metadata *kqlNormalizationMetadata) string {
+	return normalizeBudgetedMetadata(query, strict, nil, metadata)
+}
+
 func normalizeBudgeted(query string, strict bool, budget *parseBudget) string {
+	return normalizeBudgetedMetadata(query, strict, budget, nil)
+}
+
+func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, metadata *kqlNormalizationMetadata) string {
 	budget.input(query)
 	budget.step()
 	normalized := query
@@ -450,7 +462,14 @@ func normalizeBudgeted(query string, strict bool, budget *parseBudget) string {
 	// Reduce "field in (Tabular | project X)" to a scalar placeholder so
 	// expression parsing can continue. Portable extraction still sees the
 	// original query for table and predicate discovery.
-	normalized = normalizeInSubqueries(normalized)
+	placeholder := SubqueryPlaceholder
+	if metadata != nil {
+		// Earlier normalization can construct authored strings by joining
+		// adjacent literals. Select provenance markers only after that step.
+		*metadata = *newKQLNormalizationMetadata(normalized, budget)
+		placeholder = metadata.subqueryMarker
+	}
+	normalized = normalizeInSubqueriesWithPlaceholder(normalized, placeholder, budget)
 	budget.input(normalized)
 	budget.step()
 
@@ -559,6 +578,9 @@ func normalizeBudgeted(query string, strict bool, budget *parseBudget) string {
 	budget.input(normalized)
 	budget.step()
 
+	if metadata != nil {
+		normalized = metadata.restoreSubqueryMarkers(normalized, budget)
+	}
 	return normalized
 }
 
@@ -892,6 +914,11 @@ func convertBracketAccess(query string) string {
 				if end < len(query) && end+1 < len(query) && query[end] == quote && query[end+1] == ']' {
 					// Extract the key
 					key := query[i+2 : end]
+					if !precededByIdent {
+						result.WriteString(query[i : end+2])
+						i = end + 2
+						continue
+					}
 					// Check if key is a valid identifier (alphanumeric + underscore
 					// only) the grammar does not read as a keyword
 					if isValidPropertyKey(key) && !grammarReservedWords[strings.ToLower(key)] {
@@ -1058,6 +1085,20 @@ func fixNumericIdentifiers(query string) string {
 			continue
 		}
 
+		if c == '[' {
+			if end := strings.IndexByte(query[i:], ']'); end >= 0 {
+				result.WriteString(query[i : i+end+1])
+				i += end + 1
+				continue
+			}
+		}
+		if c >= '0' && c <= '9' && (i == 0 || !isIdentChar(query[i-1])) {
+			if token := numericPrefix.FindString(query[i:]); token != "" && (i+len(token) == len(query) || !isIdentChar(query[i+len(token)])) {
+				result.WriteString(token)
+				i += len(token)
+				continue
+			}
+		}
 		// Check for identifier starting with digit
 		// Only consider it an identifier if preceded by non-identifier char
 		if c >= '0' && c <= '9' {
@@ -2691,10 +2732,17 @@ func indexByteOutsideStrings(s string, needle byte, start int) int {
 
 // SubqueryPlaceholder is the value of a membership condition whose values
 // come from a subquery, as in Account in (SigninLogs | project Account): the
-// parser does not evaluate the subquery.
+// parser does not evaluate the subquery. This is an unresolved legacy marker,
+// not literal executable membership; normalization discards the subquery text.
 const SubqueryPlaceholder = "SubqueryResult"
 
 func normalizeInSubqueries(query string) string {
+	return normalizeInSubqueriesWithPlaceholder(query, SubqueryPlaceholder)
+}
+
+func normalizeInSubqueriesWithPlaceholder(query, placeholder string, budgets ...*parseBudget) string {
+	budget := suppliedBudget(budgets)
+	budget.step()
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
@@ -2703,6 +2751,7 @@ func normalizeInSubqueries(query string) string {
 	verbatim := false
 
 	for i := 0; i < len(query); i++ {
+		budget.step()
 		ch := query[i]
 		if quote != 0 {
 			if verbatim && ch == quote && i+1 < len(query) && query[i+1] == quote {
@@ -2746,7 +2795,9 @@ func normalizeInSubqueries(query string) string {
 		}
 
 		b.WriteString(query[lastCopied : i+1])
-		b.WriteString(SubqueryPlaceholder)
+		// A synthetic literal distinguishes this legacy unresolved marker
+		// from a genuine reference to a column named SubqueryResult.
+		b.WriteString(strconv.Quote(placeholder))
 		lastCopied = close
 		changed = true
 		i = close
@@ -5018,7 +5069,8 @@ func extractConditionsContext(ctx context.Context, query string, limits parseLim
 func extractConditionsInternal(query string, budget *parseBudget) (result *ParseResult) {
 	budget.input(query)
 	preflight(query, budget, false, nil)
-	normalizedQuery := normalizeBudgeted(query, false, budget)
+	normalization := &kqlNormalizationMetadata{}
+	normalizedQuery := normalizeBudgetedMetadata(query, false, budget, normalization)
 	lexerErrors := &errorListener{budget: budget}
 	stream := preflight(normalizedQuery, budget, true, lexerErrors)
 	parser := NewKQLParser(&budgetTokenStream{CommonTokenStream: stream, budget: budget})
@@ -5042,27 +5094,40 @@ func extractConditionsInternal(query string, budget *parseBudget) (result *Parse
 		queryPipeline:       -1,
 		lastLogicalOp:       "AND", // default
 		originalQuery:       normalizedQuery,
+		expressionLeaves:    make(map[IComparisonExpressionContext]*ConditionExpression),
+		letNames:            make(map[string]bool),
+		subqueryMarkers:     normalization.subqueryOffsets,
+	}
+	letStatements := extractLetStatements(query)
+	for _, binding := range letStatements {
+		budget.step()
+		extractor.letNames[binding.Name] = true
 	}
 	antlr.ParseTreeWalkerDefault.Walk(extractor, tree)
 	budget.check()
 	extractor.checkOutput()
+	if extractor.unsupportedSubquery {
+		return &ParseResult{
+			Conditions: []Condition{},
+			Errors:     []string{"unsupported scalar predicate: unresolved IN subquery"},
+		}
+	}
 
 	// Combine errors
 	allErrors := append(lexerErrors.errors, parserErrors.errors...)
 	allErrors = append(allErrors, extractor.errors...)
-	letStatements := extractLetStatements(query)
 
 	// Post-process to group OR conditions on same field. The expression tree
 	// knows the grouping; the flat operator sequence cannot tell
 	// "x and (a or b)" from "(x and a) or b", so it is only a fallback.
 	rawConditions := append([]Condition(nil), extractor.conditions...)
-	rawExpression := buildConditionExpression(tree, rawConditions, budget)
-	conditions, conditionIndexMap, grouped := groupORConditionsByExpression(rawConditions, rawExpression)
+	rawExpression := buildConditionExpression(tree, rawConditions, budget, extractor)
+	conditions, conditionIndexMap, grouped := groupORConditionsByExpression(rawConditions, rawExpression, budget)
 	if !grouped {
 		conditions, conditionIndexMap = groupORConditionsWithIndexMap(extractor.conditions)
 	}
-	expression := remapConditionExpression(rawExpression, conditionIndexMap)
-	if !hasPortableFieldConditions(conditions) {
+	expression := remapConditionExpression(rawExpression, conditionIndexMap, budget)
+	if !containsScalarExpression(expression, budget) && !hasPortableFieldConditions(conditions) {
 		var note string
 		var extracted []Condition
 		allowGenericKeyword := len(lexerErrors.errors) != 0 || len(parserErrors.errors) != 0 ||
@@ -5083,7 +5148,7 @@ func extractConditionsInternal(query string, budget *parseBudget) (result *Parse
 			}
 		}
 		if expression != nil && len(conditions) > portableStart {
-			expression = appendConditionRangeExpression(expression, portableStart, len(conditions))
+			expression = appendConditionRangeExpression(expression, portableStart, len(conditions), budget)
 		}
 		if note != "" && len(conditions) > portableStart {
 			allErrors = append(allErrors, note)
@@ -5101,7 +5166,7 @@ func extractConditionsInternal(query string, budget *parseBudget) (result *Parse
 			portableStart := len(conditions)
 			conditions = append(conditions, condition)
 			if expression != nil {
-				expression = appendConditionRangeExpression(expression, portableStart, len(conditions))
+				expression = appendConditionRangeExpression(expression, portableStart, len(conditions), budget)
 			}
 			allErrors = append(allErrors, portableKeywordExtractionNote)
 		}
@@ -5660,18 +5725,54 @@ func (e *conditionExtractor) EnterRenameItem(ctx *RenameItemContext) {
 
 // EnterComparisonExpression extracts field comparisons
 func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpressionContext) {
-	// Skip conditions inside subqueries
-	if e.inSubquery > 0 {
+	if e.inSubquery > 0 || e.inFunctionCall > 0 {
 		return
 	}
-
-	// Skip conditions inside function calls (like countif(), sumif(), etc.)
-	// These are aggregation expressions, not filter conditions
-	if e.inFunctionCall > 0 {
+	if !isKQLFilterContext(ctx, e.budget) {
 		return
 	}
+	for parent := ctx.GetParent(); parent != nil; parent = parent.GetParent() {
+		e.budget.step()
+		if comparison, ok := parent.(IComparisonExpressionContext); ok {
+			if _, recorded := e.expressionLeaves[comparison]; recorded {
+				return
+			}
+		}
+	}
+	if e.expressionLeaves == nil {
+		e.expressionLeaves = make(map[IComparisonExpressionContext]*ConditionExpression)
+	}
+	scalar := func() {
+		e.budget.step()
+		for _, offset := range e.subqueryMarkers {
+			e.budget.step()
+			if ctx.GetStart().GetStart() <= offset && offset <= ctx.GetStop().GetStop() {
+				e.unsupportedSubquery = true
+				return
+			}
+		}
+		e.budget.reserveOutput(1)
+		e.expressionLeaves[ctx] = &ConditionExpression{Operator: BooleanScalar, Scalar: &ScalarPredicate{Text: kqlSourceText(ctx, e.budget), PipeStage: e.currentStage, Pipeline: e.currentPipeline()}}
+	}
+	start := len(e.conditions)
+	defer func() {
+		if len(e.conditions) > start {
+			var leaf *ConditionExpression
+			op := BooleanAnd
+			if ctx.HAS_ANY() != nil || ctx.NOT_BETWEEN() != nil {
+				op = BooleanOr
+			}
+			for index := start; index < len(e.conditions); index++ {
+				leaf = combineConditionExpressions(op, leaf, &ConditionExpression{Operator: BooleanCondition, ConditionIndex: index}, e.budget)
+			}
+			e.expressionLeaves[ctx] = leaf
+		} else if _, represented := e.expressionLeaves[ctx]; !represented && groupedKQLExpression(ctx, e.budget) == nil {
+			scalar()
+		}
+	}()
 
-	if hasKQLFunctionPredicateAncestor(ctx, e.budget) {
+	if groupedKQLExpression(ctx, e.budget) == nil && kqlContainsLetReference(ctx, e.letNames, e.budget) {
+		scalar()
 		return
 	}
 	if predicate, ok := kqlFilterFunctionPredicate(ctx, e.budget); ok {
@@ -5689,28 +5790,56 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 		e.lastLogicalOp = "AND"
 		return
 	}
-	// A recognized predicate in extend/project/etc. is a computed value,
-	// including when a boolean literal appears on the left of a comparison.
-	if _, ok := recognizeKQLFunctionPredicate(ctx, e.budget); ok {
+	if ctx.ComparisonOperator() != nil || ctx.StringOperator() != nil {
+		left, op, right, ok := kqlComparisonOperands(ctx, e.budget)
+		if !ok {
+			scalar()
+			return
+		}
+		source, computed := e.computedFields[strings.ToLower(left.text)]
+		condition := Condition{Field: left.text, Operator: normalizeOperator(op), Negated: e.negated, PipeStage: e.currentStage, Pipeline: e.currentPipeline(), LogicalOp: e.lastLogicalOp, IsComputed: computed, SourceField: source}
+		if right.reference {
+			condition.ValueReference = right.text
+		} else {
+			condition.Value = extractValue(right.text)
+		}
+		e.appendCondition(condition)
+		e.lastLogicalOp = "AND"
 		return
 	}
-
-	// Handle comparison operators: field == value, field != value, etc.
-	if ctx.ComparisonOperator() != nil {
-		addExprs := ctx.AllAdditiveExpression()
-		if len(addExprs) >= 2 {
-			e.handleComparison(addExprs[0].GetText(), ctx.ComparisonOperator().GetText(), addExprs[1].GetText())
+	if !isKQLPredicateComparison(ctx, e.budget) {
+		if _, ok := kqlFilterFunctionPredicate(ctx, e.budget); !ok {
+			if nested := groupedKQLExpression(ctx, e.budget); nested == nil || kqlTransparentScalarChild(ctx, e.budget) == nil {
+				scalar()
+				return
+			}
 		}
-		return
 	}
 
-	// Handle string operators: field contains value, field has value, etc.
-	if ctx.StringOperator() != nil {
-		addExprs := ctx.AllAdditiveExpression()
-		if len(addExprs) >= 2 {
-			e.handleComparison(addExprs[0].GetText(), ctx.StringOperator().GetText(), addExprs[1].GetText())
+	if isKQLPredicateComparison(ctx, e.budget) {
+		values := ctx.AllAdditiveExpression()
+		if len(values) == 0 || !recognizeKQLOperand(values[0], e.budget).reference {
+			scalar()
+			return
 		}
-		return
+		for _, value := range values[1:] {
+			operand := recognizeKQLOperand(value, e.budget)
+			if !operand.literal && !operand.reference {
+				scalar()
+				return
+			}
+		}
+		if list := ctx.ExpressionList(); list != nil {
+			// Alternatives have no per-value reference metadata. Only proven
+			// literals can be lowered; computed or tabular/list expressions
+			// must remain one unevaluated scalar predicate.
+			for _, expression := range list.AllExpression() {
+				if !recognizeKQLOperand(expression, e.budget).literal {
+					scalar()
+					return
+				}
+			}
+		}
 	}
 
 	// Handle IN operator: field in (values) - including case-sensitive variants (in~, !in~)
@@ -5724,7 +5853,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 	if hasIN || hasNOT_IN || hasIN_CS || hasNOT_IN_CS {
 		addExprs := ctx.AllAdditiveExpression()
 		if len(addExprs) >= 1 && ctx.ExpressionList() != nil {
-			leftText := addExprs[0].GetText()
+			leftText := recognizeKQLOperand(addExprs[0], e.budget).text
 			isNegated := (hasNOT_IN || hasNOT_IN_CS) != e.negated
 			operator := "in"
 			if hasIN_CS || hasNOT_IN_CS || strings.Contains(strings.ToLower(ctx.GetText()), "in~") {
@@ -5739,11 +5868,20 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 	if ctx.BETWEEN() != nil || ctx.NOT_BETWEEN() != nil {
 		addExprs := ctx.AllAdditiveExpression()
 		if len(addExprs) >= 3 {
-			leftText := addExprs[0].GetText()
-			lowValue := addExprs[1].GetText()
-			highValue := addExprs[2].GetText()
+			leftText := recognizeKQLOperand(addExprs[0], e.budget).text
+			low := recognizeKQLOperand(addExprs[1], e.budget)
+			high := recognizeKQLOperand(addExprs[2], e.budget)
 			isNegated := (ctx.NOT_BETWEEN() != nil) != e.negated
-			e.handleBetweenOperator(leftText, lowValue, highValue, isNegated)
+			start := len(e.conditions)
+			e.handleBetweenOperator(leftText, low.text, high.text, isNegated)
+			if len(e.conditions) == start+2 {
+				for index, bound := range []kqlOperand{low, high} {
+					if bound.reference {
+						e.conditions[start+index].ValueReference = bound.text
+						e.conditions[start+index].Value = ""
+					}
+				}
+			}
 		}
 		return
 	}
@@ -5752,7 +5890,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 	if ctx.HAS_ANY() != nil || ctx.HAS_ALL() != nil {
 		addExprs := ctx.AllAdditiveExpression()
 		if len(addExprs) >= 1 && ctx.ExpressionList() != nil {
-			leftText := addExprs[0].GetText()
+			leftText := recognizeKQLOperand(addExprs[0], e.budget).text
 			opName := "has_any"
 			if ctx.HAS_ALL() != nil {
 				opName = "has_all"
@@ -5821,7 +5959,7 @@ func (e *conditionExtractor) handleInOperator(field string, exprList IExpression
 	// Mark if this is a computed field (created by extend/project)
 	sourceField, isComputed := e.computedFields[fieldLower]
 
-	values := extractExpressionListValues(exprList)
+	values := extractExpressionListValues(exprList, e.budget)
 	if len(values) == 0 {
 		return
 	}
@@ -5837,8 +5975,10 @@ func (e *conditionExtractor) handleInOperator(field string, exprList IExpression
 		IsComputed:   isComputed,
 		SourceField:  sourceField,
 	}
-	if len(values) == 1 && isSimpleIdentifier(values[0]) {
-		cond.ValueReference = values[0]
+	if expressions := exprList.AllExpression(); len(expressions) == 1 {
+		if operand := recognizeKQLOperand(expressions[0], e.budget); operand.reference {
+			cond.ValueReference = operand.text
+		}
 	}
 	e.appendCondition(cond)
 	e.lastLogicalOp = "AND"
@@ -5902,7 +6042,7 @@ func (e *conditionExtractor) handleHasAnyAllOperator(field, op string, exprList 
 	// Mark if this is a computed field (created by extend/project)
 	sourceField, isComputed := e.computedFields[fieldLower]
 
-	values := extractExpressionListValues(exprList)
+	values := extractExpressionListValues(exprList, e.budget)
 	logicalConnector := "OR"
 	if op == "has_all" {
 		logicalConnector = "AND"
@@ -6087,18 +6227,12 @@ func extractPortableDataSources(originalQuery, normalizedQuery string) []string 
 
 func extractLetStatements(query string) []LetStatement {
 	var statements []LetStatement
-	seen := make(map[string]bool)
 	for _, statement := range splitStatements(normalizeNewlines(query)) {
 		cleaned := trimLeadingLineComments(statement)
 		name, expression, ok := parseLetAssignment(strings.TrimSpace(cleaned))
 		if !ok || expression == "" {
 			continue
 		}
-		key := strings.ToLower(name)
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
 		statements = append(statements, LetStatement{
 			Name:       name,
 			Expression: strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(expression), ";")),
@@ -7380,14 +7514,21 @@ func compactKeyword(query string) string {
 	return compact
 }
 
-func extractExpressionListValues(ctx IExpressionListContext) []string {
+func extractExpressionListValues(ctx IExpressionListContext, budgets ...*parseBudget) []string {
+	budget := suppliedBudget(budgets)
+	budget.step()
+
 	if ctx == nil {
 		return nil
 	}
 
 	var values []string
 	for _, expr := range ctx.AllExpression() {
-		values = append(values, extractValue(expr.GetText()))
+		text := expr.GetText()
+		if operand := recognizeKQLOperand(expr, budget); operand.literal {
+			text = operand.text
+		}
+		values = append(values, extractValue(text))
 	}
 	return values
 }
@@ -7396,7 +7537,10 @@ func extractExpressionListValues(ctx IExpressionListContext) []string {
 // adjacent children of one OR node in expression into a single condition
 // with Alternatives, returning the merged list and a raw-to-merged index
 // map. It returns false when there is no expression to group by.
-func groupORConditionsByExpression(conditions []Condition, expression *ConditionExpression) ([]Condition, []int, bool) {
+func groupORConditionsByExpression(conditions []Condition, expression *ConditionExpression, budgets ...*parseBudget) ([]Condition, []int, bool) {
+	budget := suppliedBudget(budgets)
+	budget.step()
+
 	if expression == nil {
 		return nil, nil, false
 	}
@@ -7406,6 +7550,7 @@ func groupORConditionsByExpression(conditions []Condition, expression *Condition
 	}
 	var visit func(*ConditionExpression)
 	visit = func(node *ConditionExpression) {
+		budget.step()
 		if node == nil {
 			return
 		}

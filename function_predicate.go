@@ -16,16 +16,20 @@ type kqlFunctionPredicate struct {
 
 // kqlFilterFunctionPredicate is shared by extraction and expression building,
 // so both consume exactly one condition for the same filter expression.
-func kqlFilterFunctionPredicate(ctx IComparisonExpressionContext, budget *parseBudget) (kqlFunctionPredicate, bool) {
+func kqlFilterFunctionPredicate(ctx IComparisonExpressionContext, budgets ...*parseBudget) (kqlFunctionPredicate, bool) {
+	budget := suppliedBudget(budgets)
 	budget.step()
+
 	if !isKQLFilterContext(ctx, budget) || hasKQLFunctionPredicateAncestor(ctx, budget) {
 		return kqlFunctionPredicate{}, false
 	}
 	return recognizeKQLFunctionPredicate(ctx, budget)
 }
 
-func isKQLFilterContext(tree antlr.Tree, budget *parseBudget) bool {
+func isKQLFilterContext(tree antlr.Tree, budgets ...*parseBudget) bool {
+	budget := suppliedBudget(budgets)
 	budget.step()
+
 	for parent := tree.GetParent(); parent != nil; parent = parent.GetParent() {
 		budget.step()
 		switch parent.(type) {
@@ -47,8 +51,10 @@ func isKQLFilterContext(tree antlr.Tree, budget *parseBudget) bool {
 
 // Parentheses and boolean comparisons can enclose another comparison node.
 // Only their outermost recognized predicate emits a condition.
-func hasKQLFunctionPredicateAncestor(tree antlr.Tree, budget *parseBudget) bool {
+func hasKQLFunctionPredicateAncestor(tree antlr.Tree, budgets ...*parseBudget) bool {
+	budget := suppliedBudget(budgets)
 	budget.step()
+
 	for parent := tree.GetParent(); parent != nil; parent = parent.GetParent() {
 		budget.step()
 		if _, ok := parent.(IWhereOperatorContext); ok {
@@ -63,8 +69,10 @@ func hasKQLFunctionPredicateAncestor(tree antlr.Tree, budget *parseBudget) bool 
 	return false
 }
 
-func recognizeKQLFunctionPredicate(tree antlr.Tree, budget *parseBudget) (kqlFunctionPredicate, bool) {
+func recognizeKQLFunctionPredicate(tree antlr.Tree, budgets ...*parseBudget) (kqlFunctionPredicate, bool) {
+	budget := suppliedBudget(budgets)
 	budget.step()
+
 	switch ctx := tree.(type) {
 	case IFunctionCallContext:
 		if ctx.Identifier() == nil || ctx.ArgumentList() == nil {
@@ -75,7 +83,9 @@ func recognizeKQLFunctionPredicate(tree antlr.Tree, budget *parseBudget) (kqlFun
 		case "isnull", "isnotnull", "isempty", "isnotempty":
 			arguments := ctx.ArgumentList().AllArgument()
 			if len(arguments) == 1 && arguments[0].Expression() != nil {
-				return kqlFunctionPredicate{field: arguments[0].GetText(), operator: operator}, true
+				if operand := recognizeKQLOperand(arguments[0].Expression(), budget); operand.reference {
+					return kqlFunctionPredicate{field: operand.text, operator: operator}, true
+				}
 			}
 		}
 		return kqlFunctionPredicate{}, false
@@ -118,8 +128,10 @@ func recognizeKQLFunctionPredicate(tree antlr.Tree, budget *parseBudget) (kqlFun
 	return recognizeKQLFunctionPredicate(child, budget)
 }
 
-func kqlBooleanLiteral(tree antlr.Tree, budget *parseBudget) (bool, bool) {
+func kqlBooleanLiteral(tree antlr.Tree, budgets ...*parseBudget) (bool, bool) {
+	budget := suppliedBudget(budgets)
 	budget.step()
+
 	if text, ok := tree.(interface{ GetText() string }); ok {
 		switch strings.ToLower(text.GetText()) {
 		case "true":
@@ -136,8 +148,10 @@ func kqlBooleanLiteral(tree antlr.Tree, budget *parseBudget) (bool, bool) {
 
 // Only descend through scalar grammar wrappers and parentheses. In particular,
 // do not turn predicates inside arbitrary functions or arithmetic into filters.
-func kqlTransparentScalarChild(tree antlr.Tree, budget *parseBudget) antlr.Tree {
+func kqlTransparentScalarChild(tree antlr.Tree, budgets ...*parseBudget) antlr.Tree {
+	budget := suppliedBudget(budgets)
 	budget.step()
+
 	switch tree.(type) {
 	case IExpressionContext, IOrExpressionContext, IAndExpressionContext,
 		INotExpressionContext, IComparisonExpressionContext, IAdditiveExpressionContext,
