@@ -8,6 +8,7 @@ type BooleanOperator string
 const (
 	BooleanCondition BooleanOperator = "condition"
 	BooleanScalar    BooleanOperator = "scalar"
+	BooleanSearch    BooleanOperator = "search"
 	BooleanAnd       BooleanOperator = "and"
 	BooleanOr        BooleanOperator = "or"
 )
@@ -18,6 +19,7 @@ type ConditionExpression struct {
 	Operator       BooleanOperator        `json:"operator"`
 	ConditionIndex int                    `json:"condition_index"`
 	Scalar         *ScalarPredicate       `json:"scalar,omitempty"`
+	Search         *SearchPredicate       `json:"search,omitempty"`
 	Children       []*ConditionExpression `json:"children,omitempty"`
 }
 
@@ -30,14 +32,48 @@ func buildConditionExpression(tree antlr.Tree, conditions []Condition, budget *p
 		builder.leaves = extraction[0].expressionLeaves
 	}
 	var expression *ConditionExpression
-	for _, where := range collectKQLWhereOperators(tree, budget) {
+	for _, filter := range collectKQLFilterOperators(tree, budget) {
 		budget.step()
-		expression = combineConditionExpressions(BooleanAnd, expression, builder.expression(where.Expression()), budget)
+		var leaf *ConditionExpression
+		switch ctx := filter.(type) {
+		case IWhereOperatorContext:
+			leaf = builder.expression(ctx.Expression())
+		case ISearchOperatorContext:
+			if len(extraction) > 0 {
+				leaf = extraction[0].searchLeaves[ctx]
+			}
+		}
+		expression = combineConditionExpressions(BooleanAnd, expression, leaf, budget)
 	}
 	if expression != nil && builder.next == len(conditions) {
 		return expression
 	}
 	return nil
+}
+
+func collectKQLFilterOperators(tree antlr.Tree, budget *parseBudget) []antlr.Tree {
+	budget.step()
+	var filters []antlr.Tree
+	var visit func(antlr.Tree)
+	visit = func(node antlr.Tree) {
+		budget.step()
+		switch node.(type) {
+		case IJoinOperatorContext, ILookupOperatorContext:
+			return
+		case ISearchOperatorContext:
+			budget.reserveOutput(1)
+			filters = append(filters, node)
+			return
+		case IWhereOperatorContext:
+			filters = append(filters, node)
+			return
+		}
+		for i := 0; i < node.GetChildCount(); i++ {
+			visit(node.GetChild(i))
+		}
+	}
+	visit(tree)
+	return filters
 }
 
 type kqlExpressionBuilder struct {
@@ -234,6 +270,8 @@ func remapConditionExpression(expression *ConditionExpression, indexMap []int, b
 		return expression
 	}
 	switch expression.Operator {
+	case BooleanSearch:
+		return &ConditionExpression{Operator: BooleanSearch, Search: cloneSearchPredicate(expression.Search, budget)}
 	case BooleanScalar:
 		return &ConditionExpression{Operator: BooleanScalar, Scalar: cloneScalarPredicate(expression.Scalar, budget)}
 	case BooleanCondition:
@@ -311,6 +349,9 @@ func equalConditionExpression(a, b *ConditionExpression, budgets ...*parseBudget
 		return a == b
 	}
 	if (a.Scalar == nil) != (b.Scalar == nil) || (a.Scalar != nil && *a.Scalar != *b.Scalar) {
+		return false
+	}
+	if !equalSearchPredicate(a.Search, b.Search, budget) {
 		return false
 	}
 	if a.Operator != b.Operator || a.ConditionIndex != b.ConditionIndex || len(a.Children) != len(b.Children) {

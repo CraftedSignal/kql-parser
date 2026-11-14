@@ -1,7 +1,6 @@
 // Code generated from KQLParser.g4 by ANTLR 4.13.2. DO NOT EDIT.
 
-package kql
-
+package kql // KQLParser
 import "github.com/antlr4-go/antlr/v4"
 
 type BaseKQLParserVisitor struct {
@@ -81,6 +80,42 @@ func (v *BaseKQLParserVisitor) VisitWhereOperator(ctx *WhereOperatorContext) int
 }
 
 func (v *BaseKQLParserVisitor) VisitSearchOperator(ctx *SearchOperatorContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BaseKQLParserVisitor) VisitSearchPredicate(ctx *SearchPredicateContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BaseKQLParserVisitor) VisitSearchOrExpression(ctx *SearchOrExpressionContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BaseKQLParserVisitor) VisitSearchAndExpression(ctx *SearchAndExpressionContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BaseKQLParserVisitor) VisitSearchNotExpression(ctx *SearchNotExpressionContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BaseKQLParserVisitor) VisitSearchAtom(ctx *SearchAtomContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BaseKQLParserVisitor) VisitSearchStringTerm(ctx *SearchStringTermContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BaseKQLParserVisitor) VisitSearchTableSource(ctx *SearchTableSourceContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BaseKQLParserVisitor) VisitSearchQualifier(ctx *SearchQualifierContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BaseKQLParserVisitor) VisitSearchTableComponent(ctx *SearchTableComponentContext) interface{} {
 	return v.VisitChildren(ctx)
 }
 

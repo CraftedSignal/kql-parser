@@ -460,13 +460,13 @@ func TestKQLOperatorNormalizationEdges(t *testing.T) {
 	}
 
 	searchWithPipeline := normalizeSearchOperator(`search kind=case_sensitive in (SecurityEvent) | project Account`)
-	if want := `DummyTable | project Account`; searchWithPipeline != want {
+	if want := `search kind=case_sensitive in (SecurityEvent) | project Account`; searchWithPipeline != want {
 		t.Fatalf("normalizeSearchOperator() = %q, want %q", searchWithPipeline, want)
 	}
-	if got := normalizeSearchOperator(`search kind=case_sensitive in (SecurityEvent) "admin" | project Account`); got != "DummyTable" {
-		t.Fatalf("search pattern should collapse to dummy table, got %q", got)
+	if got := normalizeSearchOperator(`search kind=case_sensitive in (SecurityEvent) "admin" | project Account`); got != `search kind=case_sensitive in (SecurityEvent) "admin" | project Account` {
+		t.Fatalf("search source changed: %q", got)
 	}
-	if got := normalizeSearchOperator(`search "admin"`); got != "DummyTable" {
+	if got := normalizeSearchOperator(`search "admin"`); got != `search "admin"` {
 		t.Fatalf("search without pipeline = %q", got)
 	}
 	if original := `SecurityEvent | search "admin"`; normalizeSearchOperator(original) != original {

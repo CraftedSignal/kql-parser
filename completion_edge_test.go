@@ -96,11 +96,11 @@ func TestKQLCompletionDatasourceBooleanDeclareAndSearchEdges(t *testing.T) {
 	if got := normalizeSearchOperator(malformedSearch); got != malformedSearch {
 		t.Fatalf("malformed search changed to %q", got)
 	}
-	if got, want := normalizeSearchOperator(`search in ((SecurityEvent)) | project Account`), "DummyTable | project Account"; got != want {
+	if got, want := normalizeSearchOperator(`search in ((SecurityEvent)) | project Account`), `search in ((SecurityEvent)) | project Account`; got != want {
 		t.Fatalf("nested search in normalization = %q, want %q", got, want)
 	}
-	if got := normalizeSearchOperator(`search kind=case_sensitive in (SecurityEvent)`); got != "DummyTable" {
-		t.Fatalf("empty search pattern should collapse to DummyTable, got %q", got)
+	if got := normalizeSearchOperator(`search kind=case_sensitive in (SecurityEvent)`); got != `search kind=case_sensitive in (SecurityEvent)` {
+		t.Fatalf("malformed search source changed before validation: %q", got)
 	}
 }
 

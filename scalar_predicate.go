@@ -196,7 +196,7 @@ func containsScalarExpression(expression *ConditionExpression, budgets ...*parse
 	if expression == nil {
 		return false
 	}
-	if expression.Operator == BooleanScalar {
+	if expression.Operator == BooleanScalar || expression.Operator == BooleanSearch {
 		return true
 	}
 	for _, child := range expression.Children {

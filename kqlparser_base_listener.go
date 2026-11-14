@@ -1,7 +1,6 @@
 // Code generated from KQLParser.g4 by ANTLR 4.13.2. DO NOT EDIT.
 
-package kql
-
+package kql // KQLParser
 import "github.com/antlr4-go/antlr/v4"
 
 // BaseKQLParserListener is a complete listener for a parse tree produced by KQLParser.
@@ -134,6 +133,60 @@ func (s *BaseKQLParserListener) EnterSearchOperator(ctx *SearchOperatorContext) 
 
 // ExitSearchOperator is called when production searchOperator is exited.
 func (s *BaseKQLParserListener) ExitSearchOperator(ctx *SearchOperatorContext) {}
+
+// EnterSearchPredicate is called when production searchPredicate is entered.
+func (s *BaseKQLParserListener) EnterSearchPredicate(ctx *SearchPredicateContext) {}
+
+// ExitSearchPredicate is called when production searchPredicate is exited.
+func (s *BaseKQLParserListener) ExitSearchPredicate(ctx *SearchPredicateContext) {}
+
+// EnterSearchOrExpression is called when production searchOrExpression is entered.
+func (s *BaseKQLParserListener) EnterSearchOrExpression(ctx *SearchOrExpressionContext) {}
+
+// ExitSearchOrExpression is called when production searchOrExpression is exited.
+func (s *BaseKQLParserListener) ExitSearchOrExpression(ctx *SearchOrExpressionContext) {}
+
+// EnterSearchAndExpression is called when production searchAndExpression is entered.
+func (s *BaseKQLParserListener) EnterSearchAndExpression(ctx *SearchAndExpressionContext) {}
+
+// ExitSearchAndExpression is called when production searchAndExpression is exited.
+func (s *BaseKQLParserListener) ExitSearchAndExpression(ctx *SearchAndExpressionContext) {}
+
+// EnterSearchNotExpression is called when production searchNotExpression is entered.
+func (s *BaseKQLParserListener) EnterSearchNotExpression(ctx *SearchNotExpressionContext) {}
+
+// ExitSearchNotExpression is called when production searchNotExpression is exited.
+func (s *BaseKQLParserListener) ExitSearchNotExpression(ctx *SearchNotExpressionContext) {}
+
+// EnterSearchAtom is called when production searchAtom is entered.
+func (s *BaseKQLParserListener) EnterSearchAtom(ctx *SearchAtomContext) {}
+
+// ExitSearchAtom is called when production searchAtom is exited.
+func (s *BaseKQLParserListener) ExitSearchAtom(ctx *SearchAtomContext) {}
+
+// EnterSearchStringTerm is called when production searchStringTerm is entered.
+func (s *BaseKQLParserListener) EnterSearchStringTerm(ctx *SearchStringTermContext) {}
+
+// ExitSearchStringTerm is called when production searchStringTerm is exited.
+func (s *BaseKQLParserListener) ExitSearchStringTerm(ctx *SearchStringTermContext) {}
+
+// EnterSearchTableSource is called when production searchTableSource is entered.
+func (s *BaseKQLParserListener) EnterSearchTableSource(ctx *SearchTableSourceContext) {}
+
+// ExitSearchTableSource is called when production searchTableSource is exited.
+func (s *BaseKQLParserListener) ExitSearchTableSource(ctx *SearchTableSourceContext) {}
+
+// EnterSearchQualifier is called when production searchQualifier is entered.
+func (s *BaseKQLParserListener) EnterSearchQualifier(ctx *SearchQualifierContext) {}
+
+// ExitSearchQualifier is called when production searchQualifier is exited.
+func (s *BaseKQLParserListener) ExitSearchQualifier(ctx *SearchQualifierContext) {}
+
+// EnterSearchTableComponent is called when production searchTableComponent is entered.
+func (s *BaseKQLParserListener) EnterSearchTableComponent(ctx *SearchTableComponentContext) {}
+
+// ExitSearchTableComponent is called when production searchTableComponent is exited.
+func (s *BaseKQLParserListener) ExitSearchTableComponent(ctx *SearchTableComponentContext) {}
 
 // EnterSearchKind is called when production searchKind is entered.
 func (s *BaseKQLParserListener) EnterSearchKind(ctx *SearchKindContext) {}

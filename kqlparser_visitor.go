@@ -1,7 +1,6 @@
 // Code generated from KQLParser.g4 by ANTLR 4.13.2. DO NOT EDIT.
 
-package kql
-
+package kql // KQLParser
 import "github.com/antlr4-go/antlr/v4"
 
 // A complete Visitor for a parse tree produced by KQLParser.
@@ -64,6 +63,33 @@ type KQLParserVisitor interface {
 
 	// Visit a parse tree produced by KQLParser#searchOperator.
 	VisitSearchOperator(ctx *SearchOperatorContext) interface{}
+
+	// Visit a parse tree produced by KQLParser#searchPredicate.
+	VisitSearchPredicate(ctx *SearchPredicateContext) interface{}
+
+	// Visit a parse tree produced by KQLParser#searchOrExpression.
+	VisitSearchOrExpression(ctx *SearchOrExpressionContext) interface{}
+
+	// Visit a parse tree produced by KQLParser#searchAndExpression.
+	VisitSearchAndExpression(ctx *SearchAndExpressionContext) interface{}
+
+	// Visit a parse tree produced by KQLParser#searchNotExpression.
+	VisitSearchNotExpression(ctx *SearchNotExpressionContext) interface{}
+
+	// Visit a parse tree produced by KQLParser#searchAtom.
+	VisitSearchAtom(ctx *SearchAtomContext) interface{}
+
+	// Visit a parse tree produced by KQLParser#searchStringTerm.
+	VisitSearchStringTerm(ctx *SearchStringTermContext) interface{}
+
+	// Visit a parse tree produced by KQLParser#searchTableSource.
+	VisitSearchTableSource(ctx *SearchTableSourceContext) interface{}
+
+	// Visit a parse tree produced by KQLParser#searchQualifier.
+	VisitSearchQualifier(ctx *SearchQualifierContext) interface{}
+
+	// Visit a parse tree produced by KQLParser#searchTableComponent.
+	VisitSearchTableComponent(ctx *SearchTableComponentContext) interface{}
 
 	// Visit a parse tree produced by KQLParser#searchKind.
 	VisitSearchKind(ctx *SearchKindContext) interface{}
