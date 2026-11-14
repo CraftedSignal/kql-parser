@@ -21,6 +21,7 @@ type SemanticQuery struct {
 // semantic conditions instead of parser-internal condition indexes.
 type SemanticExpression struct {
 	Operator  BooleanOperator       `json:"operator"`
+	Scalar    *ScalarPredicate      `json:"scalar,omitempty"`
 	Condition *Condition            `json:"condition,omitempty"`
 	Children  []*SemanticExpression `json:"children,omitempty"`
 }
@@ -74,6 +75,8 @@ func semanticExpressionFromParseExpression(expression *ConditionExpression, cond
 	}
 
 	switch expression.Operator {
+	case BooleanScalar:
+		return &SemanticExpression{Operator: BooleanScalar, Scalar: cloneScalarPredicate(expression.Scalar)}
 	case BooleanCondition:
 		if expression.ConditionIndex < 0 || expression.ConditionIndex >= len(conditions) {
 			return nil

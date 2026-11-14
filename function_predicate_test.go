@@ -97,7 +97,11 @@ func TestFunctionPredicatesOnlyFilterRows(t *testing.T) {
 			query = fmt.Sprintf(query, function)
 			t.Run(query, func(t *testing.T) {
 				result := ExtractConditions(query)
-				if len(result.Errors) != 0 || len(result.Conditions) != 1 || result.Conditions[0].Field != "a" {
+				if strings.Contains(query, "where a == (") {
+					if len(result.Errors) != 0 || len(result.Conditions) != 0 || result.Expression == nil || result.Expression.Operator != BooleanScalar {
+						t.Fatalf("expected complete scalar: %#v", result)
+					}
+				} else if len(result.Errors) != 0 || len(result.Conditions) != 1 || result.Conditions[0].Field != "a" {
 					t.Fatalf("conditions = %#v, errors = %v; want only a filter", result.Conditions, result.Errors)
 				}
 			})

@@ -7,6 +7,7 @@ type BooleanOperator string
 
 const (
 	BooleanCondition BooleanOperator = "condition"
+	BooleanScalar    BooleanOperator = "scalar"
 	BooleanAnd       BooleanOperator = "and"
 	BooleanOr        BooleanOperator = "or"
 )
@@ -16,14 +17,18 @@ const (
 type ConditionExpression struct {
 	Operator       BooleanOperator        `json:"operator"`
 	ConditionIndex int                    `json:"condition_index"`
+	Scalar         *ScalarPredicate       `json:"scalar,omitempty"`
 	Children       []*ConditionExpression `json:"children,omitempty"`
 }
 
-func buildConditionExpression(tree antlr.Tree, conditions []Condition) *ConditionExpression {
-	if tree == nil || len(conditions) < 2 {
+func buildConditionExpression(tree antlr.Tree, conditions []Condition, extraction ...*conditionExtractor) *ConditionExpression {
+	if tree == nil {
 		return nil
 	}
 	builder := &kqlExpressionBuilder{conditions: conditions}
+	if len(extraction) > 0 {
+		builder.leaves = extraction[0].expressionLeaves
+	}
 	var expression *ConditionExpression
 	for _, where := range collectKQLWhereOperators(tree) {
 		expression = combineConditionExpressions(BooleanAnd, expression, builder.expression(where.Expression()))
@@ -37,6 +42,7 @@ func buildConditionExpression(tree antlr.Tree, conditions []Condition) *Conditio
 type kqlExpressionBuilder struct {
 	conditions []Condition
 	next       int
+	leaves     map[IComparisonExpressionContext]*ConditionExpression
 }
 
 func collectKQLWhereOperators(tree antlr.Tree) []IWhereOperatorContext {
@@ -94,6 +100,16 @@ func (b *kqlExpressionBuilder) comparisonExpression(ctx IComparisonExpressionCon
 	if ctx == nil {
 		return nil
 	}
+	if b.leaves != nil {
+		if leaf, ok := b.leaves[ctx]; ok {
+			b.next += countConditionLeaves(leaf)
+			return leaf
+		}
+		if nested := groupedKQLExpression(ctx); nested != nil {
+			return b.expression(nested)
+		}
+		return nil
+	}
 	if _, ok := kqlFilterFunctionPredicate(ctx); ok {
 		return b.condition()
 	}
@@ -112,6 +128,11 @@ func (b *kqlExpressionBuilder) comparisonExpression(ctx IComparisonExpressionCon
 		return b.conditionGroup(2, operator)
 	}
 	if isKQLPredicateComparison(ctx) {
+		if ctx.ComparisonOperator() != nil {
+			if _, _, _, ok := kqlComparisonOperands(ctx); !ok {
+				return &ConditionExpression{Operator: BooleanScalar, Scalar: &ScalarPredicate{Text: kqlSourceText(ctx)}}
+			}
+		}
 		return b.condition()
 	}
 	if nested := firstNestedKQLExpression(ctx); nested != nil {
@@ -187,6 +208,8 @@ func remapConditionExpression(expression *ConditionExpression, indexMap []int) *
 		return expression
 	}
 	switch expression.Operator {
+	case BooleanScalar:
+		return &ConditionExpression{Operator: BooleanScalar, Scalar: cloneScalarPredicate(expression.Scalar)}
 	case BooleanCondition:
 		if expression.ConditionIndex < 0 || expression.ConditionIndex >= len(indexMap) {
 			return nil
@@ -232,6 +255,10 @@ func appendConditionRangeExpression(expression *ConditionExpression, start, end 
 }
 
 func appendUniqueConditionExpression(children []*ConditionExpression, child *ConditionExpression) []*ConditionExpression {
+	// Unevaluated scalar functions can be nondeterministic. Preserve each occurrence.
+	if containsScalarExpression(child) {
+		return append(children, child)
+	}
 	for _, existing := range children {
 		if equalConditionExpression(existing, child) {
 			return children
@@ -243,6 +270,9 @@ func appendUniqueConditionExpression(children []*ConditionExpression, child *Con
 func equalConditionExpression(a, b *ConditionExpression) bool {
 	if a == nil || b == nil {
 		return a == b
+	}
+	if (a.Scalar == nil) != (b.Scalar == nil) || (a.Scalar != nil && *a.Scalar != *b.Scalar) {
+		return false
 	}
 	if a.Operator != b.Operator || a.ConditionIndex != b.ConditionIndex || len(a.Children) != len(b.Children) {
 		return false
@@ -281,6 +311,12 @@ func demorganConditionExpression(expression *ConditionExpression) *ConditionExpr
 		return nil
 	}
 	switch expression.Operator {
+	case BooleanScalar:
+		scalar := cloneScalarPredicate(expression.Scalar)
+		if scalar != nil {
+			scalar.Negated = !scalar.Negated
+		}
+		return &ConditionExpression{Operator: BooleanScalar, Scalar: scalar}
 	case BooleanAnd:
 		converted := &ConditionExpression{Operator: BooleanOr}
 		for _, child := range expression.Children {
@@ -296,4 +332,18 @@ func demorganConditionExpression(expression *ConditionExpression) *ConditionExpr
 	default:
 		return expression
 	}
+}
+
+func countConditionLeaves(expression *ConditionExpression) int {
+	if expression == nil {
+		return 0
+	}
+	if expression.Operator == BooleanCondition {
+		return 1
+	}
+	count := 0
+	for _, child := range expression.Children {
+		count += countConditionLeaves(child)
+	}
+	return count
 }

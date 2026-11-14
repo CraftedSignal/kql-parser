@@ -130,8 +130,8 @@ func TestKQLCompletionNormalizerWrapperEdges(t *testing.T) {
 	}
 
 	letStatements := extractLetStatements(`let IOCs = dynamic(["a"]); let IOCs = dynamic(["b"]); let Other = SecurityEvent;`)
-	if len(letStatements) != 2 || letStatements[0].Name != "IOCs" || letStatements[0].Expression != `dynamic(["a"])` {
-		t.Fatalf("duplicate let statements not deduped/preserved: %#v", letStatements)
+	if len(letStatements) != 3 || letStatements[0].Name != "IOCs" || letStatements[0].Expression != `dynamic(["a"])` {
+		t.Fatalf("shadowed let statements not preserved: %#v", letStatements)
 	}
 }
 

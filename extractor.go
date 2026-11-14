@@ -147,6 +147,8 @@ type conditionExtractor struct {
 	negated             bool
 	lastLogicalOp       string
 	errors              []string
+	expressionLeaves    map[IComparisonExpressionContext]*ConditionExpression
+	letNames            map[string]bool
 	originalQuery       string // normalized query text for extracting subexpressions
 }
 
@@ -730,6 +732,11 @@ func convertBracketAccess(query string) string {
 				if end < len(query) && end+1 < len(query) && query[end] == quote && query[end+1] == ']' {
 					// Extract the key
 					key := query[i+2 : end]
+					if !precededByIdent {
+						result.WriteString(query[i : end+2])
+						i = end + 2
+						continue
+					}
 					// Check if key is a valid identifier (alphanumeric + underscore
 					// only) the grammar does not read as a keyword
 					if isValidPropertyKey(key) && !grammarReservedWords[strings.ToLower(key)] {
@@ -896,6 +903,20 @@ func fixNumericIdentifiers(query string) string {
 			continue
 		}
 
+		if c == '[' {
+			if end := strings.IndexByte(query[i:], ']'); end >= 0 {
+				result.WriteString(query[i : i+end+1])
+				i += end + 1
+				continue
+			}
+		}
+		if c >= '0' && c <= '9' && (i == 0 || !isIdentChar(query[i-1])) {
+			if token := numericPrefix.FindString(query[i:]); token != "" && (i+len(token) == len(query) || !isIdentChar(query[i+len(token)])) {
+				result.WriteString(token)
+				i += len(token)
+				continue
+			}
+		}
 		// Check for identifier starting with digit
 		// Only consider it an identifier if preceded by non-identifier char
 		if c >= '0' && c <= '9' {
@@ -4895,6 +4916,11 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 		queryPipeline:       -1,
 		lastLogicalOp:       "AND", // default
 		originalQuery:       normalizedQuery,
+		expressionLeaves:    make(map[IComparisonExpressionContext]*ConditionExpression),
+		letNames:            make(map[string]bool),
+	}
+	for _, binding := range extractLetStatements(query) {
+		extractor.letNames[binding.Name] = true
 	}
 	antlr.ParseTreeWalkerDefault.Walk(extractor, tree)
 
@@ -4907,13 +4933,13 @@ func extractConditionsInternal(query string) (result *ParseResult) {
 	// knows the grouping; the flat operator sequence cannot tell
 	// "x and (a or b)" from "(x and a) or b", so it is only a fallback.
 	rawConditions := append([]Condition(nil), extractor.conditions...)
-	rawExpression := buildConditionExpression(tree, rawConditions)
+	rawExpression := buildConditionExpression(tree, rawConditions, extractor)
 	conditions, conditionIndexMap, grouped := groupORConditionsByExpression(rawConditions, rawExpression)
 	if !grouped {
 		conditions, conditionIndexMap = groupORConditionsWithIndexMap(extractor.conditions)
 	}
 	expression := remapConditionExpression(rawExpression, conditionIndexMap)
-	if !hasPortableFieldConditions(conditions) {
+	if !containsScalarExpression(expression) && !hasPortableFieldConditions(conditions) {
 		var note string
 		var extracted []Condition
 		allowGenericKeyword := len(lexerErrors.errors) != 0 || len(parserErrors.errors) != 0 ||
@@ -5505,18 +5531,44 @@ func (e *conditionExtractor) EnterRenameItem(ctx *RenameItemContext) {
 
 // EnterComparisonExpression extracts field comparisons
 func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpressionContext) {
-	// Skip conditions inside subqueries
-	if e.inSubquery > 0 {
+	if e.inSubquery > 0 || e.inFunctionCall > 0 {
 		return
 	}
-
-	// Skip conditions inside function calls (like countif(), sumif(), etc.)
-	// These are aggregation expressions, not filter conditions
-	if e.inFunctionCall > 0 {
+	if !isKQLFilterContext(ctx) {
 		return
 	}
+	for parent := ctx.GetParent(); parent != nil; parent = parent.GetParent() {
+		if comparison, ok := parent.(IComparisonExpressionContext); ok {
+			if _, recorded := e.expressionLeaves[comparison]; recorded {
+				return
+			}
+		}
+	}
+	if e.expressionLeaves == nil {
+		e.expressionLeaves = make(map[IComparisonExpressionContext]*ConditionExpression)
+	}
+	scalar := func() {
+		e.expressionLeaves[ctx] = &ConditionExpression{Operator: BooleanScalar, Scalar: &ScalarPredicate{Text: kqlSourceText(ctx), PipeStage: e.currentStage, Pipeline: e.currentPipeline()}}
+	}
+	start := len(e.conditions)
+	defer func() {
+		if len(e.conditions) > start {
+			var leaf *ConditionExpression
+			op := BooleanAnd
+			if ctx.HAS_ANY() != nil || ctx.NOT_BETWEEN() != nil {
+				op = BooleanOr
+			}
+			for index := start; index < len(e.conditions); index++ {
+				leaf = combineConditionExpressions(op, leaf, &ConditionExpression{Operator: BooleanCondition, ConditionIndex: index})
+			}
+			e.expressionLeaves[ctx] = leaf
+		} else if _, represented := e.expressionLeaves[ctx]; !represented && groupedKQLExpression(ctx) == nil {
+			scalar()
+		}
+	}()
 
-	if hasKQLFunctionPredicateAncestor(ctx) {
+	if groupedKQLExpression(ctx) == nil && kqlContainsLetReference(ctx, e.letNames) {
+		scalar()
 		return
 	}
 	if predicate, ok := kqlFilterFunctionPredicate(ctx); ok {
@@ -5534,28 +5586,45 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 		e.lastLogicalOp = "AND"
 		return
 	}
-	// A recognized predicate in extend/project/etc. is a computed value,
-	// including when a boolean literal appears on the left of a comparison.
-	if _, ok := recognizeKQLFunctionPredicate(ctx); ok {
+	if ctx.ComparisonOperator() != nil || ctx.StringOperator() != nil {
+		left, op, right, ok := kqlComparisonOperands(ctx)
+		if !ok {
+			scalar()
+			return
+		}
+		source, computed := e.computedFields[strings.ToLower(left.text)]
+		condition := Condition{Field: left.text, Operator: normalizeOperator(op), Negated: e.negated, PipeStage: e.currentStage, Pipeline: e.currentPipeline(), LogicalOp: e.lastLogicalOp, IsComputed: computed, SourceField: source}
+		if right.reference {
+			condition.ValueReference = right.text
+		} else {
+			condition.Value = extractValue(right.text)
+		}
+		e.conditions = append(e.conditions, condition)
+		e.lastLogicalOp = "AND"
 		return
 	}
-
-	// Handle comparison operators: field == value, field != value, etc.
-	if ctx.ComparisonOperator() != nil {
-		addExprs := ctx.AllAdditiveExpression()
-		if len(addExprs) >= 2 {
-			e.handleComparison(addExprs[0].GetText(), ctx.ComparisonOperator().GetText(), addExprs[1].GetText())
+	if !isKQLPredicateComparison(ctx) {
+		if _, ok := kqlFilterFunctionPredicate(ctx); !ok {
+			if nested := groupedKQLExpression(ctx); nested == nil || kqlTransparentScalarChild(ctx) == nil {
+				scalar()
+				return
+			}
 		}
-		return
 	}
 
-	// Handle string operators: field contains value, field has value, etc.
-	if ctx.StringOperator() != nil {
-		addExprs := ctx.AllAdditiveExpression()
-		if len(addExprs) >= 2 {
-			e.handleComparison(addExprs[0].GetText(), ctx.StringOperator().GetText(), addExprs[1].GetText())
+	if isKQLPredicateComparison(ctx) {
+		values := ctx.AllAdditiveExpression()
+		if len(values) == 0 || !recognizeKQLOperand(values[0]).reference {
+			scalar()
+			return
 		}
-		return
+		for _, value := range values[1:] {
+			operand := recognizeKQLOperand(value)
+			if !operand.literal && !operand.reference {
+				scalar()
+				return
+			}
+		}
 	}
 
 	// Handle IN operator: field in (values) - including case-sensitive variants (in~, !in~)
@@ -5569,7 +5638,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 	if hasIN || hasNOT_IN || hasIN_CS || hasNOT_IN_CS {
 		addExprs := ctx.AllAdditiveExpression()
 		if len(addExprs) >= 1 && ctx.ExpressionList() != nil {
-			leftText := addExprs[0].GetText()
+			leftText := recognizeKQLOperand(addExprs[0]).text
 			isNegated := (hasNOT_IN || hasNOT_IN_CS) != e.negated
 			operator := "in"
 			if hasIN_CS || hasNOT_IN_CS || strings.Contains(strings.ToLower(ctx.GetText()), "in~") {
@@ -5584,7 +5653,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 	if ctx.BETWEEN() != nil || ctx.NOT_BETWEEN() != nil {
 		addExprs := ctx.AllAdditiveExpression()
 		if len(addExprs) >= 3 {
-			leftText := addExprs[0].GetText()
+			leftText := recognizeKQLOperand(addExprs[0]).text
 			lowValue := addExprs[1].GetText()
 			highValue := addExprs[2].GetText()
 			isNegated := (ctx.NOT_BETWEEN() != nil) != e.negated
@@ -5597,7 +5666,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 	if ctx.HAS_ANY() != nil || ctx.HAS_ALL() != nil {
 		addExprs := ctx.AllAdditiveExpression()
 		if len(addExprs) >= 1 && ctx.ExpressionList() != nil {
-			leftText := addExprs[0].GetText()
+			leftText := recognizeKQLOperand(addExprs[0]).text
 			opName := "has_any"
 			if ctx.HAS_ALL() != nil {
 				opName = "has_all"
@@ -5932,18 +6001,12 @@ func extractPortableDataSources(originalQuery, normalizedQuery string) []string 
 
 func extractLetStatements(query string) []LetStatement {
 	var statements []LetStatement
-	seen := make(map[string]bool)
 	for _, statement := range splitStatements(normalizeNewlines(query)) {
 		cleaned := trimLeadingLineComments(statement)
 		name, expression, ok := parseLetAssignment(strings.TrimSpace(cleaned))
 		if !ok || expression == "" {
 			continue
 		}
-		key := strings.ToLower(name)
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
 		statements = append(statements, LetStatement{
 			Name:       name,
 			Expression: strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(expression), ";")),
