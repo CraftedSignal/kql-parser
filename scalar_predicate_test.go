@@ -249,3 +249,69 @@ func TestNullEmptyScalarArgumentsRemainCompletePredicates(t *testing.T) {
 		}
 	}
 }
+
+func TestComputedAndReferenceListOperandsStayScalar(t *testing.T) {
+	// IN accepts scalar and tabular expressions; string alternatives cannot
+	// represent those expressions or distinguish list references from literals.
+	// https://learn.microsoft.com/en-us/kusto/query/in-cs-operator
+	for _, operator := range []string{"in", "!in", "in~", "!in~", "has_any", "has_all"} {
+		for _, values := range []string{`rand()`, `tostring(rand()), tostring(rand())`, `other`, `SubqueryResult`, `['5']`, `"literal", other`, `1 + 2`} {
+			predicate := `a ` + operator + ` (` + values + `)`
+			r := ExtractConditions(`T | where ` + predicate)
+			leaves := scalarLeaves(r.Expression)
+			if len(r.Conditions) != 0 || len(leaves) != 1 || leaves[0].Text != predicate {
+				t.Errorf("list expressions became literals: %s: %#v / %#v", predicate, r, leaves)
+			}
+		}
+	}
+	query := `T | where a has_any (tostring(rand()), tostring(rand())) and a has_any (tostring(rand()), tostring(rand()))`
+	if r := ExtractConditions(query); len(scalarLeaves(r.Expression)) != 2 {
+		t.Fatalf("nondeterministic lists collapsed: %#v", r)
+	}
+	r := ExtractConditions(`T | extend x=1 | where not(a has_any (tostring(rand()), tostring(rand())) or a == 1)`)
+	leaves := scalarLeaves(r.Expression)
+	if len(leaves) != 1 || !leaves[0].Negated || leaves[0].Text != `a has_any (tostring(rand()), tostring(rand()))` || leaves[0].PipeStage != 1 || leaves[0].Pipeline != 0 || r.Expression.Operator != BooleanAnd || len(r.Conditions) != 1 || !r.Conditions[0].Negated {
+		t.Fatalf("negated list scalar changed topology or metadata: %#v / %#v", r, leaves)
+	}
+	semantic := semanticFromExtraction(r)
+	encoded, err := json.Marshal(semantic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded SemanticQuery
+	if err := json.Unmarshal(encoded, &decoded); err != nil || !reflect.DeepEqual(semantic, &decoded) {
+		t.Fatalf("list scalar semantic roundtrip failed: %s / %v", encoded, err)
+	}
+}
+
+func TestLiteralListsDoNotFabricateReferences(t *testing.T) {
+	for _, operator := range []string{"in", "!in", "in~", "!in~", "has_any", "has_all"} {
+		r := ExtractConditions(`T | where a ` + operator + ` ("token")`)
+		if len(r.Conditions) != 1 || r.Conditions[0].Value != "token" || r.Conditions[0].ValueReference != "" {
+			t.Errorf("literal confused with reference: %s: %#v", operator, r)
+		}
+	}
+}
+
+func TestRangeBoundsKeepTypedReferences(t *testing.T) {
+	for _, operator := range []string{"between", "!between"} {
+		for _, bounds := range []string{`low .. high`, `['5'] .. 10`, `1 .. ['high']`} {
+			r := ExtractConditions(`T | where a ` + operator + ` (` + bounds + `)`)
+			if len(r.Conditions) != 2 {
+				t.Fatalf("range lost: %s %s: %#v", operator, bounds, r)
+			}
+			wantRefs := map[string][2]string{`low .. high`: {"low", "high"}, `['5'] .. 10`: {"5", ""}, `1 .. ['high']`: {"", "high"}}[bounds]
+			for index, condition := range r.Conditions {
+				if condition.ValueReference != wantRefs[index] || wantRefs[index] != "" && condition.Value != "" || condition.Negated != (operator == "!between") {
+					t.Errorf("bound typing changed: %s %s: %#v", operator, bounds, condition)
+				}
+			}
+		}
+	}
+	for _, predicate := range []string{`a between (rand() .. 10)`, `a between (1 .. high + 1)`} {
+		r := ExtractConditions(`T | where ` + predicate)
+		if leaves := scalarLeaves(r.Expression); len(r.Conditions) != 0 || len(leaves) != 1 || leaves[0].Text != predicate {
+			t.Errorf("computed range changed: %s: %#v", predicate, r)
+		}
+	}
+}

@@ -183,7 +183,7 @@ func TestExtractConditions_InSubqueryUsesPlaceholder(t *testing.T) {
 	result := ExtractConditions(`SecurityEvent | where Account in ((SigninLogs | where ResultType != 0 | project UserPrincipalName))`)
 	for _, condition := range result.Conditions {
 		if condition.Field == "Account" {
-			if condition.Value != SubqueryPlaceholder {
+			if condition.Value != SubqueryPlaceholder || condition.ValueReference != "" {
 				t.Fatalf("membership in a subquery = %+v, want value %q", condition, SubqueryPlaceholder)
 			}
 			return

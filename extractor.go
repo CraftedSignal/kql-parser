@@ -2550,7 +2550,8 @@ func indexByteOutsideStrings(s string, needle byte, start int) int {
 
 // SubqueryPlaceholder is the value of a membership condition whose values
 // come from a subquery, as in Account in (SigninLogs | project Account): the
-// parser does not evaluate the subquery.
+// parser does not evaluate the subquery. This is an unresolved legacy marker,
+// not literal executable membership; normalization discards the subquery text.
 const SubqueryPlaceholder = "SubqueryResult"
 
 func normalizeInSubqueries(query string) string {
@@ -2605,7 +2606,9 @@ func normalizeInSubqueries(query string) string {
 		}
 
 		b.WriteString(query[lastCopied : i+1])
-		b.WriteString(SubqueryPlaceholder)
+		// A synthetic literal distinguishes this legacy unresolved marker
+		// from a genuine reference to a column named SubqueryResult.
+		b.WriteString(strconv.Quote(SubqueryPlaceholder))
 		lastCopied = close
 		changed = true
 		i = close
@@ -5625,6 +5628,17 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 				return
 			}
 		}
+		if list := ctx.ExpressionList(); list != nil {
+			// Alternatives have no per-value reference metadata. Only proven
+			// literals can be lowered; computed or tabular/list expressions
+			// must remain one unevaluated scalar predicate.
+			for _, expression := range list.AllExpression() {
+				if !recognizeKQLOperand(expression).literal {
+					scalar()
+					return
+				}
+			}
+		}
 	}
 
 	// Handle IN operator: field in (values) - including case-sensitive variants (in~, !in~)
@@ -5654,10 +5668,19 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 		addExprs := ctx.AllAdditiveExpression()
 		if len(addExprs) >= 3 {
 			leftText := recognizeKQLOperand(addExprs[0]).text
-			lowValue := addExprs[1].GetText()
-			highValue := addExprs[2].GetText()
+			low := recognizeKQLOperand(addExprs[1])
+			high := recognizeKQLOperand(addExprs[2])
 			isNegated := (ctx.NOT_BETWEEN() != nil) != e.negated
-			e.handleBetweenOperator(leftText, lowValue, highValue, isNegated)
+			start := len(e.conditions)
+			e.handleBetweenOperator(leftText, low.text, high.text, isNegated)
+			if len(e.conditions) == start+2 {
+				for index, bound := range []kqlOperand{low, high} {
+					if bound.reference {
+						e.conditions[start+index].ValueReference = bound.text
+						e.conditions[start+index].Value = ""
+					}
+				}
+			}
 		}
 		return
 	}
@@ -5751,8 +5774,10 @@ func (e *conditionExtractor) handleInOperator(field string, exprList IExpression
 		IsComputed:   isComputed,
 		SourceField:  sourceField,
 	}
-	if len(values) == 1 && isSimpleIdentifier(values[0]) {
-		cond.ValueReference = values[0]
+	if expressions := exprList.AllExpression(); len(expressions) == 1 {
+		if operand := recognizeKQLOperand(expressions[0]); operand.reference {
+			cond.ValueReference = operand.text
+		}
 	}
 	e.conditions = append(e.conditions, cond)
 	e.lastLogicalOp = "AND"
@@ -7292,7 +7317,11 @@ func extractExpressionListValues(ctx IExpressionListContext) []string {
 
 	var values []string
 	for _, expr := range ctx.AllExpression() {
-		values = append(values, extractValue(expr.GetText()))
+		text := expr.GetText()
+		if operand := recognizeKQLOperand(expr); operand.literal {
+			text = operand.text
+		}
+		values = append(values, extractValue(text))
 	}
 	return values
 }

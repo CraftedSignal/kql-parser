@@ -33,6 +33,23 @@ statements with unambiguous bindings; function scopes and column assignments
 that may shadow a binding disable it. Consumers need the retained bindings to
 interpret unresolved scalar text.
 
+Null/empty checks with constant or computed arguments, and list operators
+with computed or reference operands, now remain complete scalar predicates.
+Literal list elements remain condition values; quoted literals never become
+references. Representable range bounds use `ValueReference` for columns and
+`Value` for literals.
+
+The existing IN-subquery placeholder is a legacy exception: normalization
+still discards the subquery and projects membership as a condition whose
+`Value` is `SubqueryPlaceholder` (`"SubqueryResult"`). This is an unresolved
+subquery marker, not an executable literal membership test or preservation
+of the original subquery source. Consumers must treat that marker as
+unsupported unless they resolve the subquery independently. Normalized input
+quotes this synthetic marker to distinguish it from a genuine unquoted column
+reference named `SubqueryResult`, which remains scalar. A user-authored string
+literal `"SubqueryResult"` still collides with the public legacy marker; this
+schema has no provenance field to distinguish those cases.
+
 This parser change does not update or release the platform dependency. Before
 adopting it, the platform adapter must handle scalar leaves or return an
 unsupported-expression error. In particular, `kqlExpressionToDomain` must

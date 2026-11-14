@@ -180,7 +180,7 @@ func TestNormalizeQuery_InSubqueriesUsePlaceholderOutsideStrings(t *testing.T) {
 | where app == "OAuth"`
 
 	normalized := NormalizeQueryForDebug(query)
-	if !strings.Contains(normalized, `new !in (SubqueryResult)`) {
+	if !strings.Contains(normalized, `new !in ("SubqueryResult")`) {
 		t.Fatalf("normalization should replace tabular in() subquery, got:\n%s", normalized)
 	}
 
