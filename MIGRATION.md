@@ -63,3 +63,42 @@ unsupported-expression error. In particular, `kqlExpressionToDomain` must
 reject unknown leaves instead of returning nil, `convertParserBooleanChildren`
 must not skip nil AND children, and adapter fallback must not discard scalar
 branches by rebuilding an expression from flat conditions.
+
+## Opaque search predicates
+
+Explicit `search` operators now produce a `BooleanSearch` (`"search"`) leaf in
+both expression APIs, with `Search *SearchPredicate`. Its `Text` is the complete
+original search predicate source, including Boolean syntax, literal spelling,
+comments and internal whitespace. This is stronger than the normalized-source
+contract of ordinary scalar leaves. `Kind` retains the authored search mode;
+`Scope` is `input`, `database`, or `tables`. `TableSources` preserves ordered,
+unresolved selector fragments. `PipeStage` and `Pipeline` retain ownership.
+Semantic conversion deep-clones selector slices.
+
+Search terms are no longer fabricated as `_keyword_ contains` Conditions.
+Consumers must handle the search leaf or explicitly reject it; rebuilding from
+flat Conditions or treating its Text as an ordinary where scalar loses search
+scope, mode, matching rules and output-schema effects. Consecutive filter stages
+are connected by AND, but pipeline/stage metadata does not authorize moving them
+across transformations. Search predicates remain opaque; repeated occurrences
+are preserved and no evaluator, wildcard compiler or schema lookup is provided.
+
+Malformed search syntax, unsupported modes/selectors, and input combined with
+an explicit table scope return failure-only results, consistently with Validate.
+There is no first-term keyword or partial-where recovery for these searches.
+Bare `not term` is retained as a local compatibility form; this does not assert
+that Kusto services accept it. No consumer dependency is updated by this change.
+
+## Condition postprocessing identity correction
+
+OR alternatives now combine only literal predicates with the same exact column,
+operator, source field, pipe stage, and pipeline. Case-distinct columns and
+right-hand field references remain separate expression leaves. This corrects
+previously lossy grouping such as `User == "a" or user == "b"` and
+`x == y or x == z`.
+
+`DeduplicateConditions` uses complete condition identity and keeps source order.
+Its existing latest-stage projection now runs independently for each exact
+field and pipeline. It preserves literal equality to `"*"`; that value is a
+literal, not an unrestricted search. This helper projects flat conditions and
+does not replace the expression tree or simplify its Boolean semantics.

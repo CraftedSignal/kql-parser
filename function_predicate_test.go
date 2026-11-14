@@ -219,8 +219,8 @@ func TestStructuredQueriesRetainSearchKeywordFilters(t *testing.T) {
 	} {
 		t.Run(query, func(t *testing.T) {
 			result := ExtractConditions(query)
-			if len(result.Conditions) != 1 || result.Conditions[0].Field != "_keyword_" || result.Conditions[0].Value != "needle" {
-				t.Fatalf("search condition missing: %#v errors=%v", result.Conditions, result.Errors)
+			if leaves := searchLeaves(result.Expression); len(result.Errors) != 0 || len(result.Conditions) != 0 || len(leaves) != 1 || leaves[0].Text != `"needle"` {
+				t.Fatalf("opaque search missing: %#v errors=%v", result.Expression, result.Errors)
 			}
 		})
 	}

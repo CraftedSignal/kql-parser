@@ -5,18 +5,19 @@ import "testing"
 func TestKQLSearchKeywordPreservedWithWherePredicate(t *testing.T) {
 	result := ExtractConditions(`search "needle" | where EventID == 4688`)
 
-	requireKQLCondition(t, result.Conditions, "_keyword_", "contains", "needle", false)
 	requireKQLCondition(t, result.Conditions, "EventID", "==", "4688", false)
-	if !containsTestString(result.Errors, portableKeywordExtractionNote) {
-		t.Fatalf("expected keyword extraction note, got %v", result.Errors)
+	if leaves := searchLeaves(result.Expression); len(result.Errors) != 0 || len(leaves) != 1 || leaves[0].Text != `"needle"` || leaves[0].Scope != "database" {
+		t.Fatalf("complete search missing: %#v", result)
 	}
 }
 
 func TestKQLSearchInKeywordPreservedWithWherePredicate(t *testing.T) {
 	result := ExtractConditions(`search kind=case_sensitive in (OfficeActivity, SigninLogs) "needle" | where Operation == "FileDownloaded"`)
 
-	requireKQLCondition(t, result.Conditions, "_keyword_", "contains", "needle", false)
 	requireKQLCondition(t, result.Conditions, "Operation", "==", "FileDownloaded", false)
+	if leaves := searchLeaves(result.Expression); len(result.Errors) != 0 || len(leaves) != 1 || leaves[0].Text != `"needle"` || leaves[0].Kind != "case_sensitive" || leaves[0].Scope != "tables" || len(leaves[0].TableSources) != 2 {
+		t.Fatalf("complete scoped search missing: %#v", result)
+	}
 }
 
 func TestKQLWhereStringLiteralDoesNotBecomeKeywordWhenPredicateExists(t *testing.T) {
@@ -55,13 +56,4 @@ func TestKQLLeadingSearchKeywordExtractorEdges(t *testing.T) {
 			t.Fatalf("extractLeadingSearchKeyword(%q) = %q, want empty", query, got)
 		}
 	}
-}
-
-func containsTestString(values []string, needle string) bool {
-	for _, value := range values {
-		if value == needle {
-			return true
-		}
-	}
-	return false
 }

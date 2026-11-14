@@ -477,6 +477,13 @@ func TestExtractConditions_PortableKeywordExtraction(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := ExtractConditions(tt.query)
+			if tt.name == "search in keyword" {
+				leaves := searchLeaves(result.Expression)
+				if len(result.Errors) != 0 || len(result.Conditions) != 0 || len(leaves) != 1 || leaves[0].Text != `"username"` || leaves[0].Scope != "tables" || len(leaves[0].TableSources) != 1 || leaves[0].TableSources[0] != tt.wantSource || !containsString(result.DataSources, tt.wantSource) {
+					t.Fatalf("explicit search was lowered or lost: %#v / %#v", result, leaves)
+				}
+				return
+			}
 			if len(result.Conditions) != 1 {
 				t.Fatalf("expected one keyword extraction condition, got %d: %+v errors=%v", len(result.Conditions), result.Conditions, result.Errors)
 			}

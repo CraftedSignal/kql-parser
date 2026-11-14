@@ -80,7 +80,8 @@ tabularExpression
     ;
 
 tabularSource
-    : tableName
+    : searchOperator
+    | tableName
     | functionCall
     | LPAREN tabularExpression RPAREN
     | RANGE identifier FROM expression TO expression STEP expression
@@ -166,8 +167,28 @@ whereOperator
 // -----------------------------------------------------------------------------
 
 searchOperator
-    : SEARCH searchKind? (IN LPAREN tableList RPAREN)? expression
+    : SEARCH searchKind? (IN LPAREN searchTableSource (COMMA searchTableSource)* RPAREN)? searchPredicate
     ;
+
+// Opaque search predicates have search-local column terms and adjacent strings.
+// Ordinary where/expression rules deliberately do not accept column:term syntax.
+searchPredicate : searchOrExpression ;
+searchOrExpression : searchAndExpression (OR searchAndExpression)* ;
+searchAndExpression : searchNotExpression (AND searchNotExpression)* ;
+searchNotExpression : NOT searchNotExpression | searchAtom ;
+searchAtom
+    : LPAREN searchPredicate RPAREN
+    | (identifier | QUOTED_IDENTIFIER) COLON searchStringTerm
+    | searchStringTerm
+    | comparisonExpression
+    ;
+searchStringTerm : (STRING_LITERAL | VERBATIM_STRING | MULTILINE_STRING)+ ;
+
+// These remain unresolved source fragments. Literal qualifier names/ordering
+// and contiguous wildcard components are checked by the shared search validator.
+searchTableSource : (searchQualifier DOT)* searchTableComponent (DOT searchTableComponent)* ;
+searchQualifier : identifier LPAREN searchStringTerm RPAREN ;
+searchTableComponent : identifier (STAR identifier?)* | STAR (identifier STAR?)* | QUOTED_IDENTIFIER ;
 
 searchKind
     : KIND ASSIGN identifier

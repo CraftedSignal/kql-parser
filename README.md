@@ -21,8 +21,21 @@ A production-ready Go parser for Kusto Query Language (KQL), built with ANTLR4. 
 go get github.com/craftedsignal/kql-parser
 ```
 
-See [scalar predicate migration](MIGRATION.md) before consuming expression trees
+See [predicate migration](MIGRATION.md) before consuming expression trees
 or upgrading an adapter that uses only flat conditions.
+
+Explicit `search` filters are preserved as opaque `BooleanSearch` leaves with a
+`SearchPredicate` payload. For `T | search "alpha" or not("beta")`, `Text` is
+exactly `"alpha" or not("beta")`, `Scope` is `input`, and the leaf retains its
+pipeline and stage. Search kind and ordered unresolved table selectors are also
+retained. Consumers must handle or reject these leaves: search no longer emits
+fabricated `_keyword_` Conditions. See the migration guide for failure semantics
+and the distinction from normalized ordinary scalar predicates.
+
+OR grouping and `DeduplicateConditions` now distinguish case-sensitive column
+names, right-hand field references, stages, and pipelines. Literal equality to
+`"*"` is retained. The dedup helper keeps only the latest stage for each exact
+field and pipeline in source order; use `Expression` for Boolean semantics.
 
 ## Usage
 

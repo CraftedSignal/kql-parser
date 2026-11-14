@@ -15,7 +15,7 @@ fmt:
 generate:
 	@echo "Generating parser from ANTLR grammar..."
 	@command -v antlr4 >/dev/null 2>&1 || { echo "antlr4 is required but not installed. Install with: brew install antlr"; exit 1; }
-	antlr4 -Dlanguage=Go -visitor -listener -o . KQLLexer.g4 KQLParser.g4
+	antlr4 -Dlanguage=Go -package kql -visitor -listener -o . KQLLexer.g4 KQLParser.g4
 	@echo "Done."
 
 clean:

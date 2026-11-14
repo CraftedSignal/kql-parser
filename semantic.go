@@ -24,6 +24,7 @@ type SemanticQuery struct {
 type SemanticExpression struct {
 	Operator  BooleanOperator       `json:"operator"`
 	Scalar    *ScalarPredicate      `json:"scalar,omitempty"`
+	Search    *SearchPredicate      `json:"search,omitempty"`
 	Condition *Condition            `json:"condition,omitempty"`
 	Children  []*SemanticExpression `json:"children,omitempty"`
 }
@@ -99,6 +100,9 @@ func semanticExpressionFromParseExpression(expression *ConditionExpression, cond
 	}
 
 	switch expression.Operator {
+	case BooleanSearch:
+		budget.reserveOutput(1)
+		return &SemanticExpression{Operator: BooleanSearch, Search: cloneSearchPredicate(expression.Search, budget)}
 	case BooleanScalar:
 		budget.reserveOutput(1)
 		return &SemanticExpression{Operator: BooleanScalar, Scalar: cloneScalarPredicate(expression.Scalar, budget)}

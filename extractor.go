@@ -150,6 +150,9 @@ type conditionExtractor struct {
 	lastLogicalOp       string
 	errors              []string
 	expressionLeaves    map[IComparisonExpressionContext]*ConditionExpression
+	searchLeaves        map[ISearchOperatorContext]*ConditionExpression
+	searchOrder         []ISearchOperatorContext
+	inSearch            int
 	letNames            map[string]bool
 	subqueryMarkers     []int // Rune offsets of synthetic unresolved IN-subquery literals
 	unsupportedSubquery bool
@@ -201,7 +204,16 @@ func normalizeBudgeted(query string, strict bool, budget *parseBudget) string {
 func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, metadata *kqlNormalizationMetadata) string {
 	budget.input(query)
 	budget.step()
-	normalized := query
+	if !strict {
+		// Select the same main query before shielding its newlines. Keep let
+		// prefixes available for the existing scoped constant normalization.
+		if start := skipLetStatements(query); start < len(query) {
+			query = query[:start] + extractMainQuery(query)
+		}
+	}
+	// Let bodies are intentionally outside the selected query. A search in the
+	// selected portion must survive every later normalization rewrite.
+	normalized, searches := protectSearchClauses(query, budget, skipLetStatements(query))
 
 	// Remove line continuation backslashes (backslash followed by newline)
 	// Common in PowerShell-style queries copied from scripts
@@ -466,7 +478,7 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 	if metadata != nil {
 		// Earlier normalization can construct authored strings by joining
 		// adjacent literals. Select provenance markers only after that step.
-		*metadata = *newKQLNormalizationMetadata(normalized, budget)
+		*metadata = *newKQLNormalizationMetadata(normalized+"\n"+query, budget)
 		placeholder = metadata.subqueryMarker
 	}
 	normalized = normalizeInSubqueriesWithPlaceholder(normalized, placeholder, budget)
@@ -538,7 +550,7 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 
 	// Handle search operator: search in (Table1, Table2) "pattern" -> simplified form
 	// The search operator needs special handling
-	normalized = normalizeSearchOperator(normalized)
+	// Search clauses stay tabular operators, protected from lossy rewrites.
 	budget.input(normalized)
 	budget.step()
 
@@ -578,8 +590,10 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 	budget.input(normalized)
 	budget.step()
 
+	normalized = searches.restore(normalized, budget)
 	if metadata != nil {
 		normalized = metadata.restoreSubqueryMarkers(normalized, budget)
+		metadata.searchCount = searches.restored
 	}
 	return normalized
 }
@@ -4957,72 +4971,7 @@ func normalizePartitionOperator(query string) string {
 // search in (T1, T2) "pattern" -> DummyTable | where * contains "pattern"
 // search kind=case_sensitive in (T) "pattern" -> DummyTable | where * contains "pattern"
 // search "pattern" -> DummyTable | where * contains "pattern"
-func normalizeSearchOperator(query string) string {
-	trimmed := strings.TrimSpace(query)
-	lowerQuery := strings.ToLower(trimmed)
-
-	// Check if query starts with "search"
-	if !strings.HasPrefix(lowerQuery, "search") {
-		return query
-	}
-
-	// Skip past "search" keyword
-	i := 6
-
-	// Skip any "kind=..." parameter
-	rest := strings.TrimSpace(trimmed[i:])
-	lowerRest := strings.ToLower(rest)
-	if strings.HasPrefix(lowerRest, "kind=") {
-		// Skip past kind=value
-		spaceIdx := strings.IndexAny(rest, " \t\n")
-		if spaceIdx == -1 {
-			return query // malformed
-		}
-		rest = strings.TrimSpace(rest[spaceIdx:])
-		lowerRest = strings.ToLower(rest)
-	}
-
-	// Skip "in (tables)" if present
-	if strings.HasPrefix(lowerRest, "in ") || strings.HasPrefix(lowerRest, "in(") {
-		// Find the closing paren
-		openIdx := strings.Index(rest, "(")
-		if openIdx != -1 {
-			depth := 1
-			closeIdx := openIdx + 1
-			for closeIdx < len(rest) && depth > 0 {
-				switch rest[closeIdx] {
-				case '(':
-					depth++
-				case ')':
-					depth--
-				}
-				closeIdx++
-			}
-			if depth == 0 {
-				rest = strings.TrimSpace(rest[closeIdx:])
-			}
-		}
-	}
-
-	// Now rest should be the search pattern (e.g., "JIT", '*pattern*')
-	// or a pipe followed by more operators
-	if len(rest) == 0 {
-		return "DummyTable"
-	}
-
-	// If there's a search pattern, the grammar expects "search expression"
-	// but the grammar's search isn't being recognized, so just skip search entirely
-	// and convert to a dummy table with any following pipe stages
-
-	if strings.HasPrefix(rest, "|") {
-		// There are more pipe stages, use them
-		return "DummyTable " + rest
-	}
-
-	// The rest is a search expression - just use DummyTable
-	// We can't easily extract conditions from search patterns
-	return "DummyTable"
-}
+func normalizeSearchOperator(query string) string { return query }
 
 // isValidParamName checks if a string looks like a valid parameter name
 // Allows alphanumeric, underscore, colon (for workbook params like {_TimeRange:value})
@@ -5082,6 +5031,13 @@ func extractConditionsInternal(query string, budget *parseBudget) (result *Parse
 
 	// Parse the query
 	tree := parser.Query()
+	searchCount, searchError := validateKQLSearches(tree, budget)
+	if (normalization.searchCount > 0 || searchCount > 0) && (searchCount != normalization.searchCount || searchError != "" || len(lexerErrors.errors) > 0 || len(parserErrors.errors) > 0) {
+		if searchError == "" {
+			searchError = "malformed or unsupported search syntax"
+		}
+		return &ParseResult{Conditions: []Condition{}, Errors: []string{searchError}}
+	}
 
 	// Walk the tree to extract conditions
 	extractor := &conditionExtractor{
@@ -5154,9 +5110,14 @@ func extractConditionsInternal(query string, budget *parseBudget) (result *Parse
 			allErrors = append(allErrors, note)
 		}
 	}
-	keyword := extractLeadingSearchKeyword(query[skipLetStatements(query):])
+	keyword := ""
+	if searchCount == 0 {
+		keyword = extractLeadingSearchKeyword(query[skipLetStatements(query):])
+	}
 	if keyword == "" {
-		keyword = extractParsedKQLSearchKeyword(tree, budget)
+		if searchCount == 0 {
+			keyword = extractParsedKQLSearchKeyword(tree, budget)
+		}
 	}
 	if keyword != "" {
 		condition := portableKeywordCondition(keyword)
@@ -5173,6 +5134,9 @@ func extractConditionsInternal(query string, budget *parseBudget) (result *Parse
 	}
 
 	dataSources := extractPortableDataSources(query, normalizedQuery)
+	if searchCount > 0 {
+		dataSources = searchSources(extractor, budget)
+	}
 	budget.outputSize(len(conditions))
 	budget.check()
 
@@ -5196,6 +5160,9 @@ func extractConditionsInternal(query string, budget *parseBudget) (result *Parse
 
 // EnterJoinOperator extracts join metadata and recursively parses the right side
 func (e *conditionExtractor) EnterJoinOperator(ctx *JoinOperatorContext) {
+	if e.inSearch > 0 {
+		return
+	}
 	e.commands = append(e.commands, "join")
 
 	info := JoinInfo{
@@ -5252,6 +5219,9 @@ func (e *conditionExtractor) EnterJoinOperator(ctx *JoinOperatorContext) {
 
 // ExitJoinOperator decrements subquery depth when leaving a join with a subquery
 func (e *conditionExtractor) ExitJoinOperator(ctx *JoinOperatorContext) {
+	if e.inSearch > 0 {
+		return
+	}
 	if ctx.TabularExpression() != nil {
 		e.inSubquery--
 	}
@@ -5262,17 +5232,15 @@ func (e *conditionExtractor) extractTabularExpressionText(ctx ITabularExpression
 	if ctx == nil {
 		return ""
 	}
-	start := ctx.GetStart()
-	stop := ctx.GetStop()
-	if start == nil || stop == nil {
-		return ctx.GetText()
+	// Token offsets are runes. Prefer the normalized query for both production
+	// and synthetic contexts so a missing token stream does not drop text.
+	if start, stop := ctx.GetStart(), ctx.GetStop(); start != nil && stop != nil {
+		positions := searchRuneBytes(e.originalQuery, e.budget)
+		if start.GetStart() >= 0 && stop.GetStop() >= start.GetStart() && stop.GetStop()+1 < len(positions) {
+			return e.originalQuery[positions[start.GetStart()]:positions[stop.GetStop()+1]]
+		}
 	}
-	startPos := start.GetStart()
-	stopPos := stop.GetStop()
-	if startPos >= 0 && stopPos >= startPos && stopPos < len(e.originalQuery) {
-		return e.originalQuery[startPos : stopPos+1]
-	}
-	return ctx.GetText()
+	return kqlSourceText(ctx, e.budget)
 }
 
 // deriveExposedFields determines what fields the right side of a join makes available
@@ -5374,11 +5342,17 @@ func ClassifyFieldProvenance(result *ParseResult, field string) FieldProvenance 
 // EnterTabularOperator records the stage of the operator, which pipelines
 // nested in it, such as union inputs, are fed into.
 func (e *conditionExtractor) EnterTabularOperator(ctx *TabularOperatorContext) {
+	if e.inSearch > 0 {
+		return
+	}
 	e.operatorStages = append(e.operatorStages, e.currentStage)
 }
 
 // ExitTabularOperator increments the stage counter after processing each operator
 func (e *conditionExtractor) ExitTabularOperator(ctx *TabularOperatorContext) {
+	if e.inSearch > 0 {
+		return
+	}
 	e.operatorStages = e.operatorStages[:len(e.operatorStages)-1]
 	e.currentStage++
 	if pipeline := e.currentPipeline(); pipeline >= 0 {
@@ -5389,6 +5363,9 @@ func (e *conditionExtractor) ExitTabularOperator(ctx *TabularOperatorContext) {
 // EnterTabularExpression starts a pipeline: the query, or one nested in the
 // current pipeline.
 func (e *conditionExtractor) EnterTabularExpression(ctx *TabularExpressionContext) {
+	if e.inSearch > 0 {
+		return
+	}
 	operator := "subquery"
 	switch ctx.GetParent().(type) {
 	case *QueryContext, *TabularSourceContext, *MaterializeExpressionContext:
@@ -5412,12 +5389,18 @@ func (e *conditionExtractor) EnterTabularExpression(ctx *TabularExpressionContex
 
 // ExitTabularExpression ends the current pipeline.
 func (e *conditionExtractor) ExitTabularExpression(ctx *TabularExpressionContext) {
+	if e.inSearch > 0 {
+		return
+	}
 	e.pipelineStack = e.pipelineStack[:len(e.pipelineStack)-1]
 }
 
 // EnterUnionTable records a union input that names a table as a pipeline
 // without operators; a parenthesized input starts its own pipeline.
 func (e *conditionExtractor) EnterUnionTable(ctx *UnionTableContext) {
+	if e.inSearch > 0 {
+		return
+	}
 	if ctx.TableName() != nil {
 		e.pushPipeline("union", ctx.TableName().GetText())
 		e.pipelineStack = e.pipelineStack[:len(e.pipelineStack)-1]
@@ -5469,6 +5452,9 @@ func (e *conditionExtractor) EnterLetStatement(ctx *LetStatementContext) {
 // This prevents post-aggregation filters (| where FailedAttempts > 5) from being
 // treated as required raw data fields in test validation.
 func (e *conditionExtractor) EnterAggregationItem(ctx *AggregationItemContext) {
+	if e.inSearch > 0 {
+		return
+	}
 	// Two grammar forms:
 	//   identifier ASSIGN aggregationFunction   (e.g., EventCount = count())
 	//   aggregationFunction AS identifier        (e.g., count() as EventCount)
@@ -5543,6 +5529,9 @@ func defaultAggregationColumn(function, field string) string {
 
 // EnterGroupByItem extracts field names from summarize BY clauses.
 func (e *conditionExtractor) EnterGroupByItem(ctx *GroupByItemContext) {
+	if e.inSearch > 0 {
+		return
+	}
 	if e.inSubquery > 0 {
 		return
 	}
@@ -5567,6 +5556,9 @@ func (e *conditionExtractor) EnterGroupByItem(ctx *GroupByItemContext) {
 
 // EnterExtendItem tracks computed fields from extend
 func (e *conditionExtractor) EnterExtendItem(ctx *ExtendItemContext) {
+	if e.inSearch > 0 {
+		return
+	}
 	// Track field assignments in extend with source field extraction
 	if ctx.Identifier() != nil {
 		field := ctx.Identifier().GetText()
@@ -5684,6 +5676,9 @@ func isIdentStart(c byte) bool {
 
 // EnterProjectItem tracks renamed fields from project
 func (e *conditionExtractor) EnterProjectItem(ctx *ProjectItemContext) {
+	if e.inSearch > 0 {
+		return
+	}
 	if e.inSubquery > 0 {
 		return
 	}
@@ -5711,6 +5706,9 @@ func (e *conditionExtractor) EnterProjectItem(ctx *ProjectItemContext) {
 // EnterRenameItem tracks project-rename columns as computed from the column
 // they rename.
 func (e *conditionExtractor) EnterRenameItem(ctx *RenameItemContext) {
+	if e.inSearch > 0 {
+		return
+	}
 	if e.inSubquery > 0 {
 		return
 	}
@@ -5725,6 +5723,9 @@ func (e *conditionExtractor) EnterRenameItem(ctx *RenameItemContext) {
 
 // EnterComparisonExpression extracts field comparisons
 func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpressionContext) {
+	if e.inSearch > 0 {
+		return
+	}
 	if e.inSubquery > 0 || e.inFunctionCall > 0 {
 		return
 	}
@@ -6092,7 +6093,7 @@ func (e *conditionExtractor) EnterOrExpression(_ *OrExpressionContext) {}
 func (e *conditionExtractor) ExitAndExpression(ctx *AndExpressionContext) {
 	// Boolean expressions inside scalar/aggregation arguments do not connect
 	// the surrounding row filters.
-	if e.inFunctionCall > 0 {
+	if e.inFunctionCall > 0 || e.inSearch > 0 {
 		return
 	}
 	orCtx, ok := ctx.GetParent().(*OrExpressionContext)
@@ -6608,8 +6609,8 @@ func extractParsedKQLSearchKeyword(query IQueryContext, budget *parseBudget) str
 	if tabular := query.TabularExpression(); tabular != nil {
 		for _, operator := range tabular.AllTabularOperator() {
 			budget.step()
-			if search := operator.SearchOperator(); search != nil && search.Expression() != nil {
-				if keyword, _, ok := parseStringLiteral(search.Expression().GetText()); ok && !looksLikeURL(keyword) {
+			if search := operator.SearchOperator(); search != nil && search.SearchPredicate() != nil {
+				if keyword, _, ok := parseStringLiteral(search.SearchPredicate().GetText()); ok && !looksLikeURL(keyword) {
 					return keyword
 				}
 			}
@@ -7656,12 +7657,19 @@ func canMergeAlternativeGroup(conditions []Condition, index int) bool {
 }
 
 func sameConditionGroup(a, b Condition) bool {
-	return strings.EqualFold(a.Field, b.Field) &&
+	// Alternatives encode literal values on one field. References and computed
+	// expressions need their complete predicates, even when names look alike.
+	return a.Field == b.Field &&
 		a.Operator == b.Operator &&
 		!a.Negated &&
 		!b.Negated &&
-		a.IsComputed == b.IsComputed &&
-		strings.EqualFold(a.SourceField, b.SourceField)
+		!a.IsComputed &&
+		!b.IsComputed &&
+		a.ValueReference == "" &&
+		b.ValueReference == "" &&
+		a.SourceField == b.SourceField &&
+		a.PipeStage == b.PipeStage &&
+		a.Pipeline == b.Pipeline
 }
 
 func conditionAlternatives(cond Condition) []string {
@@ -7683,65 +7691,60 @@ func deduplicateConditionValues(values []string) []string {
 	return result
 }
 
-func conditionDedupKey(cond Condition) string {
-	return strings.ToLower(cond.Field) + "|" +
-		cond.Operator + "|" +
-		cond.Value + "|" +
-		boolKey(cond.Negated) + "|" +
-		boolKey(cond.IsComputed) + "|" +
-		strings.ToLower(cond.SourceField) + "|" +
-		strings.Join(cond.Alternatives, "\x00")
+type conditionIdentity struct {
+	field, operator, value, valueReference string
+	logicalOp, sourceField, alternatives   string
+	negated, isComputed, alternativesNil   bool
+	pipeStage, pipeline, alternativesLen   int
 }
 
-func boolKey(value bool) string {
-	if value {
-		return "1"
+func conditionDedupKey(cond Condition) conditionIdentity {
+	var alternatives strings.Builder
+	for _, value := range cond.Alternatives {
+		alternatives.WriteString(strconv.Itoa(len(value)))
+		alternatives.WriteByte(':')
+		alternatives.WriteString(value)
 	}
-	return "0"
+	return conditionIdentity{
+		field: cond.Field, operator: cond.Operator, value: cond.Value,
+		valueReference: cond.ValueReference, logicalOp: cond.LogicalOp,
+		sourceField: cond.SourceField, alternatives: alternatives.String(),
+		negated: cond.Negated, isComputed: cond.IsComputed,
+		alternativesNil: cond.Alternatives == nil,
+		pipeStage:       cond.PipeStage, pipeline: cond.Pipeline,
+		alternativesLen: len(cond.Alternatives),
+	}
 }
 
-// DeduplicateConditions removes duplicate conditions, keeping the latest pipe stage
+// DeduplicateConditions projects each exact field and pipeline to its latest
+// pipe stage, then removes only identical conditions in original source order.
 func DeduplicateConditions(conditions []Condition) []Condition {
 	if len(conditions) == 0 {
 		return conditions
 	}
-
-	// Group by field (case-insensitive)
-	fieldConditions := make(map[string][]Condition)
+	type fieldPipeline struct {
+		field    string
+		pipeline int
+	}
+	latest := make(map[fieldPipeline]int, len(conditions))
 	for _, cond := range conditions {
-		// Skip pure wildcards
-		if cond.Value == "*" {
+		key := fieldPipeline{cond.Field, cond.Pipeline}
+		if stage, ok := latest[key]; !ok || cond.PipeStage > stage {
+			latest[key] = cond.PipeStage
+		}
+	}
+	result := make([]Condition, 0, len(conditions))
+	seen := make(map[conditionIdentity]bool, len(conditions))
+	for _, cond := range conditions {
+		if cond.PipeStage != latest[fieldPipeline{cond.Field, cond.Pipeline}] {
 			continue
 		}
-		fieldLower := strings.ToLower(cond.Field)
-		fieldConditions[fieldLower] = append(fieldConditions[fieldLower], cond)
-	}
-
-	// Keep only conditions from the latest pipe stage for each field
-	result := make([]Condition, 0)
-	seen := make(map[string]bool)
-
-	for _, conds := range fieldConditions {
-		// Find max pipe stage
-		maxStage := -1
-		for _, c := range conds {
-			if c.PipeStage > maxStage {
-				maxStage = c.PipeStage
-			}
-		}
-
-		// Keep only conditions from max stage
-		for _, cond := range conds {
-			if cond.PipeStage == maxStage {
-				key := conditionDedupKey(cond)
-				if !seen[key] {
-					seen[key] = true
-					result = append(result, cond)
-				}
-			}
+		key := conditionDedupKey(cond)
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, cond)
 		}
 	}
-
 	return result
 }
 

@@ -98,8 +98,8 @@ func TestKQLLiteralLetKeywordAndDedupRemainingEdges(t *testing.T) {
 	if deduped := DeduplicateConditions(nil); deduped != nil {
 		t.Fatalf("nil dedupe = %#v", deduped)
 	}
-	if deduped := DeduplicateConditions([]Condition{{Field: "Any", Operator: "==", Value: "*", PipeStage: 9}}); len(deduped) != 0 {
-		t.Fatalf("wildcard-only dedupe = %#v", deduped)
+	if deduped := DeduplicateConditions([]Condition{{Field: "Any", Operator: "==", Value: "*", PipeStage: 9}}); len(deduped) != 1 || deduped[0].Value != "*" {
+		t.Fatalf("literal-star dedupe = %#v", deduped)
 	}
 }
 

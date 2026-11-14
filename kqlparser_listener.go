@@ -1,7 +1,6 @@
 // Code generated from KQLParser.g4 by ANTLR 4.13.2. DO NOT EDIT.
 
-package kql
-
+package kql // KQLParser
 import "github.com/antlr4-go/antlr/v4"
 
 // KQLParserListener is a complete listener for a parse tree produced by KQLParser.
@@ -64,6 +63,33 @@ type KQLParserListener interface {
 
 	// EnterSearchOperator is called when entering the searchOperator production.
 	EnterSearchOperator(c *SearchOperatorContext)
+
+	// EnterSearchPredicate is called when entering the searchPredicate production.
+	EnterSearchPredicate(c *SearchPredicateContext)
+
+	// EnterSearchOrExpression is called when entering the searchOrExpression production.
+	EnterSearchOrExpression(c *SearchOrExpressionContext)
+
+	// EnterSearchAndExpression is called when entering the searchAndExpression production.
+	EnterSearchAndExpression(c *SearchAndExpressionContext)
+
+	// EnterSearchNotExpression is called when entering the searchNotExpression production.
+	EnterSearchNotExpression(c *SearchNotExpressionContext)
+
+	// EnterSearchAtom is called when entering the searchAtom production.
+	EnterSearchAtom(c *SearchAtomContext)
+
+	// EnterSearchStringTerm is called when entering the searchStringTerm production.
+	EnterSearchStringTerm(c *SearchStringTermContext)
+
+	// EnterSearchTableSource is called when entering the searchTableSource production.
+	EnterSearchTableSource(c *SearchTableSourceContext)
+
+	// EnterSearchQualifier is called when entering the searchQualifier production.
+	EnterSearchQualifier(c *SearchQualifierContext)
+
+	// EnterSearchTableComponent is called when entering the searchTableComponent production.
+	EnterSearchTableComponent(c *SearchTableComponentContext)
 
 	// EnterSearchKind is called when entering the searchKind production.
 	EnterSearchKind(c *SearchKindContext)
@@ -577,6 +603,33 @@ type KQLParserListener interface {
 
 	// ExitSearchOperator is called when exiting the searchOperator production.
 	ExitSearchOperator(c *SearchOperatorContext)
+
+	// ExitSearchPredicate is called when exiting the searchPredicate production.
+	ExitSearchPredicate(c *SearchPredicateContext)
+
+	// ExitSearchOrExpression is called when exiting the searchOrExpression production.
+	ExitSearchOrExpression(c *SearchOrExpressionContext)
+
+	// ExitSearchAndExpression is called when exiting the searchAndExpression production.
+	ExitSearchAndExpression(c *SearchAndExpressionContext)
+
+	// ExitSearchNotExpression is called when exiting the searchNotExpression production.
+	ExitSearchNotExpression(c *SearchNotExpressionContext)
+
+	// ExitSearchAtom is called when exiting the searchAtom production.
+	ExitSearchAtom(c *SearchAtomContext)
+
+	// ExitSearchStringTerm is called when exiting the searchStringTerm production.
+	ExitSearchStringTerm(c *SearchStringTermContext)
+
+	// ExitSearchTableSource is called when exiting the searchTableSource production.
+	ExitSearchTableSource(c *SearchTableSourceContext)
+
+	// ExitSearchQualifier is called when exiting the searchQualifier production.
+	ExitSearchQualifier(c *SearchQualifierContext)
+
+	// ExitSearchTableComponent is called when exiting the searchTableComponent production.
+	ExitSearchTableComponent(c *SearchTableComponentContext)
 
 	// ExitSearchKind is called when exiting the searchKind production.
 	ExitSearchKind(c *SearchKindContext)
