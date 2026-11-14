@@ -54,7 +54,7 @@ func inlineLetConstants(query string, lets []LetStatement) string {
 		if token.GetTokenType() == KQLLexerASSIGN && previous != nil && names[decodeKQLIdentifier(previous.GetText())] && (beforePrevious == nil || beforePrevious.GetTokenType() != KQLLexerLET) {
 			return query
 		}
-		if constant, known := candidates[token.GetText()]; known && (previous == nil || previous.GetTokenType() != KQLLexerLET) {
+		if constant, known := candidates[decodeKQLIdentifier(token.GetText())]; known && (previous == nil || previous.GetTokenType() != KQLLexerLET) {
 			// An occurrence outside a supported RHS operand can introduce a
 			// column (range, mv-expand, summarize BY, project, ...), or occur
 			// in another scope. Without schema resolution its binding is unknown.

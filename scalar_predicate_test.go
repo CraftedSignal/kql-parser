@@ -210,3 +210,14 @@ func TestQuotedLetReferencesRemainScalar(t *testing.T) {
 		t.Fatalf("quoted let reference lost its binding: %#v", r)
 	}
 }
+
+func TestQuotedLetColumnIntroductionsStayScalar(t *testing.T) {
+	for _, introduction := range []string{`mv-expand ['threshold']`, `project ['threshold']`, `summarize count() by ['threshold']`} {
+		query := `let threshold=5; T | ` + introduction + ` | where Score > threshold`
+		r := ExtractConditions(query)
+		leaves := scalarLeaves(r.Expression)
+		if len(r.Conditions) != 0 || len(leaves) != 1 || leaves[0].Text != `Score > threshold` || len(r.LetStatements) != 1 {
+			t.Errorf("quoted declaration changed binding: %s: %#v / %#v", query, r, leaves)
+		}
+	}
+}
