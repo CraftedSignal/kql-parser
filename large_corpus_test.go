@@ -104,7 +104,9 @@ func TestLargeCorpusFuzz(t *testing.T) {
 					} else if len(result.Errors) == 0 {
 						atomic.AddInt64(&noPredicateCount, 1)
 					} else {
-						atomic.AddInt64(&failedCount, 1)
+						if count := atomic.AddInt64(&failedCount, 1); count <= 5 {
+							t.Logf("Diagnostics for corpus entry %q (conditions=0, expression=%t): %v", q.Name, result.Expression != nil, result.Errors)
+						}
 					}
 
 					atomic.AddInt64(&totalConditions, int64(len(result.Conditions)))
@@ -130,7 +132,7 @@ func TestLargeCorpusFuzz(t *testing.T) {
 	t.Logf("Partial success (conditions with errors): %d (%.1f%%)", partialCount, float64(partialCount)*100/float64(totalQueries))
 	t.Logf("Scalar-only expression (no errors): %d (%.1f%%)", scalarOnlyCount, float64(scalarOnlyCount)*100/float64(totalQueries))
 	t.Logf("No predicate extracted (no errors): %d (%.1f%%)", noPredicateCount, float64(noPredicateCount)*100/float64(totalQueries))
-	t.Logf("Failed (diagnostics, no conditions): %d (%.1f%%)", failedCount, float64(failedCount)*100/float64(totalQueries))
+	t.Logf("Diagnostics without Conditions: %d (%.1f%%)", failedCount, float64(failedCount)*100/float64(totalQueries))
 	t.Logf("Panics: %d", panicCount)
 	t.Logf("Total conditions extracted: %d", totalConditions)
 	t.Logf("Average conditions per query: %.2f", float64(totalConditions)/float64(totalQueries))

@@ -14,8 +14,8 @@ Cooperative work is limited to 1,000,000 checks, and guarded condition/semantic
 output growth is limited to 4,096 charged items. Intermediate semantic clones
 also consume that output budget. Unevaluated scalar leaves and their clones
 consume it too; typed operand recognition, scalar expression scans, let shadowing
-checks, and generated subquery-marker provenance use the same work budget. Syntax diagnostics are capped at 32 per
-listener, with each message truncated to 1,024 bytes.
+checks, and generated subquery-marker provenance use the same work budget.
+Syntax diagnostics are capped at 32 per listener, with each message truncated to 1,024 bytes.
 
 Parsing runs synchronously: a returned cancellation or limit error leaves no
 parsing worker running in the background. Cancellation and limit failures return

@@ -5777,7 +5777,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 	}
 	if predicate, ok := kqlFilterFunctionPredicate(ctx, e.budget); ok {
 		sourceField, isComputed := e.computedFields[strings.ToLower(predicate.field)]
-		e.conditions = append(e.conditions, Condition{
+		e.appendCondition(Condition{
 			Field:       predicate.field,
 			Operator:    predicate.operator,
 			Negated:     e.negated != predicate.negated,
