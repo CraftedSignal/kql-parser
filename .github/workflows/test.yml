@@ -37,8 +37,13 @@ jobs:
       - name: Download Go modules
         run: go mod download
 
-      - name: Run Tests
-        run: go test -v -race -coverprofile=coverage.out ./...
+      # Keep every corpus case in the full coverage run. Race instrumentation
+      # and atomic coverage make that dense workload unnecessarily costly.
+      - name: Run full tests with coverage
+        run: go test -v -count=1 -timeout=10m -coverprofile=coverage.out ./...
+
+      - name: Run short tests with race detection
+        run: go test -short -race -count=1 -timeout=5m ./...
 
       - name: Upload coverage
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5

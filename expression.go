@@ -7,6 +7,7 @@ type BooleanOperator string
 
 const (
 	BooleanCondition BooleanOperator = "condition"
+	BooleanScalar    BooleanOperator = "scalar"
 	BooleanAnd       BooleanOperator = "and"
 	BooleanOr        BooleanOperator = "or"
 )
@@ -16,17 +17,22 @@ const (
 type ConditionExpression struct {
 	Operator       BooleanOperator        `json:"operator"`
 	ConditionIndex int                    `json:"condition_index"`
+	Scalar         *ScalarPredicate       `json:"scalar,omitempty"`
 	Children       []*ConditionExpression `json:"children,omitempty"`
 }
 
-func buildConditionExpression(tree antlr.Tree, conditions []Condition, budget *parseBudget) *ConditionExpression {
-	if tree == nil || len(conditions) < 2 {
+func buildConditionExpression(tree antlr.Tree, conditions []Condition, budget *parseBudget, extraction ...*conditionExtractor) *ConditionExpression {
+	if tree == nil {
 		return nil
 	}
 	builder := &kqlExpressionBuilder{conditions: conditions, budget: budget}
+	if len(extraction) > 0 {
+		builder.leaves = extraction[0].expressionLeaves
+	}
 	var expression *ConditionExpression
 	for _, where := range collectKQLWhereOperators(tree, budget) {
-		expression = combineConditionExpressions(BooleanAnd, expression, builder.expression(where.Expression()))
+		budget.step()
+		expression = combineConditionExpressions(BooleanAnd, expression, builder.expression(where.Expression()), budget)
 	}
 	if expression != nil && builder.next == len(conditions) {
 		return expression
@@ -38,6 +44,7 @@ type kqlExpressionBuilder struct {
 	budget     *parseBudget
 	conditions []Condition
 	next       int
+	leaves     map[IComparisonExpressionContext]*ConditionExpression
 }
 
 func collectKQLWhereOperators(tree antlr.Tree, budget *parseBudget) []IWhereOperatorContext {
@@ -52,6 +59,7 @@ func collectKQLWhereOperators(tree antlr.Tree, budget *parseBudget) []IWhereOper
 			wheres = append(wheres, where)
 		}
 		for i := 0; i < node.GetChildCount(); i++ {
+			budget.step()
 			visit(node.GetChild(i))
 		}
 	}
@@ -71,7 +79,8 @@ func (b *kqlExpressionBuilder) orExpression(ctx IOrExpressionContext) *Condition
 	b.budget.step()
 	var expression *ConditionExpression
 	for _, and := range ctx.AllAndExpression() {
-		expression = combineConditionExpressions(BooleanOr, expression, b.andExpression(and))
+		b.budget.step()
+		expression = combineConditionExpressions(BooleanOr, expression, b.andExpression(and), b.budget)
 	}
 	return expression
 }
@@ -80,7 +89,8 @@ func (b *kqlExpressionBuilder) andExpression(ctx IAndExpressionContext) *Conditi
 	b.budget.step()
 	var expression *ConditionExpression
 	for _, not := range ctx.AllNotExpression() {
-		expression = combineConditionExpressions(BooleanAnd, expression, b.notExpression(not))
+		b.budget.step()
+		expression = combineConditionExpressions(BooleanAnd, expression, b.notExpression(not), b.budget)
 	}
 	return expression
 }
@@ -91,7 +101,7 @@ func (b *kqlExpressionBuilder) notExpression(ctx INotExpressionContext) *Conditi
 		return nil
 	}
 	if ctx.NOT() != nil {
-		return demorganConditionExpression(b.notExpression(ctx.NotExpression()))
+		return demorganConditionExpression(b.notExpression(ctx.NotExpression()), b.budget)
 	}
 	return b.comparisonExpression(ctx.ComparisonExpression())
 }
@@ -100,6 +110,19 @@ func (b *kqlExpressionBuilder) comparisonExpression(ctx IComparisonExpressionCon
 	b.budget.step()
 	if ctx == nil {
 		return nil
+	}
+	if b.leaves != nil {
+		if leaf, ok := b.leaves[ctx]; ok {
+			b.next += countConditionLeaves(leaf, b.budget)
+			return leaf
+		}
+		if nested := groupedKQLExpression(ctx, b.budget); nested != nil {
+			return b.expression(nested)
+		}
+		return nil
+	}
+	if _, ok := kqlFilterFunctionPredicate(ctx, b.budget); ok {
+		return b.condition()
 	}
 	if ctx.HAS_ANY() != nil || ctx.HAS_ALL() != nil {
 		operator := BooleanOr
@@ -115,16 +138,25 @@ func (b *kqlExpressionBuilder) comparisonExpression(ctx IComparisonExpressionCon
 		}
 		return b.conditionGroup(2, operator)
 	}
-	if isKQLPredicateComparison(ctx) {
+	if isKQLPredicateComparison(ctx, b.budget) {
+		if ctx.ComparisonOperator() != nil {
+			if _, _, _, ok := kqlComparisonOperands(ctx, b.budget); !ok {
+				b.budget.reserveOutput(1)
+				return &ConditionExpression{Operator: BooleanScalar, Scalar: &ScalarPredicate{Text: kqlSourceText(ctx, b.budget)}}
+			}
+		}
 		return b.condition()
 	}
-	if nested := firstNestedKQLExpression(ctx); nested != nil {
+	if nested := firstNestedKQLExpression(ctx, b.budget); nested != nil {
 		return b.expression(nested)
 	}
 	return nil
 }
 
-func isKQLPredicateComparison(ctx IComparisonExpressionContext) bool {
+func isKQLPredicateComparison(ctx IComparisonExpressionContext, budgets ...*parseBudget) bool {
+	budget := suppliedBudget(budgets)
+	budget.step()
+
 	return ctx.ComparisonOperator() != nil ||
 		ctx.BETWEEN() != nil ||
 		ctx.NOT_BETWEEN() != nil ||
@@ -137,16 +169,20 @@ func isKQLPredicateComparison(ctx IComparisonExpressionContext) bool {
 		ctx.StringOperator() != nil
 }
 
-func firstNestedKQLExpression(tree antlr.Tree) IExpressionContext {
+func firstNestedKQLExpression(tree antlr.Tree, budgets ...*parseBudget) IExpressionContext {
+	budget := suppliedBudget(budgets)
+	budget.step()
+
 	if tree == nil {
 		return nil
 	}
 	for i := 0; i < tree.GetChildCount(); i++ {
+		budget.step()
 		child := tree.GetChild(i)
 		if expression, ok := child.(IExpressionContext); ok {
 			return expression
 		}
-		if expression := firstNestedKQLExpression(child); expression != nil {
+		if expression := firstNestedKQLExpression(child, budget); expression != nil {
 			return expression
 		}
 	}
@@ -167,7 +203,7 @@ func (b *kqlExpressionBuilder) multiValueCondition(exprList IExpressionListConte
 	b.budget.step()
 	count := 1
 	if exprList != nil {
-		if values := extractExpressionListValues(exprList); len(values) > 0 {
+		if values := extractExpressionListValues(exprList, b.budget); len(values) > 0 {
 			count = len(values)
 		}
 	}
@@ -184,16 +220,22 @@ func (b *kqlExpressionBuilder) conditionGroup(count int, operator BooleanOperato
 	}
 	var expression *ConditionExpression
 	for i := 0; i < count; i++ {
-		expression = combineConditionExpressions(operator, expression, b.condition())
+		b.budget.step()
+		expression = combineConditionExpressions(operator, expression, b.condition(), b.budget)
 	}
 	return expression
 }
 
-func remapConditionExpression(expression *ConditionExpression, indexMap []int) *ConditionExpression {
+func remapConditionExpression(expression *ConditionExpression, indexMap []int, budgets ...*parseBudget) *ConditionExpression {
+	budget := suppliedBudget(budgets)
+	budget.step()
+
 	if expression == nil || len(indexMap) == 0 {
 		return expression
 	}
 	switch expression.Operator {
+	case BooleanScalar:
+		return &ConditionExpression{Operator: BooleanScalar, Scalar: cloneScalarPredicate(expression.Scalar, budget)}
 	case BooleanCondition:
 		if expression.ConditionIndex < 0 || expression.ConditionIndex >= len(indexMap) {
 			return nil
@@ -206,17 +248,19 @@ func remapConditionExpression(expression *ConditionExpression, indexMap []int) *
 	case BooleanAnd, BooleanOr:
 		converted := &ConditionExpression{Operator: expression.Operator}
 		for _, child := range expression.Children {
-			remapped := remapConditionExpression(child, indexMap)
+			budget.step()
+			remapped := remapConditionExpression(child, indexMap, budget)
 			if remapped == nil {
 				continue
 			}
 			if remapped.Operator == expression.Operator {
 				for _, grandchild := range remapped.Children {
-					converted.Children = appendUniqueConditionExpression(converted.Children, grandchild)
+					budget.step()
+					converted.Children = appendUniqueConditionExpression(converted.Children, grandchild, budget)
 				}
 				continue
 			}
-			converted.Children = appendUniqueConditionExpression(converted.Children, remapped)
+			converted.Children = appendUniqueConditionExpression(converted.Children, remapped, budget)
 		}
 		if len(converted.Children) == 0 {
 			return nil
@@ -230,39 +274,61 @@ func remapConditionExpression(expression *ConditionExpression, indexMap []int) *
 	}
 }
 
-func appendConditionRangeExpression(expression *ConditionExpression, start, end int) *ConditionExpression {
+func appendConditionRangeExpression(expression *ConditionExpression, start, end int, budgets ...*parseBudget) *ConditionExpression {
+	budget := suppliedBudget(budgets)
+	budget.step()
+
 	for index := start; index < end; index++ {
+		budget.step()
 		leaf := &ConditionExpression{Operator: BooleanCondition, ConditionIndex: index}
-		expression = combineConditionExpressions(BooleanAnd, expression, leaf)
+		expression = combineConditionExpressions(BooleanAnd, expression, leaf, budget)
 	}
 	return expression
 }
 
-func appendUniqueConditionExpression(children []*ConditionExpression, child *ConditionExpression) []*ConditionExpression {
+func appendUniqueConditionExpression(children []*ConditionExpression, child *ConditionExpression, budgets ...*parseBudget) []*ConditionExpression {
+	budget := suppliedBudget(budgets)
+	budget.step()
+
+	// Unevaluated scalar functions can be nondeterministic. Preserve each occurrence.
+	if containsScalarExpression(child, budget) {
+		return append(children, child)
+	}
 	for _, existing := range children {
-		if equalConditionExpression(existing, child) {
+		budget.step()
+		if equalConditionExpression(existing, child, budget) {
 			return children
 		}
 	}
 	return append(children, child)
 }
 
-func equalConditionExpression(a, b *ConditionExpression) bool {
+func equalConditionExpression(a, b *ConditionExpression, budgets ...*parseBudget) bool {
+	budget := suppliedBudget(budgets)
+	budget.step()
+
 	if a == nil || b == nil {
 		return a == b
+	}
+	if (a.Scalar == nil) != (b.Scalar == nil) || (a.Scalar != nil && *a.Scalar != *b.Scalar) {
+		return false
 	}
 	if a.Operator != b.Operator || a.ConditionIndex != b.ConditionIndex || len(a.Children) != len(b.Children) {
 		return false
 	}
 	for i := range a.Children {
-		if !equalConditionExpression(a.Children[i], b.Children[i]) {
+		budget.step()
+		if !equalConditionExpression(a.Children[i], b.Children[i], budget) {
 			return false
 		}
 	}
 	return true
 }
 
-func combineConditionExpressions(operator BooleanOperator, left, right *ConditionExpression) *ConditionExpression {
+func combineConditionExpressions(operator BooleanOperator, left, right *ConditionExpression, budgets ...*parseBudget) *ConditionExpression {
+	budget := suppliedBudget(budgets)
+	budget.step()
+
 	if left == nil {
 		return right
 	}
@@ -283,24 +349,53 @@ func combineConditionExpressions(operator BooleanOperator, left, right *Conditio
 	return combined
 }
 
-func demorganConditionExpression(expression *ConditionExpression) *ConditionExpression {
+func demorganConditionExpression(expression *ConditionExpression, budgets ...*parseBudget) *ConditionExpression {
+	budget := suppliedBudget(budgets)
+	budget.step()
+
 	if expression == nil {
 		return nil
 	}
 	switch expression.Operator {
+	case BooleanScalar:
+		scalar := cloneScalarPredicate(expression.Scalar, budget)
+		if scalar != nil {
+			scalar.Negated = !scalar.Negated
+		}
+		return &ConditionExpression{Operator: BooleanScalar, Scalar: scalar}
 	case BooleanAnd:
 		converted := &ConditionExpression{Operator: BooleanOr}
 		for _, child := range expression.Children {
-			converted.Children = append(converted.Children, demorganConditionExpression(child))
+			budget.step()
+			converted.Children = append(converted.Children, demorganConditionExpression(child, budget))
 		}
 		return converted
 	case BooleanOr:
 		converted := &ConditionExpression{Operator: BooleanAnd}
 		for _, child := range expression.Children {
-			converted.Children = append(converted.Children, demorganConditionExpression(child))
+			budget.step()
+			converted.Children = append(converted.Children, demorganConditionExpression(child, budget))
 		}
 		return converted
 	default:
 		return expression
 	}
+}
+
+func countConditionLeaves(expression *ConditionExpression, budgets ...*parseBudget) int {
+	budget := suppliedBudget(budgets)
+	budget.step()
+
+	if expression == nil {
+		return 0
+	}
+	if expression.Operator == BooleanCondition {
+		return 1
+	}
+	count := 0
+	for _, child := range expression.Children {
+		budget.step()
+		count += countConditionLeaves(child, budget)
+	}
+	return count
 }

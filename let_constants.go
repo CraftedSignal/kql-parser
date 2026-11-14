@@ -1,8 +1,10 @@
 package kql
 
 import (
-	"strconv"
 	"strings"
+	"unicode/utf8"
+
+	"github.com/antlr4-go/antlr/v4"
 )
 
 // letConstant is the literal a let statement binds, as written in the query:
@@ -19,13 +21,92 @@ type letConstant struct {
 // and list operators are replaced; lets that bind anything else, such as a
 // tabular expression, stay names.
 func inlineLetConstants(query string, lets []LetStatement, budget *parseBudget) string {
-	constants := make(map[string]letConstant, len(lets))
-	for _, let := range lets {
+	budget.step()
+	// Only substitute in a later top-level statement, after proving that
+	// bindings are unique and no function scope or column assignment shadows
+	// them. Ambiguous queries keep their bindings and scalar predicates.
+	if len(lets) == 0 {
+		return query
+	}
+	names := make(map[string]bool, len(lets))
+	candidates := make(map[string]letConstant, len(lets))
+	for _, binding := range lets {
 		budget.step()
-		if constant, ok := parseLetConstant(let.Expression); ok {
-			constants[let.Name] = constant
+		if names[binding.Name] {
+			return query
+		}
+		names[binding.Name] = true
+		if constant, ok := parseLetConstant(binding.Expression); ok {
+			candidates[binding.Name] = constant
 		}
 	}
+	if len(candidates) == 0 {
+		return query
+	}
+	input := &budgetCharStream{CharStream: antlr.NewInputStream(query), budget: budget}
+	var lexer antlr.Lexer = NewKQLLexer(input)
+	lexer.RemoveErrorListeners()
+	if budget != nil {
+		lexer = &budgetLexer{Lexer: lexer, budget: budget}
+	}
+	bytePosition, runePosition := 0, 0
+	var previous, beforePrevious antlr.Token
+	for token := lexer.NextToken(); token.GetTokenType() != antlr.TokenEOF; token = lexer.NextToken() {
+		budget.step()
+		if token.GetChannel() != antlr.TokenDefaultChannel {
+			continue
+		}
+		if token.GetTokenType() == KQLLexerLBRACE {
+			return query
+		}
+		if token.GetTokenType() == KQLLexerASSIGN && previous != nil && names[decodeKQLIdentifier(previous.GetText(), budget)] && (beforePrevious == nil || beforePrevious.GetTokenType() != KQLLexerLET) {
+			return query
+		}
+		if constant, known := candidates[decodeKQLIdentifier(token.GetText(), budget)]; known && (previous == nil || previous.GetTokenType() != KQLLexerLET) {
+			// An occurrence outside a supported RHS operand can introduce a
+			// column (range, mv-expand, summarize BY, project, ...), or occur
+			// in another scope. Without schema resolution its binding is unknown.
+			for runePosition < token.GetStart() {
+				budget.step()
+				_, size := utf8.DecodeRuneInString(query[bytePosition:])
+				bytePosition += size
+				runePosition++
+			}
+			start := bytePosition
+			end := start + len(token.GetText())
+			if _, safe := letConstantOperand(query, start, end, constant); !safe {
+				return query
+			}
+		}
+		beforePrevious, previous = previous, token
+	}
+	constants := make(map[string]letConstant, len(lets))
+	statements := splitStatements(query)
+	normalizedBytes := len(statements) - 1
+	for _, statement := range statements {
+		normalizedBytes += len(statement)
+	}
+	for index, statement := range statements {
+		budget.step()
+		name, expression, isLet := parseLetAssignment(strings.TrimSpace(trimLeadingLineComments(statement)))
+		if isLet {
+			if constant, ok := parseLetConstant(expression); ok {
+				constants[name] = constant
+			}
+			continue
+		}
+		// Account for every other statement before growing this one, so
+		// splitting the query never resets the normalized-input byte cap.
+		otherBytes := normalizedBytes - len(statement)
+		statements[index] = inlineLetConstantOperands(statement, constants, budget, otherBytes)
+		normalizedBytes = otherBytes + len(statements[index])
+	}
+	result := strings.Join(statements, ";")
+	budget.input(result)
+	return result
+}
+
+func inlineLetConstantOperands(query string, constants map[string]letConstant, budget *parseBudget, otherBytes int) string {
 	if len(constants) == 0 {
 		return query
 	}
@@ -33,7 +114,7 @@ func inlineLetConstants(query string, lets []LetStatement, budget *parseBudget) 
 	var b strings.Builder
 	write := func(value string) {
 		budget.step()
-		if budget != nil && len(value) > budget.limits.maxInputBytes-b.Len() {
+		if budget != nil && len(value) > budget.limits.maxInputBytes-otherBytes-b.Len() {
 			budget.reject("normalized input bytes")
 		}
 		b.WriteString(value)
@@ -181,7 +262,7 @@ func isScalarLiteral(s string) bool {
 	if isStringLiteralStart(s, 0) {
 		return stringLiteralEnd(s, 0) == len(s)
 	}
-	if _, err := strconv.ParseFloat(s, 64); err == nil {
+	if numericToken.MatchString(strings.TrimLeft(s, "+-")) {
 		return true
 	}
 	switch strings.ToLower(s) {

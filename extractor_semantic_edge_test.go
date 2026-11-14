@@ -87,7 +87,7 @@ union withsource=TableName SecurityEvent, Derived, cluster("c").database("d").Si
 
 	statements := extractLetStatements(query + "\nlet IOCs = dynamic([\"dupe\"]);")
 	if len(statements) != 2 || statements[0].Name != "IOCs" || statements[1].Name != "Derived" {
-		t.Fatalf("let statements not deduplicated/preserved: %#v", statements)
+		t.Fatalf("shadowed let statements not preserved: %#v", statements)
 	}
 	if !hasPortableFieldConditions([]Condition{{Field: "where"}, {Field: "Computed", IsComputed: true}, {Field: "Account"}}) {
 		t.Fatalf("portable field condition was not detected")

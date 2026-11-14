@@ -226,11 +226,11 @@ func TestKQLAdditionalNormalizationEdges(t *testing.T) {
 
 func TestKQLSubqueryJoinUnionAndSourceNormalizationEdges(t *testing.T) {
 	inSubquery := normalizeInSubqueries(`T | where Account in (SigninLogs | project Account) and Message == "a|b"`)
-	if want := `T | where Account in (SubqueryResult) and Message == "a|b"`; inSubquery != want {
+	if want := `T | where Account in ("SubqueryResult") and Message == "a|b"`; inSubquery != want {
 		t.Fatalf("normalizeInSubqueries() = %q, want %q", inSubquery, want)
 	}
 	verbatimInSubquery := normalizeInSubqueries(`T | where Message == @"literal "" in (SigninLogs | project Account)" and Account in (SigninLogs | project Account)`)
-	if want := `T | where Message == @"literal "" in (SigninLogs | project Account)" and Account in (SubqueryResult)`; verbatimInSubquery != want {
+	if want := `T | where Message == @"literal "" in (SigninLogs | project Account)" and Account in ("SubqueryResult")`; verbatimInSubquery != want {
 		t.Fatalf("normalizeInSubqueries() with verbatim string = %q, want %q", verbatimInSubquery, want)
 	}
 	malformedInSubquery := `T | where Account in (SigninLogs | project Account`

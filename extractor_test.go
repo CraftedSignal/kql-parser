@@ -180,7 +180,7 @@ func TestNormalizeQuery_InSubqueriesUsePlaceholderOutsideStrings(t *testing.T) {
 | where app == "OAuth"`
 
 	normalized := NormalizeQueryForDebug(query)
-	if !strings.Contains(normalized, `new !in (SubqueryResult)`) {
+	if !strings.Contains(normalized, `new !in ("SubqueryResult")`) {
 		t.Fatalf("normalization should replace tabular in() subquery, got:\n%s", normalized)
 	}
 
@@ -585,7 +585,7 @@ func TestExtractConditions_PortablePredicateExtractionHasAny(t *testing.T) {
 	}
 }
 
-func TestExtractConditions_PortablePredicateExtractionWhenWalkerOnlyComputed(t *testing.T) {
+func TestExtractConditions_PreservesUnresolvedLetFilter(t *testing.T) {
 	query := `let BadDomains = ThreatIntelIndicators
 | where TimeGenerated > ago(11d)
 and ObservableKey == "domain-name:value"
@@ -596,15 +596,17 @@ DeviceNetworkEvents
 | where Domain has_any(BadDomains)`
 
 	result := ExtractConditions(query)
-	assertConditionValue(t, result.Conditions, "ObservableKey", "==", "domain-name:value")
+	if leaves := scalarLeaves(result.Expression); len(result.Conditions) != 0 || len(leaves) != 1 || leaves[0].Text != `Domain has_any(BadDomains)` || len(result.LetStatements) != 1 || !strings.Contains(result.LetStatements[0].Expression, `ObservableKey == "domain-name:value"`) {
+		t.Fatalf("let predicate or binding lost: %#v", result)
+	}
 	if !containsString(result.DataSources, "ThreatIntelIndicators") {
 		t.Fatalf("expected ThreatIntelIndicators datasource, got %v", result.DataSources)
 	}
 	if !containsString(result.DataSources, "DeviceNetworkEvents") {
 		t.Fatalf("expected DeviceNetworkEvents datasource, got %v", result.DataSources)
 	}
-	if !containsString(result.Errors, portablePredicateExtractionNote) {
-		t.Fatalf("expected parser-native portable predicate extraction note, got %v", result.Errors)
+	if containsString(result.Errors, portablePredicateExtractionNote) {
+		t.Fatalf("unexpected text fallback for preserved let predicate, got %v", result.Errors)
 	}
 }
 
@@ -639,13 +641,15 @@ func TestExtractConditions_PortablePredicateExtractionSetHasElement(t *testing.T
 | where NumberofRoles > 0`
 
 	result := ExtractConditions(query)
-	assertConditionValue(t, result.Conditions, "Categories", "has", "identity")
+	if leaves := scalarLeaves(result.Expression); len(leaves) != 1 || leaves[0].Text != `set_has_element(Categories, "identity")` {
+		t.Fatalf("scalar function predicate lost: %#v", result)
+	}
 	assertConditionValue(t, result.Conditions, "NumberofRoles", ">", "0")
 	if !containsString(result.DataSources, "ExposureGraphNodes") {
 		t.Fatalf("expected ExposureGraphNodes datasource, got %v", result.DataSources)
 	}
-	if !containsString(result.Errors, portablePredicateExtractionNote) {
-		t.Fatalf("expected parser-native portable predicate extraction note, got %v", result.Errors)
+	if containsString(result.Errors, portablePredicateExtractionNote) {
+		t.Fatalf("unexpected text fallback for preserved scalar predicate, got %v", result.Errors)
 	}
 }
 
@@ -1472,12 +1476,12 @@ func TestIsnotempty_Extraction(t *testing.T) {
 
 	found := false
 	for _, c := range result.Conditions {
-		if c.Field == "InitiatingProcessFileName" && c.Operator == "isnotnull" {
+		if c.Field == "InitiatingProcessFileName" && c.Operator == "isnotempty" {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("Expected isnotnull condition for InitiatingProcessFileName, got %v", result.Conditions)
+		t.Errorf("Expected isnotempty condition for InitiatingProcessFileName, got %v", result.Conditions)
 	}
 }
 

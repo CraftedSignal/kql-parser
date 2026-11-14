@@ -31,8 +31,8 @@ func TestKQLExpressionBuilderHelperEdges(t *testing.T) {
 	if got := buildConditionExpression(nil, conditions, nil); got != nil {
 		t.Fatalf("nil tree returned expression %#v", got)
 	}
-	if got := buildConditionExpression(kqlParserForTest(t, `SecurityEvent | where a == 1`).Query(), conditions[:1], nil); got != nil {
-		t.Fatalf("single condition returned expression %#v", got)
+	if got := buildConditionExpression(kqlParserForTest(t, `SecurityEvent | where a == 1`).Query(), conditions[:1], nil); got == nil || got.Operator != BooleanCondition {
+		t.Fatalf("single condition lost expression %#v", got)
 	}
 	if got := collectKQLWhereOperators(nil, nil); got != nil {
 		t.Fatalf("nil tree where collection returned %#v", got)

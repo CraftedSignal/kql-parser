@@ -57,11 +57,11 @@ func FuzzKQLParser(f *testing.F) {
 	f.Add("SecurityEvent | where EventID between (4624 .. 4626)")
 
 	// Numeric field names (Sysmon-style)
-	f.Add("SysmonData | where 1 == \"CreateProcess\" and 3 == \"cmd.exe\"")
-	f.Add("SysmonData | where 1 == \"CreateProcess\" and 7 == \"x86\" and 10 == \"C:\\\\Windows\\\\System32\"")
-	f.Add("SysmonData | where 22 contains \"malicious.com\" and 3 == \"dns.exe\"")
-	f.Add("SysmonData | where 1 == \"CreateProcess\" | where 3 startswith \"C:\\\\\"")
-	f.Add("SysmonData | where 1 in (\"CreateProcess\", \"ProcessTerminate\")")
+	f.Add("SysmonData | where ['1'] == \"CreateProcess\" and ['3'] == \"cmd.exe\"")
+	f.Add("SysmonData | where ['1'] == \"CreateProcess\" and ['7'] == \"x86\" and ['10'] == \"C:\\\\Windows\\\\System32\"")
+	f.Add("SysmonData | where ['22'] contains \"malicious.com\" and ['3'] == \"dns.exe\"")
+	f.Add("SysmonData | where ['1'] == \"CreateProcess\" | where ['3'] startswith \"C:\\\\\"")
+	f.Add("SysmonData | where ['1'] in (\"CreateProcess\", \"ProcessTerminate\")")
 
 	// let statements
 	f.Add("let threshold = 10; SecurityEvent | where EventID == 4625 | where Count > threshold")
@@ -253,22 +253,22 @@ func TestConditionCompleteness(t *testing.T) {
 		},
 		{
 			name:           "numeric field names with surrounding conditions",
-			query:          "SysmonData | where 1 == \"CreateProcess\" and 3 == \"cmd.exe\"",
+			query:          "SysmonData | where ['1'] == \"CreateProcess\" and ['3'] == \"cmd.exe\"",
 			expectedFields: []string{"1", "3"},
 		},
 		{
 			name:           "multiple numeric field names",
-			query:          "SysmonData | where 1 == \"CreateProcess\" and 7 == \"x86\" and 10 == \"C:\\\\Windows\\\\System32\"",
+			query:          "SysmonData | where ['1'] == \"CreateProcess\" and ['7'] == \"x86\" and ['10'] == \"C:\\\\Windows\\\\System32\"",
 			expectedFields: []string{"1", "7", "10"},
 		},
 		{
 			name:           "numeric field name with string operator",
-			query:          "SysmonData | where 22 contains \"malicious.com\" and 3 == \"dns.exe\"",
+			query:          "SysmonData | where ['22'] contains \"malicious.com\" and ['3'] == \"dns.exe\"",
 			expectedFields: []string{"22", "3"},
 		},
 		{
 			name:           "numeric field name in piped where",
-			query:          "SysmonData | where 1 == \"CreateProcess\" | where 3 startswith \"C:\\\\\"",
+			query:          "SysmonData | where ['1'] == \"CreateProcess\" | where ['3'] startswith \"C:\\\\\"",
 			expectedFields: []string{"1", "3"},
 		},
 		{
