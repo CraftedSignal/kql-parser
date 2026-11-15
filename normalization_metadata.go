@@ -14,6 +14,7 @@ type kqlNormalizationMetadata struct {
 	subqueryOffsets []int
 	searchCount     int
 	membership      *membershipProtection
+	typed           *typedProtection
 }
 
 func newKQLNormalizationMetadata(query string, budgets ...*parseBudget) *kqlNormalizationMetadata {

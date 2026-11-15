@@ -10,8 +10,9 @@ import (
 // letConstant is the literal a let statement binds, as written in the query:
 // a scalar, or the elements of a dynamic([...]) array.
 type letConstant struct {
-	items []string
-	list  bool
+	items  []string
+	list   bool
+	source string
 }
 
 // inlineLetConstants replaces references to lets that bind a constant with
@@ -20,8 +21,12 @@ type letConstant struct {
 // "x has_all (name)" lists the array's elements. Only operands of comparison
 // and list operators are replaced; lets that bind anything else, such as a
 // tabular expression, stay names.
-func inlineLetConstants(query string, lets []LetStatement, budget *parseBudget) string {
+func inlineLetConstants(query string, lets []LetStatement, budget *parseBudget, protections ...*typedProtection) string {
 	budget.step()
+	var protection *typedProtection
+	if len(protections) > 0 {
+		protection = protections[0]
+	}
 	// Only substitute in a later top-level statement, after proving that
 	// bindings are unique and no function scope or column assignment shadows
 	// them. Ambiguous queries keep their bindings and scalar predicates.
@@ -98,7 +103,7 @@ func inlineLetConstants(query string, lets []LetStatement, budget *parseBudget) 
 		// Account for every other statement before growing this one, so
 		// splitting the query never resets the normalized-input byte cap.
 		otherBytes := normalizedBytes - len(statement)
-		statements[index] = inlineLetConstantOperands(statement, constants, budget, otherBytes)
+		statements[index] = inlineLetConstantOperands(statement, constants, budget, otherBytes, protection)
 		normalizedBytes = otherBytes + len(statements[index])
 	}
 	result := strings.Join(statements, ";")
@@ -106,7 +111,7 @@ func inlineLetConstants(query string, lets []LetStatement, budget *parseBudget) 
 	return result
 }
 
-func inlineLetConstantOperands(query string, constants map[string]letConstant, budget *parseBudget, otherBytes int) string {
+func inlineLetConstantOperands(query string, constants map[string]letConstant, budget *parseBudget, otherBytes int, protection *typedProtection) string {
 	if len(constants) == 0 {
 		return query
 	}
@@ -140,6 +145,17 @@ func inlineLetConstantOperands(query string, constants map[string]letConstant, b
 			}
 			if constant, ok := constants[query[i:end]]; ok {
 				if literal, ok := letConstantOperand(query, i, end, constant); ok {
+					if protection != nil {
+						if constant.list {
+							parts := make([]string, 0, len(constant.items))
+							for _, item := range constant.items {
+								parts = append(parts, protection.mark(letOrigin{source: item, binding: query[i:end], listSource: constant.source, normalized: item}, budget)+item)
+							}
+							literal = strings.Join(parts, ", ")
+						} else {
+							literal = protection.mark(letOrigin{source: constant.items[0], binding: query[i:end], normalized: literal}, budget) + literal
+						}
+					}
 					write(query[last:i])
 					write(literal)
 					last = end
@@ -230,7 +246,7 @@ func trailingOperator(s string) (string, string) {
 func parseLetConstant(expression string) (letConstant, bool) {
 	expression = strings.TrimSpace(expression)
 	if isScalarLiteral(expression) {
-		return letConstant{items: []string{expression}}, true
+		return letConstant{items: []string{expression}, source: expression}, true
 	}
 	if !strings.HasPrefix(strings.ToLower(expression), "dynamic") {
 		return letConstant{}, false
@@ -253,7 +269,7 @@ func parseLetConstant(expression string) (letConstant, bool) {
 	if len(items) == 0 {
 		return letConstant{}, false
 	}
-	return letConstant{items: items, list: true}, true
+	return letConstant{items: items, list: true, source: expression}, true
 }
 
 // isScalarLiteral reports whether s is exactly one string, number or boolean
