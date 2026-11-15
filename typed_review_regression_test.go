@@ -228,3 +228,88 @@ func TestTypedReviewJoinedChildLetBinding(t *testing.T) {
 		}
 	}
 }
+
+func TestTypedReviewReferenceRestorationAcrossOperators(t *testing.T) {
+	for _, fixture := range []struct{ query, field, source string }{
+		{`T | extend 3plogTime=Source | where 3plogTime in (42, "42")`, "3plogTime", "Source"},
+		{`T | project 3plogTime=Source | where 3plogTime in (42, "42")`, "3plogTime", "Source"},
+		{`T | extend Derived=3plogTime | where Derived in (42, "42")`, "Derived", "3plogTime"},
+	} {
+		computedParse, computedSemantic := ExtractConditions(fixture.query), AnalyzeQuery(fixture.query)
+		for _, result := range []struct {
+			name       string
+			conditions []Condition
+			errors     []string
+		}{{"parse", computedParse.Conditions, computedParse.Errors}, {"semantic", computedSemantic.Conditions, computedSemantic.Errors}} {
+			if len(result.errors) != 0 || len(result.conditions) != 1 || result.conditions[0].Field != fixture.field || !result.conditions[0].IsComputed || result.conditions[0].SourceField != fixture.source {
+				t.Errorf("%s computed reference %q: %#v / %#v", result.name, fixture.query, result.conditions, result.errors)
+			}
+		}
+	}
+	boundsParsed, boundsSemantic := ExtractConditions(`T | where x between (3lo .. 3hi)`), AnalyzeQuery(`T | where x between (3lo .. 3hi)`)
+	for _, result := range []struct {
+		name       string
+		conditions []Condition
+		errors     []string
+	}{
+		{"parse", boundsParsed.Conditions, boundsParsed.Errors},
+		{"semantic", boundsSemantic.Conditions, boundsSemantic.Errors},
+	} {
+		if len(result.errors) != 0 || len(result.conditions) != 2 {
+			t.Fatalf("%s bounds: %#v / %#v", result.name, result.conditions, result.errors)
+		}
+		for i, expected := range []struct{ operator, name string }{{">=", "3lo"}, {"<=", "3hi"}} {
+			c := result.conditions[i]
+			if c.Field != "x" || c.Operator != expected.operator || c.ValueReference != expected.name || c.Value != "" || c.RHS == nil || c.RHS.Kind != OperandField || c.RHS.Source != expected.name || c.RHS.Value != expected.name {
+				t.Errorf("%s bound %d: %+v", result.name, i, c)
+			}
+		}
+	}
+	for _, fixture := range []struct {
+		query string
+		count int
+	}{
+		{`T | where 3plogTime in (42, "42")`, 1},
+		{`T | where 3plogTime between (1 .. 2)`, 2},
+		{`T | where 3plogTime has_all ("a", "b")`, 2},
+		{`T | where 3plogTime == "a"`, 1},
+	} {
+		parsed, semantic := ExtractConditions(fixture.query), AnalyzeQuery(fixture.query)
+		for _, result := range []struct {
+			name       string
+			conditions []Condition
+			errors     []string
+		}{{"parse", parsed.Conditions, parsed.Errors}, {"semantic", semantic.Conditions, semantic.Errors}} {
+			if len(result.errors) != 0 || len(result.conditions) != fixture.count {
+				t.Fatalf("%s %q: %#v / %#v", result.name, fixture.query, result.conditions, result.errors)
+			}
+			for _, c := range result.conditions {
+				if c.Field != "3plogTime" {
+					t.Errorf("%s %q: field=%q", result.name, fixture.query, c.Field)
+				}
+			}
+		}
+	}
+}
+
+func TestTypedReviewCompleteBracketReferenceBoundary(t *testing.T) {
+	for _, reference := range []string{`bag['a'][0]`, `bag['a']['b']`, `3bag['key'][0]`} {
+		query := `T | where x == ` + reference
+		parsed, semantic := ExtractConditions(query), AnalyzeQuery(query)
+		if len(parsed.Errors) != 0 || len(parsed.Conditions) != 0 || parsed.Expression == nil || parsed.Expression.Operator != BooleanScalar || parsed.Expression.Scalar == nil || parsed.Expression.Scalar.Text != `x == `+reference {
+			t.Errorf("parse %q: %#v", query, parsed)
+		}
+		if len(semantic.Errors) != 0 || len(semantic.Conditions) != 0 || semantic.Expression == nil || semantic.Expression.Operator != BooleanScalar || semantic.Expression.Scalar == nil || semantic.Expression.Scalar.Text != `x == `+reference {
+			t.Errorf("semantic %q: %#v", query, semantic)
+		}
+	}
+	for _, fixture := range []struct{ reference, identity string }{
+		{`bag['key']`, `bag.key`},
+		{`3bag['key']`, `3bag.key`},
+	} {
+		c := requireTypedReviewCondition(t, `T | where x == `+fixture.reference)
+		if c.RHS.Kind != OperandField || c.RHS.Source != fixture.reference || c.RHS.Value != fixture.identity || c.ValueReference != fixture.identity {
+			t.Errorf("simple reference %q: %+v", fixture.reference, c)
+		}
+	}
+}

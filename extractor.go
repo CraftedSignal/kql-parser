@@ -5648,7 +5648,7 @@ func (e *conditionExtractor) EnterExtendItem(ctx *ExtendItemContext) {
 	}
 	// Track field assignments in extend with source field extraction
 	if ctx.Identifier() != nil {
-		field := ctx.Identifier().GetText()
+		field := e.typed.sourceOf(ctx.Identifier())
 		sourceField := ""
 		expression := ""
 
@@ -5656,6 +5656,9 @@ func (e *conditionExtractor) EnterExtendItem(ctx *ExtendItemContext) {
 		if ctx.Expression() != nil {
 			expression = ctx.Expression().GetText()
 			sourceField = extractFirstFieldFromExpression(ctx.Expression())
+			if sourceField == expression {
+				sourceField = e.typed.sourceOf(ctx.Expression())
+			}
 		}
 
 		e.computedFields[strings.ToLower(field)] = sourceField
@@ -5771,11 +5774,14 @@ func (e *conditionExtractor) EnterProjectItem(ctx *ProjectItemContext) {
 	}
 	if ctx.Identifier() != nil && (ctx.ASSIGN() != nil || ctx.AS() != nil) {
 		// Aliased project item: project NewName = expr or project expr AS NewName
-		field := ctx.Identifier().GetText()
+		field := e.typed.sourceOf(ctx.Identifier())
 		sourceField, expression := "", ""
 		if ctx.Expression() != nil {
 			expression = ctx.Expression().GetText()
 			sourceField = extractFirstFieldFromExpression(ctx.Expression())
+			if sourceField == expression {
+				sourceField = e.typed.sourceOf(ctx.Expression())
+			}
 		}
 		e.computedFields[strings.ToLower(field)] = sourceField
 		e.computedExpressions[strings.ToLower(field)] = expression
@@ -5964,7 +5970,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 	if hasIN || hasNOT_IN || hasIN_CS || hasNOT_IN_CS {
 		addExprs := ctx.AllAdditiveExpression()
 		if len(addExprs) >= 1 && ctx.ExpressionList() != nil {
-			leftText := recognizeKQLOperand(addExprs[0], e.budget).text
+			leftText := e.typed.applyKQLOperand(recognizeKQLOperand(addExprs[0], e.budget), addExprs[0]).text
 			isNegated := (hasNOT_IN || hasNOT_IN_CS) != e.negated
 			operator := "in"
 			if hasIN_CS || hasNOT_IN_CS || strings.Contains(strings.ToLower(ctx.GetText()), "in~") {
@@ -5979,15 +5985,15 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 	if ctx.BETWEEN() != nil || ctx.NOT_BETWEEN() != nil {
 		addExprs := ctx.AllAdditiveExpression()
 		if len(addExprs) >= 3 {
-			leftText := recognizeKQLOperand(addExprs[0], e.budget).text
-			low := recognizeKQLOperand(addExprs[1], e.budget)
-			high := recognizeKQLOperand(addExprs[2], e.budget)
+			leftText := e.typed.applyKQLOperand(recognizeKQLOperand(addExprs[0], e.budget), addExprs[0]).text
+			low := e.typed.applyKQLOperand(recognizeKQLOperand(addExprs[1], e.budget), addExprs[1])
+			high := e.typed.applyKQLOperand(recognizeKQLOperand(addExprs[2], e.budget), addExprs[2])
 			isNegated := (ctx.NOT_BETWEEN() != nil) != e.negated
 			start := len(e.conditions)
-			e.handleBetweenOperator(leftText, low.text, high.text, isNegated)
+			e.handleBetweenOperator(leftText, low.text, high.text, isNegated, addExprs[0])
 			if len(e.conditions) == start+2 {
 				for index, bound := range []kqlOperand{low, high} {
-					rhs := e.typed.apply(bound.rhs, addExprs[1+index])
+					rhs := bound.rhs
 					e.budget.reserveOutput(operandOutputCost(rhs, e.budget))
 					e.conditions[start+index].RHS = rhs
 					if bound.reference {
@@ -6004,12 +6010,12 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 	if ctx.HAS_ANY() != nil || ctx.HAS_ALL() != nil {
 		addExprs := ctx.AllAdditiveExpression()
 		if len(addExprs) >= 1 && ctx.ExpressionList() != nil {
-			leftText := recognizeKQLOperand(addExprs[0], e.budget).text
+			leftText := e.typed.applyKQLOperand(recognizeKQLOperand(addExprs[0], e.budget), addExprs[0]).text
 			opName := "has_any"
 			if ctx.HAS_ALL() != nil {
 				opName = "has_all"
 			}
-			e.handleHasAnyAllOperator(leftText, opName, ctx.ExpressionList())
+			e.handleHasAnyAllOperator(leftText, opName, ctx.ExpressionList(), addExprs[0])
 		}
 		return
 	}
@@ -6061,7 +6067,11 @@ func (e *conditionExtractor) handleComparison(left, op, right string) {
 
 // handleInOperator processes IN operator conditions
 func (e *conditionExtractor) handleInOperator(field string, exprList IExpressionListContext, operator string, negated bool, contexts ...IComparisonExpressionContext) {
-	if !isValidFieldName(field) {
+	var left antlr.ParserRuleContext
+	if len(contexts) > 0 && len(contexts[0].AllAdditiveExpression()) > 0 {
+		left = contexts[0].AllAdditiveExpression()[0]
+	}
+	if !isValidFieldName(field) && !e.typed.provesReferenceIn(left, field) {
 		return
 	}
 
@@ -6143,8 +6153,8 @@ func (e *conditionExtractor) originalListSource(ctx IComparisonExpressionContext
 }
 
 // handleBetweenOperator processes BETWEEN operator conditions
-func (e *conditionExtractor) handleBetweenOperator(field, lowValue, highValue string, negated bool) {
-	if !isValidFieldName(field) {
+func (e *conditionExtractor) handleBetweenOperator(field, lowValue, highValue string, negated bool, left ...antlr.ParserRuleContext) {
+	if !isValidFieldName(field) && (len(left) == 0 || !e.typed.provesReferenceIn(left[0], field)) {
 		return
 	}
 
@@ -6187,8 +6197,8 @@ func (e *conditionExtractor) handleBetweenOperator(field, lowValue, highValue st
 }
 
 // handleHasAnyAllOperator processes has_any and has_all operators
-func (e *conditionExtractor) handleHasAnyAllOperator(field, op string, exprList IExpressionListContext) {
-	if !isValidFieldName(field) {
+func (e *conditionExtractor) handleHasAnyAllOperator(field, op string, exprList IExpressionListContext, left ...antlr.ParserRuleContext) {
+	if !isValidFieldName(field) && (len(left) == 0 || !e.typed.provesReferenceIn(left[0], field)) {
 		return
 	}
 

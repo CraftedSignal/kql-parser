@@ -111,8 +111,55 @@ func replaceRegexOutsideProtected(query string, pattern *regexp.Regexp, replacem
 
 var typedTimespanSuffix = regexp.MustCompile(`(?i)\b[0-9]+(?:minutes|minute|min|seconds|second|sec|hours|hour|days|day)\b`)
 var typedTrailingDecimal = regexp.MustCompile(`[0-9]+\.`)
-var typedBracketReference = regexp.MustCompile(`\b[A-Za-z_][A-Za-z0-9_]*(?:\.)?\[(?:'[^'\r\n]*'|"[^"\r\n]*"|[0-9]+)\]`)
+var typedBracketReference = regexp.MustCompile(`\b[0-9]*[A-Za-z_][A-Za-z0-9_]*(?:\.)?\[(?:'[^'\r\n]*'|"[^"\r\n]*"|[0-9]+)\]`)
 var typedNumericReference = regexp.MustCompile(`\b[0-9]+[A-Za-z_][A-Za-z0-9_]*\b`)
+
+func completeBracketReferenceEnd(query string, end int, budget *parseBudget) int {
+	for end < len(query) {
+		budget.step()
+		open := end
+		if query[open] == '.' {
+			open++
+		}
+		if open >= len(query) || query[open] != '[' {
+			break
+		}
+		depth := 1
+		i := open + 1
+		for i < len(query) && depth > 0 {
+			budget.step()
+			if isStringLiteralStart(query, i) {
+				if next := stringLiteralEnd(query, i); next > i {
+					i = next
+					continue
+				}
+			}
+			switch query[i] {
+			case '[':
+				depth++
+			case ']':
+				depth--
+			}
+			i++
+		}
+		if depth != 0 {
+			break
+		}
+		end = i
+	}
+	return end
+}
+
+func (p *typedProtection) precedingBracketOrigin(query string, at int) bool {
+	if at < 4 || query[at-1] != ' ' || query[at-3:at-1] != "*/" {
+		return false
+	}
+	if start := strings.LastIndex(query[:at-1], "/*"); start >= 0 {
+		origin, ok := p.markers[query[start:at-1]]
+		return ok && origin.bracketReference
+	}
+	return false
+}
 
 func provenBracketReference(source, normalized string) string {
 	open := strings.IndexByte(source, '[')
@@ -137,7 +184,16 @@ func markReferenceSources(query string, pattern *regexp.Regexp, transform func(s
 	last := 0
 	for _, loc := range pattern.FindAllStringIndex(query, -1) {
 		budget.step()
+		if loc[0] < last {
+			continue
+		}
 		if protected[loc[0]] {
+			continue
+		}
+		if pattern == typedBracketReference {
+			loc[1] = completeBracketReferenceEnd(query, loc[1], budget)
+		}
+		if pattern == typedNumericReference && p.precedingBracketOrigin(query, loc[0]) {
 			continue
 		}
 		original := query[loc[0]:loc[1]]
@@ -146,16 +202,24 @@ func markReferenceSources(query string, pattern *regexp.Regexp, transform func(s
 			continue
 		}
 		origin := letOrigin{source: original, normalized: normalized}
+		replacement := original
 		switch pattern {
 		case typedBracketReference:
 			origin.referenceValue = provenBracketReference(original, normalized)
 			origin.opaqueReference = origin.referenceValue == ""
+			origin.bracketReference = true
+			if origin.opaqueReference {
+				replacement = p.prefix + "opaque_" + strconv.Itoa(p.next) + "__"
+				origin.normalized = replacement
+			} else {
+				origin.normalized = fixNumericIdentifiers(normalized)
+			}
 		case typedNumericReference:
 			origin.referenceValue = original
 		}
 		out.WriteString(query[last:loc[0]])
 		out.WriteString(p.mark(origin, budget))
-		out.WriteString(original)
+		out.WriteString(replacement)
 		last = loc[1]
 	}
 	if last == 0 {
@@ -284,7 +348,7 @@ func markNullEscapeStrings(query string, p *typedProtection, budget *parseBudget
 // comparing decoded values with let definitions.
 type letOrigin struct {
 	source, binding, listSource, normalized, referenceValue string
-	opaqueReference                                         bool
+	opaqueReference, bracketReference                       bool
 }
 
 type typedProtection struct {
@@ -556,6 +620,21 @@ func (p *typedProtection) hasOpaqueReference(ctx antlr.ParserRuleContext) bool {
 	for i := sort.SearchInts(p.starts, start); i < len(p.starts) && p.starts[i] <= stop; i++ {
 		p.budget.step()
 		if p.byStart[p.starts[i]].opaqueReference {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *typedProtection) provesReferenceIn(tree antlr.ParserRuleContext, value string) bool {
+	if p == nil || tree == nil || tree.GetStart() == nil || tree.GetStop() == nil {
+		return false
+	}
+	start, stop := tree.GetStart().GetStart(), tree.GetStop().GetStop()
+	for i := sort.SearchInts(p.starts, start); i < len(p.starts) && p.starts[i] <= stop; i++ {
+		p.budget.step()
+		origin := p.byStart[p.starts[i]]
+		if !origin.opaqueReference && origin.referenceValue == value {
 			return true
 		}
 	}
