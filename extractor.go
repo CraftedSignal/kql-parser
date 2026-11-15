@@ -154,6 +154,7 @@ type conditionExtractor struct {
 	searchOrder         []ISearchOperatorContext
 	inSearch            int
 	letNames            map[string]bool
+	membership          *membershipProtection
 	subqueryMarkers     []int // Rune offsets of synthetic unresolved IN-subquery literals
 	unsupportedSubquery bool
 	originalQuery       string // normalized query text for extracting subexpressions
@@ -213,7 +214,11 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 	}
 	// Let bodies are intentionally outside the selected query. A search in the
 	// selected portion must survive every later normalization rewrite.
-	normalized, searches := protectSearchClauses(query, budget, skipLetStatements(query))
+	normalized := query
+	if metadata != nil {
+		normalized, metadata.membership = protectMembershipSources(normalized, budget)
+	}
+	normalized, searches := protectSearchClauses(normalized, budget, skipLetStatements(normalized))
 
 	// Remove line continuation backslashes (backslash followed by newline)
 	// Common in PowerShell-style queries copied from scripts
@@ -478,7 +483,9 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 	if metadata != nil {
 		// Earlier normalization can construct authored strings by joining
 		// adjacent literals. Select provenance markers only after that step.
+		membership := metadata.membership
 		*metadata = *newKQLNormalizationMetadata(normalized+"\n"+query, budget)
+		metadata.membership = membership
 		placeholder = metadata.subqueryMarker
 	}
 	normalized = normalizeInSubqueriesWithPlaceholder(normalized, placeholder, budget)
@@ -2744,10 +2751,9 @@ func indexByteOutsideStrings(s string, needle byte, start int) int {
 	return indexOutsideStrings(s, string(needle), start, false)
 }
 
-// SubqueryPlaceholder is the value of a membership condition whose values
-// come from a subquery, as in Account in (SigninLogs | project Account): the
-// parser does not evaluate the subquery. This is an unresolved legacy marker,
-// not literal executable membership; normalization discards the subquery text.
+// SubqueryPlaceholder is retained for legacy normalization/debug compatibility.
+// Public parse and semantic results preserve inline tabular membership as an
+// opaque ScalarPredicate and do not emit this value as a condition.
 const SubqueryPlaceholder = "SubqueryResult"
 
 func normalizeInSubqueries(query string) string {
@@ -5031,6 +5037,12 @@ func extractConditionsInternal(query string, budget *parseBudget) (result *Parse
 
 	// Parse the query
 	tree := parser.Query()
+	if normalization.membership != nil {
+		normalization.membership.bind(tree, normalizedQuery, budget)
+	}
+	if len(normalization.membership.entries) > 0 && (len(lexerErrors.errors) > 0 || len(parserErrors.errors) > 0) {
+		return &ParseResult{Conditions: []Condition{}, Errors: append(lexerErrors.errors, parserErrors.errors...)}
+	}
 	searchCount, searchError := validateKQLSearches(tree, budget)
 	if (normalization.searchCount > 0 || searchCount > 0) && (searchCount != normalization.searchCount || searchError != "" || len(lexerErrors.errors) > 0 || len(parserErrors.errors) > 0) {
 		if searchError == "" {
@@ -5052,6 +5064,7 @@ func extractConditionsInternal(query string, budget *parseBudget) (result *Parse
 		originalQuery:       normalizedQuery,
 		expressionLeaves:    make(map[IComparisonExpressionContext]*ConditionExpression),
 		letNames:            make(map[string]bool),
+		membership:          normalization.membership,
 		subqueryMarkers:     normalization.subqueryOffsets,
 	}
 	letStatements := extractLetStatements(query)
@@ -5237,7 +5250,11 @@ func (e *conditionExtractor) extractTabularExpressionText(ctx ITabularExpression
 	if start, stop := ctx.GetStart(), ctx.GetStop(); start != nil && stop != nil {
 		positions := searchRuneBytes(e.originalQuery, e.budget)
 		if start.GetStart() >= 0 && stop.GetStop() >= start.GetStart() && stop.GetStop()+1 < len(positions) {
-			return e.originalQuery[positions[start.GetStart()]:positions[stop.GetStop()+1]]
+			text := e.originalQuery[positions[start.GetStart()]:positions[stop.GetStop()+1]]
+			if e.membership != nil {
+				return e.membership.originalSubquery(text, e.budget)
+			}
+			return text
 		}
 	}
 	return kqlSourceText(ctx, e.budget)
@@ -5740,18 +5757,28 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 			}
 		}
 	}
+	if e.membership != nil {
+		if entry := e.membership.byContext[ctx]; entry != nil {
+			e.budget.reserveOutput(1)
+			e.expressionLeaves[ctx] = &ConditionExpression{Operator: BooleanScalar, Scalar: &ScalarPredicate{Text: entry.source, PipeStage: e.currentStage, Pipeline: e.currentPipeline()}}
+			return
+		}
+	}
+	// A generated legacy placeholder in a row filter is never a literal
+	// membership value. If early source protection missed an enclosing path,
+	// fail the entire result instead of lowering a fabricated condition.
+	for _, offset := range e.subqueryMarkers {
+		e.budget.step()
+		if ctx.GetStart().GetStart() <= offset && offset <= ctx.GetStop().GetStop() {
+			e.unsupportedSubquery = true
+			return
+		}
+	}
 	if e.expressionLeaves == nil {
 		e.expressionLeaves = make(map[IComparisonExpressionContext]*ConditionExpression)
 	}
 	scalar := func() {
 		e.budget.step()
-		for _, offset := range e.subqueryMarkers {
-			e.budget.step()
-			if ctx.GetStart().GetStart() <= offset && offset <= ctx.GetStop().GetStop() {
-				e.unsupportedSubquery = true
-				return
-			}
-		}
 		e.budget.reserveOutput(1)
 		e.expressionLeaves[ctx] = &ConditionExpression{Operator: BooleanScalar, Scalar: &ScalarPredicate{Text: kqlSourceText(ctx, e.budget), PipeStage: e.currentStage, Pipeline: e.currentPipeline()}}
 	}

@@ -8,7 +8,9 @@ import (
 )
 
 // ScalarPredicate is a complete, unevaluated row-filter predicate. Text is
-// the exact normalized input slice; Negated applies an enclosing boolean NOT.
+// the exact normalized input slice for ordinary scalars. Inline tabular
+// membership preserves the original authored predicate atom instead. Negated
+// applies an enclosing boolean NOT; operator-internal !in remains in Text.
 // Consumers must preserve it or explicitly reject unsupported scalar filters.
 type ScalarPredicate struct {
 	Text      string `json:"text"`

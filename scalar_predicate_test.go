@@ -317,7 +317,7 @@ func TestRangeBoundsKeepTypedReferences(t *testing.T) {
 	}
 }
 
-func TestSyntheticSubqueryCannotBecomeCompleteScalar(t *testing.T) {
+func TestInlineSubqueryPreservesCompleteScalar(t *testing.T) {
 	for _, predicate := range []string{
 		`tolower(Account) in ((SigninLogs | project Account))`,
 		`5 in ((T2 | project n))`,
@@ -330,12 +330,26 @@ func TestSyntheticSubqueryCannotBecomeCompleteScalar(t *testing.T) {
 	} {
 		query := `T | where ` + predicate
 		r := ExtractConditions(query)
-		if len(r.Errors) != 1 || r.Errors[0] != "unsupported scalar predicate: unresolved IN subquery" || len(r.Conditions) != 0 || r.Expression != nil {
-			t.Errorf("synthetic subquery looked complete: %s: %#v", query, r)
+		if len(r.Errors) != 0 || r.Expression == nil {
+			t.Errorf("inline subquery lost: %s: %#v", query, r)
+		}
+		for _, condition := range r.Conditions {
+			if condition.Value == SubqueryPlaceholder {
+				t.Errorf("inline subquery fabricated a condition: %s: %#v", query, r)
+			}
+		}
+		found := false
+		for _, scalar := range scalarLeaves(r.Expression) {
+			if strings.Contains(scalar.Text, ` in ((`) && !strings.Contains(scalar.Text, `"SubqueryResult"`) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("inline subquery source missing: %s: %#v", query, r)
 		}
 		semantic := AnalyzeQuery(query)
-		if len(semantic.Errors) != 1 || semantic.Errors[0] != "unsupported scalar predicate: unresolved IN subquery" || len(semantic.Conditions) != 0 || semantic.Expression != nil {
-			t.Errorf("semantic extraction retained partial filters: %s: %#v", query, semantic)
+		if len(semantic.Errors) != 0 || semantic.Expression == nil {
+			t.Errorf("semantic extraction lost inline subquery: %s: %#v", query, semantic)
 		}
 	}
 }
@@ -349,7 +363,11 @@ func TestAuthoredSubqueryMarkerStringsRemainOrdinaryValues(t *testing.T) {
 		`tolower(Account) in ("__kql_in_subquery_0__") and Account in ((SigninLogs | project Account))`,
 	} {
 		r := ExtractConditions(`T | where ` + predicate)
-		if leaves := scalarLeaves(r.Expression); len(r.Errors) != 0 || len(leaves) != 1 {
+		want := 1
+		if strings.Contains(predicate, `SigninLogs | project Account`) {
+			want = 2
+		}
+		if leaves := scalarLeaves(r.Expression); len(r.Errors) != 0 || len(leaves) != want || leaves[0].Text == "" {
 			t.Errorf("authored string confused with synthetic marker: %s: %#v", predicate, r)
 		}
 	}
@@ -374,21 +392,19 @@ func TestSubqueryProvenanceAfterStringJoining(t *testing.T) {
 	query := `T | where "é" == "é" and a == "__kql_in_" "subquery_0__" and b == "__kql_in_subquery_" "1__" and c == "SubqueryResult" and Account in ((SigninLogs | project Account)) and User in ((AuditLogs | project User))`
 	metadata := newKQLNormalizationMetadata(query)
 	normalized := normalizeWithMetadata(query, false, metadata)
-	if normalized != NormalizeQueryForDebug(query) || len(metadata.subqueryOffsets) != 2 {
+	if metadata.membership == nil || len(metadata.membership.entries) != 2 || len(metadata.subqueryOffsets) != 0 || !strings.Contains(normalized, metadata.membership.entries[0].marker) || !strings.Contains(normalized, metadata.membership.entries[1].marker) {
 		t.Fatalf("normalization parity or generated provenance changed: %s / %#v", normalized, metadata)
 	}
-	for _, offset := range metadata.subqueryOffsets {
-		if suffix := string([]rune(normalized)[offset:]); !strings.HasPrefix(suffix, `"SubqueryResult")`) {
-			t.Errorf("generated marker rune offset points at authored source: %d: %s", offset, suffix)
-		}
+	if metadata.membership.entries[0].source != `Account in ((SigninLogs | project Account))` || metadata.membership.entries[1].source != `User in ((AuditLogs | project User))` {
+		t.Errorf("occurrence sources changed: %#v", metadata.membership.entries)
 	}
 	r := ExtractConditions(query)
-	if len(r.Errors) != 0 || len(r.Conditions) != 5 || r.Conditions[0].Value != "__kql_in_subquery_0__" || r.Conditions[1].Value != "__kql_in_subquery_1__" || len(scalarLeaves(r.Expression)) != 1 {
+	if len(r.Errors) != 0 || len(r.Conditions) != 3 || r.Conditions[0].Value != "__kql_in_subquery_0__" || r.Conditions[1].Value != "__kql_in_subquery_1__" || len(scalarLeaves(r.Expression)) != 3 {
 		t.Fatalf("mixed generated/authored markers changed: %#v", r)
 	}
 	query += ` and 5 in ((Other | project n))`
 	r = ExtractConditions(query)
-	if len(r.Errors) != 1 || r.Errors[0] != "unsupported scalar predicate: unresolved IN subquery" || len(r.Conditions) != 0 || r.Expression != nil {
-		t.Fatalf("actual synthetic scalar escaped guard: %#v", r)
+	if len(r.Errors) != 0 || len(r.Conditions) != 3 || len(scalarLeaves(r.Expression)) != 4 {
+		t.Fatalf("additional inline source lost: %#v", r)
 	}
 }
