@@ -626,6 +626,30 @@ func (p *typedProtection) hasOpaqueReference(ctx antlr.ParserRuleContext) bool {
 	return false
 }
 
+func (p *typedProtection) hasOrigin(ctx antlr.ParserRuleContext) bool {
+	if p == nil || ctx == nil || ctx.GetStart() == nil || ctx.GetStop() == nil {
+		return false
+	}
+	start, stop := ctx.GetStart().GetStart(), ctx.GetStop().GetStop()
+	i := sort.SearchInts(p.starts, start)
+	return i < len(p.starts) && p.starts[i] <= stop
+}
+
+func (p *typedProtection) opaqueValueIn(ctx antlr.ParserRuleContext, value string) bool {
+	if p == nil || ctx == nil || ctx.GetStart() == nil || ctx.GetStop() == nil {
+		return false
+	}
+	start, stop := ctx.GetStart().GetStart(), ctx.GetStop().GetStop()
+	for i := sort.SearchInts(p.starts, start); i < len(p.starts) && p.starts[i] <= stop; i++ {
+		p.budget.step()
+		origin := p.byStart[p.starts[i]]
+		if origin.opaqueReference && origin.normalized == value {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *typedProtection) provesReferenceIn(tree antlr.ParserRuleContext, value string) bool {
 	if p == nil || tree == nil || tree.GetStart() == nil || tree.GetStop() == nil {
 		return false

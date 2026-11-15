@@ -5632,6 +5632,10 @@ func (e *conditionExtractor) EnterGroupByItem(ctx *GroupByItemContext) {
 		e.groupByFields = append(e.groupByFields, alias)
 		e.computedFields[strings.ToLower(alias)] = ""
 	} else if ctx.Expression() != nil {
+		if e.typed.hasOpaqueReference(ctx.Expression()) {
+			e.groupByExpressions = append(e.groupByExpressions, e.typed.sourceOf(ctx.Expression()))
+			return
+		}
 		text := ctx.Expression().GetText()
 		if isValidFieldName(text) {
 			e.groupByFields = append(e.groupByFields, text)
@@ -5655,9 +5659,14 @@ func (e *conditionExtractor) EnterExtendItem(ctx *ExtendItemContext) {
 		// Try to extract the source field from the expression
 		if ctx.Expression() != nil {
 			expression = ctx.Expression().GetText()
+			if e.typed.hasOrigin(ctx.Expression()) {
+				expression = e.typed.sourceOf(ctx.Expression())
+			}
 			sourceField = extractFirstFieldFromExpression(ctx.Expression())
-			if sourceField == expression {
+			if sourceField == ctx.Expression().GetText() {
 				sourceField = e.typed.sourceOf(ctx.Expression())
+			} else if e.typed.opaqueValueIn(ctx.Expression(), sourceField) {
+				sourceField = ""
 			}
 		}
 
@@ -5778,9 +5787,14 @@ func (e *conditionExtractor) EnterProjectItem(ctx *ProjectItemContext) {
 		sourceField, expression := "", ""
 		if ctx.Expression() != nil {
 			expression = ctx.Expression().GetText()
+			if e.typed.hasOrigin(ctx.Expression()) {
+				expression = e.typed.sourceOf(ctx.Expression())
+			}
 			sourceField = extractFirstFieldFromExpression(ctx.Expression())
-			if sourceField == expression {
+			if sourceField == ctx.Expression().GetText() {
 				sourceField = e.typed.sourceOf(ctx.Expression())
+			} else if e.typed.opaqueValueIn(ctx.Expression(), sourceField) {
+				sourceField = ""
 			}
 		}
 		e.computedFields[strings.ToLower(field)] = sourceField
@@ -5789,6 +5803,9 @@ func (e *conditionExtractor) EnterProjectItem(ctx *ProjectItemContext) {
 	} else if ctx.Expression() != nil {
 		// Simple project item: project FieldName
 		// The field name is the expression text (for simple identifiers)
+		if e.typed.hasOpaqueReference(ctx.Expression()) {
+			return // The expression has no representable column identity.
+		}
 		text := ctx.Expression().GetText()
 		if isValidFieldName(text) {
 			e.projectedFields = append(e.projectedFields, text)

@@ -1,6 +1,7 @@
 package kql
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -14,6 +15,75 @@ func requireTypedReviewCondition(t *testing.T, query string) Condition {
 		t.Fatalf("%q: parse=%#v semantic=%#v", query, parsed, semantic)
 	}
 	return parsed.Conditions[0]
+}
+
+func TestTypedReviewOpaqueReferenceMetadata(t *testing.T) {
+	for _, fixture := range []struct {
+		query, projected, computed, groupExpression, sourceField string
+		join                                                     bool
+	}{
+		{query: `T | project bag['a'][0]`},
+		{query: `T | extend d=bag['a'][0] | where d == 1`, computed: `bag['a'][0]`, sourceField: `bag['a'][0]`},
+		{query: `T | project d=bag['a'][0] | where d == 1`, projected: `d`, computed: `bag['a'][0]`, sourceField: `bag['a'][0]`},
+		{query: `T | extend d=bag['a'][0]+1 | where d == 1`, computed: `bag['a'][0]+1`},
+		{query: `T | project d=bag['a'][0]+1 | where d == 1`, projected: `d`, computed: `bag['a'][0]+1`},
+		{query: `T | extend d=a+bag['a'][0] | where d == 1`, computed: `a+bag['a'][0]`, sourceField: `a`},
+		{query: `T | summarize count() by bag['a'][0]`, groupExpression: `bag['a'][0]`},
+		{query: `T | join (U | project bag['a'][0]) on id`, join: true},
+	} {
+		parsed, semantic := ExtractConditions(fixture.query), AnalyzeQuery(fixture.query)
+		if len(parsed.Errors) != 0 || len(semantic.Errors) != 0 {
+			t.Fatalf("%q: parse=%#v semantic=%#v", fixture.query, parsed.Errors, semantic.Errors)
+		}
+		for _, result := range []any{parsed, semantic} {
+			encoded, err := json.Marshal(result)
+			if err != nil || strings.Contains(string(encoded), "__kql_typed_origin_") {
+				t.Errorf("private metadata in %q: %s / %v", fixture.query, encoded, err)
+			}
+		}
+		if fixture.projected == "" && (len(parsed.ProjectedFields) != 0 || len(semantic.ProjectedFields) != 0) || fixture.projected != "" && (!reflect.DeepEqual(parsed.ProjectedFields, []string{fixture.projected}) || !reflect.DeepEqual(semantic.ProjectedFields, []string{fixture.projected})) || len(parsed.GroupByFields) != 0 || len(semantic.GroupByFields) != 0 {
+			t.Errorf("fabricated column in %q: parse=%#v semantic=%#v", fixture.query, parsed, semantic)
+		}
+		if fixture.computed != "" && (parsed.ComputedExpressions["d"] != fixture.computed || semantic.ComputedExpressions["d"] != fixture.computed) {
+			t.Errorf("computed expression %q: parse=%#v semantic=%#v", fixture.query, parsed.ComputedExpressions, semantic.ComputedExpressions)
+		}
+		if fixture.computed != "" && (parsed.ComputedFields["d"] != fixture.sourceField || semantic.ComputedFields["d"] != fixture.sourceField) {
+			t.Errorf("computed source %q: parse=%#v semantic=%#v", fixture.query, parsed.ComputedFields, semantic.ComputedFields)
+		}
+		if fixture.groupExpression != "" && (len(parsed.GroupByExpressions) != 1 || parsed.GroupByExpressions[0] != fixture.groupExpression) {
+			t.Errorf("group expression %q: %#v", fixture.query, parsed.GroupByExpressions)
+		}
+		if fixture.join {
+			if len(parsed.Joins) != 1 || parsed.Joins[0].Subsearch == nil || len(parsed.Joins[0].Subsearch.ProjectedFields) != 0 || !reflect.DeepEqual(parsed.Joins[0].ExposedFields, []string{"id"}) || len(semantic.Joins) != 1 || semantic.Joins[0].Subquery == nil || len(semantic.Joins[0].Subquery.ProjectedFields) != 0 || !reflect.DeepEqual(semantic.Joins[0].ExposedFields, []string{"id"}) {
+				t.Errorf("join metadata %q: parse=%#v semantic=%#v", fixture.query, parsed.Joins, semantic.Joins)
+			}
+		}
+	}
+}
+
+func TestTypedReviewSimpleReferenceMetadataControls(t *testing.T) {
+	for _, fixture := range []struct {
+		query, projected, computed, group string
+	}{
+		{query: `T | project x`, projected: `x`},
+		{query: `T | project bag['key']`, projected: `bag.key`},
+		{query: `T | project d=bag['key']`, projected: `d`, computed: `bag['key']`},
+		{query: `T | summarize count() by bag['key']`, group: `bag.key`},
+	} {
+		parsed, semantic := ExtractConditions(fixture.query), AnalyzeQuery(fixture.query)
+		if len(parsed.Errors) != 0 || len(semantic.Errors) != 0 {
+			t.Fatalf("%q: parse=%#v semantic=%#v", fixture.query, parsed.Errors, semantic.Errors)
+		}
+		if fixture.projected != "" && (!reflect.DeepEqual(parsed.ProjectedFields, []string{fixture.projected}) || !reflect.DeepEqual(semantic.ProjectedFields, []string{fixture.projected})) {
+			t.Errorf("projected %q: parse=%#v semantic=%#v", fixture.query, parsed.ProjectedFields, semantic.ProjectedFields)
+		}
+		if fixture.computed != "" && (parsed.ComputedExpressions["d"] != fixture.computed || semantic.ComputedExpressions["d"] != fixture.computed) {
+			t.Errorf("computed %q: parse=%#v semantic=%#v", fixture.query, parsed.ComputedExpressions, semantic.ComputedExpressions)
+		}
+		if fixture.group != "" && (!reflect.DeepEqual(parsed.GroupByFields, []string{fixture.group}) || !reflect.DeepEqual(semantic.GroupByFields, []string{fixture.group})) {
+			t.Errorf("grouped %q: parse=%#v semantic=%#v", fixture.query, parsed.GroupByFields, semantic.GroupByFields)
+		}
+	}
 }
 
 func TestTypedReviewAuthoredMarkerCollisions(t *testing.T) {
