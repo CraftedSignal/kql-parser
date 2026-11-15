@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
-func membershipScalar(t *testing.T, query, source string) (*ParseResult, *SemanticQuery) {
+func membershipScalar(t *testing.T, query, source string) *SemanticQuery {
 	t.Helper()
 	parsed, semantic := ExtractConditions(query), AnalyzeQuery(query)
 	if len(parsed.Errors) != 0 || len(semantic.Errors) != 0 {
@@ -18,7 +19,10 @@ func membershipScalar(t *testing.T, query, source string) (*ParseResult, *Semant
 		semantic.Expression == nil || semantic.Expression.Operator != BooleanScalar || semantic.Expression.Scalar == nil || semantic.Expression.Scalar.Text != source {
 		t.Fatalf("membership source was not a complete scalar %q: parsed %#v, semantic %#v", source, parsed, semantic)
 	}
-	return parsed, semantic
+	if parsed.Expression.Scalar.Negated || semantic.Expression.Scalar.Negated {
+		t.Fatalf("operator-internal negation applied twice: %#v / %#v", parsed.Expression.Scalar, semantic.Expression.Scalar)
+	}
+	return semantic
 }
 
 func semanticMembershipShape(expression *SemanticExpression) string {
@@ -83,6 +87,10 @@ func TestMembershipSubqueryOpaqueOperatorAndSource(t *testing.T) {
 		{`Account !in~ ((SigninLogs | project Account))`},
 		{`tolower(Account) in ((SigninLogs | project Account))`},
 		{`tolower(Account) !in ((SigninLogs | project Account))`},
+		{`isnull(tolower(Account) in ((SigninLogs | project Account)))`},
+		{`isnull(Account in ((SigninLogs | project Account))) == false`},
+		{`toint(Account in ((SigninLogs | project Account))) + 1 > 0`},
+		{`(Account in ((SigninLogs | project Account))) == true`},
 	} {
 		t.Run(fixture.predicate, func(t *testing.T) {
 			membershipScalar(t, `T | where `+fixture.predicate, fixture.predicate)
@@ -134,6 +142,7 @@ func TestMembershipSubqueryOriginalSourceAndAuthoredMarkers(t *testing.T) {
 		`Account in ((SigninLogs | where Message == "é" | project Account))`,
 		`Account in ((SigninLogs | where Message == """é""" | project Account))`,
 		`Account in ((SigninLogs | where Message containscs "ERR" | project Account))`,
+		`Account in ((SigninLogs | search "needle" | project Account))`,
 		`Account in ((materialize(SigninLogs | where Message == "make_set(") | project Account))`,
 		`Account in ((SigninLogs | where Message == "SubqueryResult" | project Account))`,
 		`Account in ((SigninLogs | where Message == "__kql_in_subquery_0__" | project Account))`,
@@ -161,7 +170,7 @@ func TestMembershipSubqueryScopeAndNonfilterControls(t *testing.T) {
 		`T | summarize n=countif(Account in ((SigninLogs | project Account)))`,
 	} {
 		parsed, semantic := ExtractConditions(query), AnalyzeQuery(query)
-		if len(parsed.Conditions) != 0 || parsed.Expression != nil || len(semantic.Conditions) != 0 || semantic.Expression != nil {
+		if len(parsed.Errors) != 0 || len(semantic.Errors) != 0 || len(parsed.Conditions) != 0 || parsed.Expression != nil || len(semantic.Conditions) != 0 || semantic.Expression != nil {
 			t.Errorf("nonfilter membership became row filter: %s: %#v / %#v", query, parsed, semantic)
 		}
 	}
@@ -171,17 +180,27 @@ func TestMembershipSubqueryScopeAndNonfilterControls(t *testing.T) {
 		t.Errorf("unused let changed selected filter: %#v / %#v", parsed, semantic)
 	}
 	query = `let allowed = SigninLogs | project Account; T | where Account in ((allowed | project Account))`
-	_, semantic = membershipScalar(t, query, `Account in ((allowed | project Account))`)
+	semantic = membershipScalar(t, query, `Account in ((allowed | project Account))`)
 	if len(semantic.LetStatements) != 1 || semantic.LetStatements[0].Name != "allowed" {
 		t.Errorf("let binding lost: %#v", semantic.LetStatements)
 	}
+	query = `let allowed = SigninLogs | project Account; T | where Account in (allowed)`
+	semantic = membershipScalar(t, query, `Account in (allowed)`)
+	if len(semantic.LetStatements) != 1 {
+		t.Errorf("let reference lost its binding: %#v", semantic)
+	}
+	query = `let allowed = SigninLogs | project Account; T | where Account in ("allowed")`
+	parsed, semantic = ExtractConditions(query), AnalyzeQuery(query)
+	if len(parsed.Errors) != 0 || len(semantic.Errors) != 0 || len(parsed.Conditions) != 1 || len(semantic.Conditions) != 1 || parsed.Conditions[0].Value != "allowed" || semantic.Expression == nil || semantic.Expression.Operator != BooleanCondition {
+		t.Errorf("quoted let name ceased to be a literal: %#v / %#v", parsed, semantic)
+	}
 	query = `T | where a == 1 | where Account in ((SigninLogs | project Account))`
 	parsed, semantic = ExtractConditions(query), AnalyzeQuery(query)
-	if len(parsed.Errors) != 0 || len(semantic.Errors) != 0 || len(semantic.Conditions) != 1 || semanticMembershipShape(semantic.Expression) != `and(condition(a),scalar(Account in ((SigninLogs | project Account))))` {
+	if len(parsed.Errors) != 0 || len(semantic.Errors) != 0 || len(semantic.Conditions) != 1 || semanticMembershipShape(semantic.Expression) != `and(condition(a),scalar(Account in ((SigninLogs | project Account))))` || semantic.Expression.Children[1].Scalar.PipeStage != 1 || semantic.Expression.Children[1].Scalar.Pipeline != 0 {
 		t.Errorf("pipeline stage ownership: %#v / %#v", parsed, semantic)
 	}
 	query = `let allowed = AuditLogs | project Account; let allowed = SigninLogs | project Account; T | where Account in ((allowed | project Account))`
-	_, semantic = membershipScalar(t, query, `Account in ((allowed | project Account))`)
+	semantic = membershipScalar(t, query, `Account in ((allowed | project Account))`)
 	if len(semantic.LetStatements) != 2 {
 		t.Errorf("shadowed bindings lost: %#v", semantic.LetStatements)
 	}
@@ -208,14 +227,22 @@ func TestMembershipSubqueryMalformedAndContextFailures(t *testing.T) {
 		`T | where a == 1 and Account in ((SigninLogs | where ResultType == | project Account))`,
 		`T | where Account in ((SigninLogs | project Account)`,
 		`T | where Account in ((SigninLogs | where Message == "unterminated | project Account))`,
+		`T | where Account in ((SigninLogs | search kind=bad "needle" | project Account))`,
+		`T | mv-apply x on (U | where Account in ((SigninLogs | project Account))) | where a == 1`,
 	} {
 		parsed, semantic := ExtractConditions(query), AnalyzeQuery(query)
 		if len(parsed.Errors) == 0 || len(semantic.Errors) == 0 || len(parsed.Conditions) != 0 || parsed.Expression != nil || len(semantic.Conditions) != 0 || semantic.Expression != nil {
 			t.Errorf("malformed membership produced partial success: %s: %#v / %#v", query, parsed, semantic)
 		}
+		if len(Validate(query)) == 0 {
+			t.Errorf("validation accepted malformed or removed membership: %s", query)
+		}
 	}
 	query := `T | where Account in ((SigninLogs | project Account))`
 	parsed, semantic := ExtractConditions(query), AnalyzeQuery(query)
+	if errs := Validate(query); len(errs) != 0 {
+		t.Errorf("validation rejected valid membership: %v", errs)
+	}
 	parseJSON, _ := json.Marshal(parsed)
 	semanticJSON, _ := json.Marshal(semantic)
 	var parsedCopy ParseResult
@@ -232,6 +259,10 @@ func TestMembershipSubqueryMalformedAndContextFailures(t *testing.T) {
 	contextParsed, contextSemantic := ExtractConditionsContext(context.Background(), query), AnalyzeQueryContext(context.Background(), query)
 	if !reflect.DeepEqual(parsed, contextParsed) || !reflect.DeepEqual(semantic, contextSemantic) {
 		t.Errorf("context API differs: %#v / %#v", contextParsed, contextSemantic)
+	}
+	semantic.Expression.Scalar.Text = "mutated"
+	if parsed.Expression.Scalar.Text != `Account in ((SigninLogs | project Account))` {
+		t.Errorf("semantic conversion aliased parse source: %#v", parsed.Expression)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -250,5 +281,33 @@ func TestMembershipSubqueryMalformedAndContextFailures(t *testing.T) {
 		if len(limitedParse.Errors) == 0 || len(limitedSemantic.Errors) == 0 || len(limitedParse.Conditions) != 0 || limitedParse.Expression != nil || len(limitedSemantic.Conditions) != 0 || limitedSemantic.Expression != nil {
 			t.Errorf("budget failure returned partial membership: %#v / %#v", limitedParse, limitedSemantic)
 		}
+	}
+}
+
+func TestMembershipSourceAssociationRejectsMissingOrDuplicateIdentity(t *testing.T) {
+	query := `T | where Account in ((SigninLogs | project Account))`
+	for _, mutate := range []func(string, string) string{
+		func(normalized, marker string) string { return strings.Replace(normalized, marker, "true", 1) },
+		func(normalized, marker string) string {
+			return strings.Replace(normalized, marker, marker+" and "+marker, 1)
+		},
+	} {
+		func() {
+			budget, cancel := newParseBudget(context.Background(), defaultParseLimits())
+			defer cancel()
+			protected, ownership := protectMembershipSources(query, budget)
+			changed := mutate(protected, ownership.entries[0].marker)
+			parser := NewKQLParser(preflight(changed, budget, true, nil))
+			parser.RemoveErrorListeners()
+			tree := parser.Query()
+			defer func() {
+				if failure := recover(); failure == nil {
+					t.Errorf("missing or duplicated membership identity was accepted: %q", changed)
+				} else if _, ok := failure.(budgetAbort); !ok {
+					t.Errorf("unexpected association failure: %v", failure)
+				}
+			}()
+			ownership.bind(tree, changed, budget)
+		}()
 	}
 }

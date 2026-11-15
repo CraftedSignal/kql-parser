@@ -41,6 +41,9 @@ func validateContext(ctx context.Context, query string, limits parseLimits) (err
 	parser.RemoveErrorListeners()
 	parser.AddErrorListener(listener)
 	tree := parser.Query()
+	if normalization.membership != nil {
+		normalization.membership.bind(tree, normalized, budget)
+	}
 	if count, diagnostic := validateKQLSearches(tree, budget); normalization.searchCount > 0 || count > 0 {
 		if diagnostic != "" {
 			return []string{diagnostic}

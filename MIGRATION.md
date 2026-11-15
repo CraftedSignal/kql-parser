@@ -15,8 +15,10 @@ right now emit the reference as `Field` and reverse relational operators.
 
 Consumers must walk `Expression`, handle `BooleanScalar`, and preserve its
 `Text`, `Negated`, `PipeStage`, and `Pipeline`. `Text` is an exact slice of the
-normalized parser input, not necessarily of the original query. The parser
-does not evaluate or fold scalar predicates. Applying `Negated` means negating
+normalized parser input for ordinary scalars. An inline tabular membership
+instead retains the complete original authored atom, including its left
+operand, operator spelling, subquery, comments and internal whitespace. The
+parser does not evaluate or fold scalar predicates. Applying `Negated` means negating
 the complete predicate. The semantic API clones scalar payloads.
 
 A consumer that cannot represent or execute scalar leaves must explicitly
@@ -39,23 +41,20 @@ Literal list elements remain condition values; quoted literals never become
 references. Representable range bounds use `ValueReference` for columns and
 `Value` for literals.
 
-The existing IN-subquery placeholder is a legacy exception: normalization
-still discards the subquery and projects membership as a condition whose
-`Value` is `SubqueryPlaceholder` (`"SubqueryResult"`). This is an unresolved
-subquery marker, not an executable literal membership test or preservation
-of the original subquery source. Consumers must treat that marker as
-unsupported unless they resolve the subquery independently. Normalized input
-quotes this synthetic marker to distinguish it from a genuine unquoted column
-reference named `SubqueryResult`, which remains scalar. A user-authored string
-literal `"SubqueryResult"` still collides with the public legacy marker; this
-schema has no provenance field to distinguish those cases.
-If that generated marker would instead become part of a scalar predicate
-(for example, `tolower(Account) in ((SigninLogs | project Account))`), extraction
-fails with `unsupported scalar predicate: unresolved IN subquery`, no conditions,
-and no expression. This also discards other filters in the query so callers
-cannot accidentally execute partial AND/OR semantics. Private normalization
-provenance distinguishes generated markers from user-authored strings; a scalar
-that explicitly contains the string `"SubqueryResult"` remains supported.
+Inline tabular membership such as `Account in ((SigninLogs | project Account))`
+is now a `BooleanScalar` leaf with that complete source as `Text`. It does not
+emit a synthetic `Condition` or a literal `"SubqueryResult"` value. Different
+subqueries, repeated occurrences, and an authored `"SubqueryResult"` literal
+remain distinct in the public parse and semantic models. `!in`/`!in~` stay in
+the authored text; `Negated` records only an enclosing Boolean NOT. Membership
+inside a larger atomic scalar, such as `isnull(Account in (...))`, preserves the
+whole atom. AND/OR grouping and other condition leaves remain structured.
+
+The exported `SubqueryPlaceholder` constant and `NormalizeQueryForDebug`'s
+legacy placeholder output are retained for compatibility with normalization
+tools; neither represents an executable membership condition. A consumer must
+handle or explicitly reject the opaque scalar. Malformed tabular RHS syntax or
+lost source association yields a failure-only result without partial filters.
 
 This parser change does not update or release the platform dependency. Before
 adopting it, the platform adapter must handle scalar leaves or return an
