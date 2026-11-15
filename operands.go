@@ -3,6 +3,7 @@ package kql
 import (
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // OperandKind describes the authored role of a condition's right operand.
@@ -117,7 +118,11 @@ func decodeKQLString(source string) string {
 							continue
 						}
 					}
-					b.WriteRune(rune(value))
+					if value > utf8.MaxRune {
+						b.WriteRune(utf8.RuneError)
+					} else {
+						b.WriteRune(rune(value))
+					}
 					i += n
 					continue
 				}
