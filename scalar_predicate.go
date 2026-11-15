@@ -22,6 +22,7 @@ type ScalarPredicate struct {
 type kqlOperand struct {
 	text               string
 	reference, literal bool
+	rhs                *Operand
 }
 
 // Classify syntax, never a float approximation or a field-name guess. In
@@ -32,22 +33,34 @@ func recognizeKQLOperand(tree antlr.Tree, budgets ...*parseBudget) kqlOperand {
 
 	switch ctx := tree.(type) {
 	case ILiteralContext:
-		return kqlOperand{text: ctx.GetText(), literal: true}
+		text := kqlSourceText(ctx, budget)
+		return kqlOperand{text: ctx.GetText(), literal: true, rhs: literalKQLOperand(ctx.GetStart().GetTokenType(), text)}
 	case IIdentifierContext:
 		text := ctx.GetText()
-		if numericToken.MatchString(text) || text == "true" || text == "false" {
-			return kqlOperand{text: text, literal: true}
+		if numericToken.MatchString(text) {
+			return kqlOperand{text: text, literal: true, rhs: &Operand{Kind: OperandNumber, Source: text, Value: text}}
 		}
-		return kqlOperand{text: text, reference: true}
+		if text == "true" || text == "false" {
+			return kqlOperand{text: text, literal: true, rhs: &Operand{Kind: OperandBool, Source: text, Value: text}}
+		}
+		return kqlOperand{text: text, reference: true, rhs: &Operand{Kind: OperandField, Source: text, Value: text}}
 	case IPrimaryExpressionContext:
 		if token := ctx.QUOTED_IDENTIFIER(); token != nil {
-			return kqlOperand{text: decodeKQLIdentifier(token.GetText(), budget), reference: true}
+			return kqlOperand{text: decodeKQLIdentifier(token.GetText(), budget), reference: true, rhs: &Operand{Kind: OperandField, Source: token.GetText(), Value: decodeKQLIdentifier(token.GetText(), budget)}}
 		}
 	case IUnaryExpressionContext:
 		if ctx.MINUS() != nil || ctx.PLUS() != nil {
 			child := recognizeKQLOperand(ctx.UnaryExpression(), budget)
 			if child.literal {
 				child.text = kqlSourceText(ctx, budget)
+				if child.rhs != nil {
+					copy := *child.rhs
+					copy.Source = child.text
+					if copy.Kind == OperandNumber {
+						copy.Value = child.text
+					}
+					child.rhs = &copy
+				}
 				return child
 			}
 			return kqlOperand{}
@@ -55,7 +68,7 @@ func recognizeKQLOperand(tree antlr.Tree, budgets ...*parseBudget) kqlOperand {
 	case IPostfixExpressionContext:
 		if len(ctx.AllPostfixOperator()) > 0 {
 			if base := recognizeKQLOperand(ctx.PrimaryExpression(), budget); base.reference && isValidFieldName(ctx.GetText()) {
-				return kqlOperand{text: ctx.GetText(), reference: true}
+				return kqlOperand{text: ctx.GetText(), reference: true, rhs: &Operand{Kind: OperandField, Source: kqlSourceText(ctx, budget), Value: ctx.GetText()}}
 			}
 			return kqlOperand{}
 		}
@@ -69,15 +82,28 @@ func recognizeKQLOperand(tree antlr.Tree, budgets ...*parseBudget) kqlOperand {
 		case "int", "long", "real", "double", "decimal", "bool", "boolean", "string", "datetime", "date", "timespan", "time", "guid", "dynamic":
 			if args := ctx.ArgumentList(); args != nil && len(args.AllArgument()) == 1 {
 				argument := args.AllArgument()[0]
-				if recognizeKQLOperand(argument.Expression(), budget).literal {
-					return kqlOperand{text: text, literal: true}
+				if child := recognizeKQLOperand(argument.Expression(), budget); child.literal && child.rhs != nil {
+					return kqlOperand{text: text, literal: true, rhs: &Operand{Kind: OperandTyped, Source: text, Type: name, Items: []Operand{*child.rhs}}}
 				}
 			}
 		}
 		return kqlOperand{}
 	}
 	if child := kqlTransparentScalarChild(tree, budget); child != nil {
-		return recognizeKQLOperand(child, budget)
+		operand := recognizeKQLOperand(child, budget)
+		if operand.rhs != nil {
+			ctx, parentOK := tree.(antlr.ParserRuleContext)
+			childCtx, childOK := child.(antlr.ParserRuleContext)
+			if parentOK && childOK && ctx.GetStart() != nil && ctx.GetStop() != nil && ctx.GetStart() != childCtx.GetStart() {
+				copy := *operand.rhs
+				copy.Source = kqlSourceText(ctx, budget)
+				if copy.Kind == OperandNumber {
+					copy.Value = copy.Source
+				}
+				operand.rhs = &copy
+			}
+		}
+		return operand
 	}
 	return kqlOperand{}
 }

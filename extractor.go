@@ -27,6 +27,7 @@ type Condition struct {
 	Field          string   `json:"field"`
 	Operator       string   `json:"operator"`
 	Value          string   `json:"value"`
+	RHS            *Operand `json:"rhs,omitempty"`             // Authored right operand; nil for legacy or unary conditions
 	ValueReference string   `json:"value_reference,omitempty"` // Variable or symbol referenced by the value expression
 	Negated        bool     `json:"negated"`
 	PipeStage      int      `json:"pipe_stage"`
@@ -155,6 +156,7 @@ type conditionExtractor struct {
 	inSearch            int
 	letNames            map[string]bool
 	membership          *membershipProtection
+	typed               *typedProtection
 	subqueryMarkers     []int // Rune offsets of synthetic unresolved IN-subquery literals
 	unsupportedSubquery bool
 	originalQuery       string // normalized query text for extracting subexpressions
@@ -264,7 +266,16 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 
 	// Inline lets that bind constants before later steps rewrite their
 	// literals, so a condition reads a let's value as an inline literal.
-	normalized = inlineLetConstants(normalized, extractLetStatements(normalized), budget)
+	if metadata != nil {
+		metadata.typed = newTypedProtection(normalized)
+		normalized = metadata.typed.shieldNative(normalized, budget)
+		budget.input(normalized)
+	}
+	if metadata != nil {
+		normalized = inlineLetConstants(normalized, extractLetStatements(normalized), budget, metadata.typed)
+	} else {
+		normalized = inlineLetConstants(normalized, extractLetStatements(normalized), budget)
+	}
 	budget.input(normalized)
 	budget.step()
 
@@ -299,13 +310,13 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 	budget.step()
 
 	// Handle materialize by stripping it (handles both with and without space)
-	normalized = strings.ReplaceAll(normalized, "materialize(", "(")
+	normalized = replaceAllOutsideStrings(normalized, "materialize(", "(")
 	budget.input(normalized)
 	budget.step()
-	normalized = strings.ReplaceAll(normalized, "materialize (", "(")
+	normalized = replaceAllOutsideStrings(normalized, "materialize (", "(")
 	budget.input(normalized)
 	budget.step()
-	normalized = strings.ReplaceAll(normalized, "materialize  (", "(")
+	normalized = replaceAllOutsideStrings(normalized, "materialize  (", "(")
 	budget.input(normalized)
 	budget.step()
 
@@ -317,16 +328,16 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 
 	// Convert make_set and make_list aliases used by existing parser fixtures.
 	// Handle both make_set( and make_set ( with space.
-	normalized = strings.ReplaceAll(normalized, "make_set(", "makeset(")
+	normalized = replaceAllOutsideStrings(normalized, "make_set(", "makeset(")
 	budget.input(normalized)
 	budget.step()
-	normalized = strings.ReplaceAll(normalized, "make_set (", "makeset(")
+	normalized = replaceAllOutsideStrings(normalized, "make_set (", "makeset(")
 	budget.input(normalized)
 	budget.step()
-	normalized = strings.ReplaceAll(normalized, "make_list(", "makelist(")
+	normalized = replaceAllOutsideStrings(normalized, "make_list(", "makelist(")
 	budget.input(normalized)
 	budget.step()
-	normalized = strings.ReplaceAll(normalized, "make_list (", "makelist(")
+	normalized = replaceAllOutsideStrings(normalized, "make_list (", "makelist(")
 	budget.input(normalized)
 	budget.step()
 
@@ -348,13 +359,25 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 
 	// Normalize timespan literals without space: 0min -> 0 min, 30min -> 30 min
 	// The lexer expects space or recognizes combined form only for certain patterns
-	normalized = normalizeTimespanLiterals(normalized)
+	if metadata != nil {
+		normalized = normalizeTimespanLiteralsTracked(normalized, metadata.typed, budget)
+	} else {
+		normalized = normalizeTimespanLiterals(normalized)
+	}
 	budget.input(normalized)
 	budget.step()
-	normalized = normalizeDatetimeLiterals(normalized)
+	if metadata != nil {
+		normalized = markedRegexLiterals(normalized, datetimeWithSpaceRe, "datetime(${1}T${2})", metadata.typed, budget)
+	} else {
+		normalized = normalizeDatetimeLiterals(normalized)
+	}
 	budget.input(normalized)
 	budget.step()
-	normalized = joinAdjacentStringLiterals(normalized)
+	if metadata != nil {
+		normalized = joinAdjacentStringLiteralsTracked(normalized, metadata.typed, budget)
+	} else {
+		normalized = joinAdjacentStringLiterals(normalized)
+	}
 	budget.input(normalized)
 	budget.step()
 	normalized = normalizeMakeGraphEdges(normalized)
@@ -366,12 +389,19 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 
 	// Normalize trailing decimals: 1000. -> 1000.0
 	// The grammar requires at least one digit after the decimal point
-	normalized = normalizeTrailingDecimals(normalized)
+	if metadata != nil {
+		normalized = normalizeTrailingDecimalsTracked(normalized, metadata.typed, budget)
+	} else {
+		normalized = normalizeTrailingDecimals(normalized)
+	}
 	budget.input(normalized)
 	budget.step()
 
 	// Normalize \0 escape sequences to \x00 (null character)
 	// The grammar only supports \x hex escapes, not bare \0
+	if metadata != nil {
+		normalized = markNullEscapeStrings(normalized, metadata.typed, budget)
+	}
 	normalized = normalizeNullEscapes(normalized)
 	budget.input(normalized)
 	budget.step()
@@ -484,8 +514,10 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 		// Earlier normalization can construct authored strings by joining
 		// adjacent literals. Select provenance markers only after that step.
 		membership := metadata.membership
+		typed := metadata.typed
 		*metadata = *newKQLNormalizationMetadata(normalized+"\n"+query, budget)
 		metadata.membership = membership
+		metadata.typed = typed
 		placeholder = metadata.subqueryMarker
 	}
 	normalized = normalizeInSubqueriesWithPlaceholder(normalized, placeholder, budget)
@@ -600,6 +632,10 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 	normalized = searches.restore(normalized, budget)
 	if metadata != nil {
 		normalized = metadata.restoreSubqueryMarkers(normalized, budget)
+		if metadata.typed != nil {
+			normalized = metadata.typed.restoreShields(normalized, budget)
+			normalized = metadata.typed.restore(normalized, budget)
+		}
 		metadata.searchCount = searches.restored
 	}
 	return normalized
@@ -5065,6 +5101,7 @@ func extractConditionsInternal(query string, budget *parseBudget) (result *Parse
 		expressionLeaves:    make(map[IComparisonExpressionContext]*ConditionExpression),
 		letNames:            make(map[string]bool),
 		membership:          normalization.membership,
+		typed:               normalization.typed,
 		subqueryMarkers:     normalization.subqueryOffsets,
 	}
 	letStatements := extractLetStatements(query)
@@ -5112,7 +5149,7 @@ func extractConditionsInternal(query string, budget *parseBudget) (result *Parse
 			}
 			condition.Pipeline = extractor.queryPipeline
 			if !containsCondition(conditions, condition) {
-				budget.reserveOutput(1 + len(condition.Alternatives))
+				budget.reserveOutput(1 + len(condition.Alternatives) + operandOutputCost(condition.RHS, budget))
 				conditions = append(conditions, condition)
 			}
 		}
@@ -5825,7 +5862,14 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 			return
 		}
 		source, computed := e.computedFields[strings.ToLower(left.text)]
-		condition := Condition{Field: left.text, Operator: normalizeOperator(op), Negated: e.negated, PipeStage: e.currentStage, Pipeline: e.currentPipeline(), LogicalOp: e.lastLogicalOp, IsComputed: computed, SourceField: source}
+		if expressions := ctx.AllAdditiveExpression(); len(expressions) == 2 {
+			rhsTree := expressions[1]
+			if first, second := recognizeKQLOperand(expressions[0], e.budget), recognizeKQLOperand(expressions[1], e.budget); first.literal && second.reference {
+				rhsTree = expressions[0]
+			}
+			right.rhs = e.typed.apply(right.rhs, rhsTree)
+		}
+		condition := Condition{Field: left.text, Operator: normalizeOperator(op), RHS: right.rhs, Negated: e.negated, PipeStage: e.currentStage, Pipeline: e.currentPipeline(), LogicalOp: e.lastLogicalOp, IsComputed: computed, SourceField: source}
 		if right.reference {
 			condition.ValueReference = right.text
 		} else {
@@ -5887,7 +5931,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 			if hasIN_CS || hasNOT_IN_CS || strings.Contains(strings.ToLower(ctx.GetText()), "in~") {
 				operator = "in~"
 			}
-			e.handleInOperator(leftText, ctx.ExpressionList(), operator, isNegated)
+			e.handleInOperator(leftText, ctx.ExpressionList(), operator, isNegated, ctx)
 		}
 		return
 	}
@@ -5904,6 +5948,9 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 			e.handleBetweenOperator(leftText, low.text, high.text, isNegated)
 			if len(e.conditions) == start+2 {
 				for index, bound := range []kqlOperand{low, high} {
+					rhs := e.typed.apply(bound.rhs, addExprs[1+index])
+					e.budget.reserveOutput(operandOutputCost(rhs, e.budget))
+					e.conditions[start+index].RHS = rhs
 					if bound.reference {
 						e.conditions[start+index].ValueReference = bound.text
 						e.conditions[start+index].Value = ""
@@ -5974,7 +6021,7 @@ func (e *conditionExtractor) handleComparison(left, op, right string) {
 }
 
 // handleInOperator processes IN operator conditions
-func (e *conditionExtractor) handleInOperator(field string, exprList IExpressionListContext, operator string, negated bool) {
+func (e *conditionExtractor) handleInOperator(field string, exprList IExpressionListContext, operator string, negated bool, contexts ...IComparisonExpressionContext) {
 	if !isValidFieldName(field) {
 		return
 	}
@@ -6003,6 +6050,21 @@ func (e *conditionExtractor) handleInOperator(field string, exprList IExpression
 		IsComputed:   isComputed,
 		SourceField:  sourceField,
 	}
+	items := make([]Operand, 0, len(values))
+	for _, expression := range exprList.AllExpression() {
+		operand := recognizeKQLOperand(expression, e.budget)
+		if operand.rhs != nil {
+			items = append(items, *e.typed.apply(operand.rhs, expression))
+		}
+	}
+	listSource := "(" + kqlSourceText(exprList, e.budget) + ")"
+	if len(contexts) > 0 {
+		listSource = e.originalListSource(contexts[0], exprList, items)
+	}
+	cond.RHS = &Operand{Kind: OperandList, Source: listSource, Items: items}
+	if source, binding := e.typed.listOrigin(items); binding != "" {
+		cond.RHS.Source, cond.RHS.Binding = source, binding
+	}
 	if expressions := exprList.AllExpression(); len(expressions) == 1 {
 		if operand := recognizeKQLOperand(expressions[0], e.budget); operand.reference {
 			cond.ValueReference = operand.text
@@ -6010,6 +6072,35 @@ func (e *conditionExtractor) handleInOperator(field string, exprList IExpression
 	}
 	e.appendCondition(cond)
 	e.lastLogicalOp = "AND"
+}
+
+func (e *conditionExtractor) originalListSource(ctx IComparisonExpressionContext, list IExpressionListContext, items []Operand) string {
+	e.budget.step()
+	if ctx.LPAREN() == nil || ctx.RPAREN() == nil || e.originalQuery == "" {
+		return "(" + kqlSourceText(list, e.budget) + ")"
+	}
+	positions := searchRuneBytes(e.originalQuery, e.budget)
+	start, end := ctx.LPAREN().GetSymbol().GetStart(), ctx.RPAREN().GetSymbol().GetStop()+1
+	if start < 0 || end >= len(positions) || start >= end {
+		return "(" + kqlSourceText(list, e.budget) + ")"
+	}
+	var out strings.Builder
+	last := positions[start]
+	for i, expression := range list.AllExpression() {
+		e.budget.step()
+		if i >= len(items) {
+			break
+		}
+		itemStart, itemEnd := expression.GetStart().GetStart(), expression.GetStop().GetStop()+1
+		if itemStart < 0 || itemEnd >= len(positions) || positions[itemStart] < last {
+			continue
+		}
+		out.WriteString(e.originalQuery[last:positions[itemStart]])
+		out.WriteString(items[i].Source)
+		last = positions[itemEnd]
+	}
+	out.WriteString(e.originalQuery[last:positions[end]])
+	return out.String()
 }
 
 // handleBetweenOperator processes BETWEEN operator conditions
@@ -6076,6 +6167,7 @@ func (e *conditionExtractor) handleHasAnyAllOperator(field, op string, exprList 
 		logicalConnector = "AND"
 	}
 
+	expressions := exprList.AllExpression()
 	for i, value := range values {
 		logOp := e.lastLogicalOp
 		if i > 0 {
@@ -6091,6 +6183,9 @@ func (e *conditionExtractor) handleHasAnyAllOperator(field, op string, exprList 
 			LogicalOp:   logOp,
 			IsComputed:  isComputed,
 			SourceField: sourceField,
+		}
+		if i < len(expressions) {
+			cond.RHS = e.typed.apply(recognizeKQLOperand(expressions[i], e.budget).rhs, expressions[i])
 		}
 		e.appendCondition(cond)
 	}
@@ -6906,10 +7001,15 @@ func parsePortablePredicate(expr string, lists map[string][]string) (Condition, 
 		if !ok {
 			return Condition{}, false
 		}
+		rhs := portablePredicateOperand(right, valueReference, op)
+		if rhs == nil {
+			return Condition{}, false
+		}
 		return Condition{
 			Field:          left,
 			Operator:       op,
 			Value:          value,
+			RHS:            rhs,
 			ValueReference: valueReference,
 			Alternatives:   alternatives,
 			PipeStage:      1,
@@ -6938,10 +7038,15 @@ func parsePortableFunctionPredicate(expr string, lists map[string][]string) (Con
 		if !ok {
 			return Condition{}, false
 		}
+		rhs := portableTypedOperandWithReference(args[1], valueReference)
+		if rhs == nil {
+			return Condition{}, false
+		}
 		return Condition{
 			Field:          field,
 			Operator:       "has",
 			Value:          value,
+			RHS:            rhs,
 			ValueReference: valueReference,
 			Alternatives:   alternatives,
 			PipeStage:      1,
@@ -7602,15 +7707,69 @@ func groupORConditionsByExpression(conditions []Condition, expression *Condition
 
 	result := make([]Condition, 0, len(conditions))
 	indexMap := make([]int, len(conditions))
+	type group struct {
+		values []string
+		items  []Operand
+		seen   map[string]bool
+	}
+	groups := make(map[int]*group)
+	add := func(g *group, condition Condition) {
+		values := conditionAlternatives(condition)
+		if condition.RHS == nil {
+			for _, value := range values {
+				budget.step()
+				key := "legacy:" + value
+				if !g.seen[key] {
+					g.seen[key] = true
+					g.values = append(g.values, value)
+				}
+			}
+			return
+		}
+		items := []Operand{*condition.RHS}
+		if condition.RHS.Kind == OperandList {
+			items = condition.RHS.Items
+		}
+		for i, item := range items {
+			budget.step()
+			key := operandIdentity(&item, budget)
+			if g.seen[key] {
+				continue
+			}
+			budget.reserveOutput(len(key))
+			g.seen[key] = true
+			g.items = append(g.items, item)
+			if i < len(values) {
+				g.values = append(g.values, values[i])
+			}
+		}
+	}
 	for i, condition := range conditions {
+		budget.step()
 		if start := groupStart[i]; start != i {
-			merged := &result[indexMap[start]]
-			merged.Alternatives = deduplicateConditionValues(append(conditionAlternatives(*merged), conditionAlternatives(condition)...))
+			g := groups[start]
+			if g == nil {
+				g = &group{seen: make(map[string]bool)}
+				groups[start] = g
+				add(g, result[indexMap[start]])
+			}
+			add(g, condition)
 			indexMap[i] = indexMap[start]
 			continue
 		}
 		indexMap[i] = len(result)
 		result = append(result, condition)
+	}
+	for start, g := range groups {
+		budget.step()
+		merged := &result[indexMap[start]]
+		merged.Alternatives = g.values
+		if merged.RHS != nil {
+			merged.RHS = &Operand{Kind: OperandList, Items: g.items}
+		}
+	}
+	for i := range result {
+		result[i] = *cloneSemanticCondition(result[i], budget)
 	}
 	return result, indexMap, true
 }
@@ -7638,12 +7797,14 @@ func groupORConditionsWithIndexMap(conditions []Condition) ([]Condition, []int) 
 		// Look ahead for OR conditions on the same field
 		if i+1 < len(conditions) && conditions[i+1].LogicalOp == "OR" && sameConditionGroup(cond, conditions[i+1]) && canMergeAlternativeGroup(conditions, i) {
 			alternatives := conditionAlternatives(cond)
+			items := conditionOperandItems(cond)
 
 			j := i + 1
 			for j < len(conditions) {
 				next := conditions[j]
 				if next.LogicalOp == "OR" && sameConditionGroup(cond, next) {
 					alternatives = append(alternatives, conditionAlternatives(next)...)
+					items = append(items, conditionOperandItems(next)...)
 					j++
 				} else {
 					break
@@ -7651,7 +7812,12 @@ func groupORConditionsWithIndexMap(conditions []Condition) ([]Condition, []int) 
 			}
 
 			if len(alternatives) > 1 {
-				cond.Alternatives = deduplicateConditionValues(alternatives)
+				if cond.RHS == nil {
+					cond.Alternatives = deduplicateConditionValues(alternatives)
+				} else {
+					cond.Alternatives, items = deduplicateTypedAlternatives(alternatives, items)
+					cond.RHS = &Operand{Kind: OperandList, Items: items}
+				}
 				groupedIndex := len(result)
 				result = append(result, cond)
 				for rawIndex := i; rawIndex < j; rawIndex++ {
@@ -7669,6 +7835,9 @@ func groupORConditionsWithIndexMap(conditions []Condition) ([]Condition, []int) 
 		result = append(result, cond)
 	}
 
+	for i := range result {
+		result[i] = *cloneSemanticCondition(result[i], nil)
+	}
 	return result, indexMap
 }
 
@@ -7692,6 +7861,7 @@ func sameConditionGroup(a, b Condition) bool {
 		!b.Negated &&
 		!a.IsComputed &&
 		!b.IsComputed &&
+		(a.RHS == nil && b.RHS == nil || a.RHS != nil && b.RHS != nil && a.RHS.Kind != OperandField && b.RHS.Kind != OperandField) &&
 		a.ValueReference == "" &&
 		b.ValueReference == "" &&
 		a.SourceField == b.SourceField &&
@@ -7723,6 +7893,7 @@ type conditionIdentity struct {
 	logicalOp, sourceField, alternatives   string
 	negated, isComputed, alternativesNil   bool
 	pipeStage, pipeline, alternativesLen   int
+	rhs                                    string
 }
 
 func conditionDedupKey(cond Condition) conditionIdentity {
@@ -7740,6 +7911,7 @@ func conditionDedupKey(cond Condition) conditionIdentity {
 		alternativesNil: cond.Alternatives == nil,
 		pipeStage:       cond.PipeStage, pipeline: cond.Pipeline,
 		alternativesLen: len(cond.Alternatives),
+		rhs:             operandIdentity(cond.RHS),
 	}
 }
 
@@ -7769,7 +7941,10 @@ func DeduplicateConditions(conditions []Condition) []Condition {
 		key := conditionDedupKey(cond)
 		if !seen[key] {
 			seen[key] = true
-			result = append(result, cond)
+			copy := cond
+			copy.Alternatives = append([]string(nil), cond.Alternatives...)
+			copy.RHS = cloneOperand(cond.RHS, nil)
+			result = append(result, copy)
 		}
 	}
 	return result

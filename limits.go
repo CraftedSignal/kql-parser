@@ -186,7 +186,7 @@ func preflight(query string, b *parseBudget, charge bool, listener *errorListene
 }
 
 func (e *conditionExtractor) appendCondition(condition Condition) {
-	e.budget.reserveOutput(1 + len(condition.Alternatives))
+	e.budget.reserveOutput(1 + len(condition.Alternatives) + operandOutputCost(condition.RHS, e.budget))
 	e.conditions = append(e.conditions, condition)
 }
 

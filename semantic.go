@@ -113,7 +113,7 @@ func semanticExpressionFromParseExpression(expression *ConditionExpression, cond
 		budget.reserveOutput(1)
 		return &SemanticExpression{
 			Operator:  BooleanCondition,
-			Condition: &conditions[expression.ConditionIndex],
+			Condition: cloneSemanticCondition(conditions[expression.ConditionIndex], budget),
 		}
 	case BooleanAnd, BooleanOr:
 		budget.reserveOutput(1 + len(expression.Children))
@@ -144,7 +144,7 @@ func semanticExpressionFromConditions(conditions []Condition, budget *parseBudge
 	for index := range conditions {
 		budget.step()
 		budget.reserveOutput(1)
-		leaf := &SemanticExpression{Operator: BooleanCondition, Condition: &conditions[index]}
+		leaf := &SemanticExpression{Operator: BooleanCondition, Condition: cloneSemanticCondition(conditions[index], budget)}
 		if expression == nil {
 			expression = leaf
 			continue
@@ -213,14 +213,21 @@ func cloneSemanticConditions(conditions []Condition, budget *parseBudget) []Cond
 	if len(conditions) == 0 {
 		return nil
 	}
-	budget.reserveOutput(len(conditions))
 	out := make([]Condition, len(conditions))
 	for i, condition := range conditions {
 		budget.step()
-		out[i] = condition
-		out[i].Alternatives = cloneSemanticStrings(condition.Alternatives, budget)
+		out[i] = *cloneSemanticCondition(condition, budget)
 	}
 	return out
+}
+
+func cloneSemanticCondition(condition Condition, budget *parseBudget) *Condition {
+	budget.step()
+	budget.reserveOutput(1)
+	copy := condition
+	copy.Alternatives = cloneSemanticStrings(condition.Alternatives, budget)
+	copy.RHS = cloneOperand(condition.RHS, budget)
+	return &copy
 }
 
 func cloneSemanticStrings(values []string, budget *parseBudget) []string {
