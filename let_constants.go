@@ -149,11 +149,11 @@ func inlineLetConstantOperands(query string, constants map[string]letConstant, b
 						if constant.list {
 							parts := make([]string, 0, len(constant.items))
 							for _, item := range constant.items {
-								parts = append(parts, protection.mark(letOrigin{source: item, binding: query[i:end], listSource: constant.source}, budget)+item)
+								parts = append(parts, protection.mark(letOrigin{source: item, binding: query[i:end], listSource: constant.source, normalized: item}, budget)+item)
 							}
 							literal = strings.Join(parts, ", ")
 						} else {
-							literal = protection.mark(letOrigin{source: constant.items[0], binding: query[i:end]}, budget) + literal
+							literal = protection.mark(letOrigin{source: constant.items[0], binding: query[i:end], normalized: literal}, budget) + literal
 						}
 					}
 					write(query[last:i])

@@ -2,8 +2,10 @@ package kql
 
 import (
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/antlr4-go/antlr/v4"
 )
@@ -25,7 +27,7 @@ func rewriteLiteralSources(query string, rewrites []literalRewrite, p *typedProt
 			continue
 		}
 		out.WriteString(query[last:rewrite.start])
-		out.WriteString(p.mark(letOrigin{source: query[rewrite.start:rewrite.end]}, budget))
+		out.WriteString(p.mark(letOrigin{source: query[rewrite.start:rewrite.end], normalized: rewrite.replacement}, budget))
 		out.WriteString(rewrite.replacement)
 		last = rewrite.end
 	}
@@ -80,8 +82,88 @@ func markedRegexLiterals(query string, pattern *regexp.Regexp, replacement strin
 	return rewriteLiteralSources(query, rewrites, p, budget)
 }
 
+func replaceRegexOutsideProtected(query string, pattern *regexp.Regexp, replacement string, budget *parseBudget) string {
+	protected := protectedKQLBytes(query, budget)
+	var out strings.Builder
+	last := 0
+	for _, loc := range pattern.FindAllStringSubmatchIndex(query, -1) {
+		budget.step()
+		blocked := false
+		for i := loc[0]; i < loc[1]; i++ {
+			if protected[i] {
+				blocked = true
+				break
+			}
+		}
+		if blocked {
+			continue
+		}
+		out.WriteString(query[last:loc[0]])
+		out.Write(pattern.ExpandString(nil, replacement, query, loc))
+		last = loc[1]
+	}
+	if last == 0 {
+		return query
+	}
+	out.WriteString(query[last:])
+	return out.String()
+}
+
 var typedTimespanSuffix = regexp.MustCompile(`(?i)\b[0-9]+(?:minutes|minute|min|seconds|second|sec|hours|hour|days|day)\b`)
 var typedTrailingDecimal = regexp.MustCompile(`[0-9]+\.`)
+var typedBracketReference = regexp.MustCompile(`\b[A-Za-z_][A-Za-z0-9_]*(?:\.)?\[(?:'[^'\r\n]*'|"[^"\r\n]*"|[0-9]+)\]`)
+var typedNumericReference = regexp.MustCompile(`\b[0-9]+[A-Za-z_][A-Za-z0-9_]*\b`)
+
+func provenBracketReference(source, normalized string) string {
+	open := strings.IndexByte(source, '[')
+	if open < 0 || !strings.HasSuffix(source, "]") {
+		return ""
+	}
+	base := strings.TrimSuffix(source[:open], ".")
+	quoted := source[open+1 : len(source)-1]
+	if len(quoted) < 2 || quoted[0] != quoted[len(quoted)-1] || quoted[0] != '\'' && quoted[0] != '"' {
+		return ""
+	}
+	key := quoted[1 : len(quoted)-1]
+	if !isValidPropertyKey(key) || grammarReservedWords[strings.ToLower(key)] || normalized != base+"."+key {
+		return ""
+	}
+	return normalized
+}
+
+func markReferenceSources(query string, pattern *regexp.Regexp, transform func(string) string, p *typedProtection, budget *parseBudget) string {
+	protected := protectedKQLBytes(query, budget)
+	var out strings.Builder
+	last := 0
+	for _, loc := range pattern.FindAllStringIndex(query, -1) {
+		budget.step()
+		if protected[loc[0]] {
+			continue
+		}
+		original := query[loc[0]:loc[1]]
+		normalized := transform(original)
+		if normalized == original {
+			continue
+		}
+		origin := letOrigin{source: original, normalized: normalized}
+		switch pattern {
+		case typedBracketReference:
+			origin.referenceValue = provenBracketReference(original, normalized)
+			origin.opaqueReference = origin.referenceValue == ""
+		case typedNumericReference:
+			origin.referenceValue = original
+		}
+		out.WriteString(query[last:loc[0]])
+		out.WriteString(p.mark(origin, budget))
+		out.WriteString(original)
+		last = loc[1]
+	}
+	if last == 0 {
+		return query
+	}
+	out.WriteString(query[last:])
+	return out.String()
+}
 
 func normalizeTimespanLiteralsTracked(query string, p *typedProtection, budget *parseBudget) string {
 	protected := protectedKQLBytes(query, budget)
@@ -169,6 +251,18 @@ func markNullEscapeStrings(query string, p *typedProtection, budget *parseBudget
 	var rewrites []literalRewrite
 	for i := 0; i < len(query); {
 		budget.step()
+		if strings.HasPrefix(query[i:], "//") {
+			for i < len(query) && query[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(query[i:], "/*") {
+			if end := strings.Index(query[i+2:], "*/"); end >= 0 {
+				i += end + 4
+				continue
+			}
+		}
 		if !isStringLiteralStart(query, i) {
 			i++
 			continue
@@ -189,23 +283,27 @@ func markNullEscapeStrings(query string, p *typedProtection, budget *parseBudget
 // letOrigin is attached to a proven inlining occurrence, never recovered by
 // comparing decoded values with let definitions.
 type letOrigin struct {
-	source, binding, listSource string
+	source, binding, listSource, normalized, referenceValue string
+	opaqueReference                                         bool
 }
 
 type typedProtection struct {
-	markers map[string]letOrigin
-	shields map[string]string
-	byStart map[int]letOrigin
-	prefix  string
-	next    int
+	markers       map[string]letOrigin
+	shields       map[string]string
+	byStart       map[int]letOrigin
+	markerByStart map[int]string
+	starts        []int
+	prefix        string
+	next          int
+	budget        *parseBudget
 }
 
-func newTypedProtection(query string) *typedProtection {
+func newTypedProtection(query string, budgets ...*parseBudget) *typedProtection {
 	prefix := "__kql_typed_origin_"
 	for strings.Contains(query, prefix) {
 		prefix += "_"
 	}
-	return &typedProtection{markers: make(map[string]letOrigin), shields: make(map[string]string), prefix: prefix}
+	return &typedProtection{markers: make(map[string]letOrigin), shields: make(map[string]string), prefix: prefix, budget: suppliedBudget(budgets)}
 }
 
 func (p *typedProtection) shieldNative(query string, budget *parseBudget) string {
@@ -259,7 +357,9 @@ func (p *typedProtection) restoreShields(query string, budget *parseBudget) stri
 		return query
 	}
 	prefix := p.prefix + "shield_"
+	protected := protectedKQLBytes(query, budget)
 	var out strings.Builder
+	offset := 0
 	for len(query) > 0 {
 		budget.step()
 		index := strings.Index(query, prefix)
@@ -269,10 +369,17 @@ func (p *typedProtection) restoreShields(query string, budget *parseBudget) stri
 		}
 		out.WriteString(query[:index])
 		query = query[index:]
+		if protected[offset+index] {
+			out.WriteString(prefix)
+			query = query[len(prefix):]
+			offset += index + len(prefix)
+			continue
+		}
 		end := strings.Index(query[len(prefix):], "__")
 		if end < 0 {
 			out.WriteString(query[:len(prefix)])
 			query = query[len(prefix):]
+			offset += index + len(prefix)
 			continue
 		}
 		end += len(prefix)
@@ -283,6 +390,7 @@ func (p *typedProtection) restoreShields(query string, budget *parseBudget) stri
 			out.WriteString(marker)
 		}
 		query = query[end+2:]
+		offset += index + end + 2
 	}
 	return out.String()
 }
@@ -293,7 +401,9 @@ func (p *typedProtection) mark(origin letOrigin, budget *parseBudget) string {
 	p.next++
 	budget.reserveOutput(1 + len(marker) + len(origin.source) + len(origin.binding) + len(origin.listSource))
 	p.markers[marker] = origin
-	return marker
+	// A separator prevents two adjacent block markers from forming */*/*,
+	// whose middle // is misread as a line comment by legacy normalizers.
+	return marker + " "
 }
 
 func (p *typedProtection) restore(query string, budget *parseBudget) string {
@@ -302,22 +412,42 @@ func (p *typedProtection) restore(query string, budget *parseBudget) string {
 		return query
 	}
 	p.byStart = make(map[int]letOrigin, len(p.markers))
+	p.markerByStart = make(map[int]string, len(p.markers))
+	p.starts = p.starts[:0]
 	var out strings.Builder
 	runes := 0
 	for i := 0; i < len(query); {
 		budget.step()
-		if strings.HasPrefix(query[i:], "/*"+p.prefix) {
-			end := strings.Index(query[i:], "*/")
-			if end >= 0 {
-				marker := query[i : i+end+2]
+		if isStringLiteralStart(query, i) {
+			end := stringLiteralEnd(query, i)
+			if end > i {
+				out.WriteString(query[i:end])
+				runes += utf8.RuneCountInString(query[i:end])
+				i = end
+				continue
+			}
+		}
+		if strings.HasPrefix(query[i:], "/*") {
+			if end := strings.Index(query[i+2:], "*/"); end >= 0 {
+				end += i + 4
+				marker := query[i:end]
 				if origin, ok := p.markers[marker]; ok {
 					if _, present := p.byStart[runes]; !present {
 						budget.reserveOutput(1)
 						p.byStart[runes] = origin
+						p.markerByStart[runes] = marker
+						p.starts = append(p.starts, runes)
 					}
-					i += end + 2
+					i = end
+					if i < len(query) && query[i] == ' ' {
+						i++ // Consume the marker's guaranteed separator.
+					}
 					continue
 				}
+				out.WriteString(marker)
+				runes += utf8.RuneCountInString(marker)
+				i = end
+				continue
 			}
 		}
 		out.WriteByte(query[i])
@@ -326,27 +456,171 @@ func (p *typedProtection) restore(query string, budget *parseBudget) string {
 		}
 		i++
 	}
+	sort.Ints(p.starts)
 	return out.String()
+}
+
+// reinsert carries only authenticated occurrences into a recursively parsed
+// tabular child. The child normalizer knows the matching marker records, so a
+// let's defining source and binding survive without matching decoded values.
+func (p *typedProtection) reinsert(ctx antlr.ParserRuleContext) (string, map[string]letOrigin) {
+	p.budget.step()
+	text := kqlSourceText(ctx, p.budget)
+	if len(p.starts) == 0 || ctx.GetStart() == nil || ctx.GetStop() == nil {
+		return text, nil
+	}
+	start, stop := ctx.GetStart().GetStart(), ctx.GetStop().GetStop()
+	positions := searchRuneBytes(text, p.budget)
+	var out strings.Builder
+	var inherited map[string]letOrigin
+	last := 0
+	for i := sort.SearchInts(p.starts, start); i < len(p.starts) && p.starts[i] <= stop; i++ {
+		p.budget.step()
+		relative := p.starts[i] - start
+		if relative < 0 || relative >= len(positions) {
+			continue
+		}
+		at := positions[relative]
+		if at < last {
+			continue
+		}
+		marker := p.markerByStart[p.starts[i]]
+		if marker == "" {
+			continue
+		}
+		if inherited == nil {
+			inherited = make(map[string]letOrigin)
+		}
+		inherited[marker] = p.byStart[p.starts[i]]
+		out.WriteString(text[last:at])
+		out.WriteString(marker)
+		out.WriteByte(' ')
+		last = at
+	}
+	if inherited == nil {
+		return text, nil
+	}
+	out.WriteString(text[last:])
+	return out.String(), inherited
 }
 
 func (p *typedProtection) apply(operand *Operand, tree antlr.Tree) *Operand {
 	if p == nil || operand == nil || tree == nil {
 		return operand
 	}
+	p.budget.step()
 	ctx, ok := tree.(antlr.ParserRuleContext)
 	if !ok || ctx.GetStart() == nil {
 		return operand
 	}
-	origin, ok := p.byStart[ctx.GetStart().GetStart()]
-	if !ok {
-		return operand
-	}
 	copy := *operand
-	copy.Source, copy.Binding = origin.source, origin.binding
+	copy.Source = p.sourceOf(ctx)
+	if origin, ok := p.byStart[ctx.GetStart().GetStart()]; ok {
+		copy.Binding = origin.binding
+	}
+	if copy.Kind == OperandField {
+		start, stop := ctx.GetStart().GetStart(), ctx.GetStop().GetStop()
+		for i := sort.SearchInts(p.starts, start); i < len(p.starts) && p.starts[i] <= stop; i++ {
+			p.budget.step()
+			origin := p.byStart[p.starts[i]]
+			if origin.referenceValue != "" {
+				copy.Value = strings.Replace(copy.Value, origin.normalized, origin.referenceValue, 1)
+			}
+		}
+	}
 	if copy.Kind == OperandNumber {
-		copy.Value = origin.source
+		copy.Value = copy.Source
+	}
+	if copy.Kind == OperandTyped && len(copy.Items) == 1 {
+		if child := p.constructorArgument(tree); child != nil {
+			copy.Items = append([]Operand(nil), copy.Items...)
+			copy.Items[0] = *p.apply(&copy.Items[0], child)
+		}
 	}
 	return &copy
+}
+
+func (p *typedProtection) applyKQLOperand(operand kqlOperand, tree antlr.Tree) kqlOperand {
+	operand.rhs = p.apply(operand.rhs, tree)
+	if operand.reference && operand.rhs != nil && operand.rhs.Kind == OperandField {
+		operand.text = operand.rhs.Value
+	}
+	return operand
+}
+
+func (p *typedProtection) hasOpaqueReference(ctx antlr.ParserRuleContext) bool {
+	if p == nil || ctx == nil || ctx.GetStart() == nil || ctx.GetStop() == nil {
+		return false
+	}
+	start, stop := ctx.GetStart().GetStart(), ctx.GetStop().GetStop()
+	for i := sort.SearchInts(p.starts, start); i < len(p.starts) && p.starts[i] <= stop; i++ {
+		p.budget.step()
+		if p.byStart[p.starts[i]].opaqueReference {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *typedProtection) constructorArgument(tree antlr.Tree) antlr.Tree {
+	p.budget.step()
+	if call, ok := tree.(IFunctionCallContext); ok {
+		if args := call.ArgumentList(); args != nil && len(args.AllArgument()) == 1 {
+			return args.AllArgument()[0].Expression()
+		}
+	}
+	for i := 0; i < tree.GetChildCount(); i++ {
+		if child := p.constructorArgument(tree.GetChild(i)); child != nil {
+			return child
+		}
+	}
+	return nil
+}
+
+func (p *typedProtection) sourceOf(ctx antlr.ParserRuleContext) string {
+	p.budget.step()
+	text := kqlSourceText(ctx)
+	if len(p.starts) == 0 || ctx.GetStart() == nil || ctx.GetStop() == nil {
+		return text
+	}
+	start, stop := ctx.GetStart().GetStart(), ctx.GetStop().GetStop()
+	first := sort.SearchInts(p.starts, start)
+	if first == len(p.starts) || p.starts[first] > stop {
+		return text
+	}
+	positions := searchRuneBytes(text, p.budget)
+	var out strings.Builder
+	last := 0
+	for i := first; i < len(p.starts) && p.starts[i] <= stop; i++ {
+		p.budget.step()
+		relative := p.starts[i] - start
+		if relative < 0 || relative >= len(positions) {
+			continue
+		}
+		at := positions[relative]
+		if at < last {
+			continue
+		}
+		origin := p.byStart[p.starts[i]]
+		end := at
+		if origin.normalized != "" && strings.HasPrefix(text[at:], origin.normalized) {
+			end += len(origin.normalized)
+		} else if isStringLiteralStart(text, at) {
+			end = stringLiteralEnd(text, at)
+		} else {
+			for end < len(text) && !strings.ContainsRune(" \t\r\n,)]}+-*/", rune(text[end])) {
+				end++
+			}
+		}
+		if end <= at {
+			continue
+		}
+		out.WriteString(text[last:at])
+		out.WriteString(origin.source)
+		last = end
+	}
+	out.WriteString(text[last:])
+	return out.String()
 }
 
 func (p *typedProtection) listOrigin(items []Operand) (string, string) {

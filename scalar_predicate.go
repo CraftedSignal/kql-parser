@@ -51,7 +51,7 @@ func recognizeKQLOperand(tree antlr.Tree, budgets ...*parseBudget) kqlOperand {
 	case IUnaryExpressionContext:
 		if ctx.MINUS() != nil || ctx.PLUS() != nil {
 			child := recognizeKQLOperand(ctx.UnaryExpression(), budget)
-			if child.literal {
+			if child.literal && child.rhs != nil && (child.rhs.Kind == OperandNumber || child.rhs.Kind == OperandTyped && child.rhs.Type == "timespan") {
 				child.text = kqlSourceText(ctx, budget)
 				if child.rhs != nil {
 					copy := *child.rhs

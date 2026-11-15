@@ -110,6 +110,13 @@ func decodeKQLString(source string) string {
 			}
 			if i+n < len(s) {
 				if value, err := strconv.ParseUint(s[i+1:i+1+n], 16, 32); err == nil {
+					if s[i] == 'u' && value >= 0xd800 && value <= 0xdbff && i+10 < len(s) && s[i+5] == '\\' && s[i+6] == 'u' {
+						if low, err := strconv.ParseUint(s[i+7:i+11], 16, 16); err == nil && low >= 0xdc00 && low <= 0xdfff {
+							b.WriteRune(rune(0x10000 + (value-0xd800)*0x400 + (low - 0xdc00)))
+							i += 10
+							continue
+						}
+					}
 					b.WriteRune(rune(value))
 					i += n
 					continue
@@ -284,4 +291,19 @@ func portablePredicateOperand(raw, reference, operator string) *Operand {
 		return nil
 	}
 	return value
+}
+
+func portableListProjectionMatches(rhs *Operand, alternatives []string) bool {
+	if rhs == nil || rhs.Kind != OperandList {
+		return true
+	}
+	if len(rhs.Items) != len(alternatives) {
+		return false
+	}
+	for i, item := range rhs.Items {
+		if item.Kind != OperandString && item.Kind != OperandNumber && item.Kind != OperandBool || item.Value != alternatives[i] {
+			return false
+		}
+	}
+	return true
 }
