@@ -181,14 +181,40 @@ func membershipAtomSpan(tokens []antlr.Token, depths []int, operator, rhsEnd int
 			start = open - 1
 			continue
 		}
-		if close+1 < len(tokens) && membershipScalarSuffix(tokens[close+1].GetTokenType()) {
+		if open > 0 && membershipScalarOperator(tokens[open-1].GetTokenType()) ||
+			close+1 < len(tokens) && membershipScalarOperator(tokens[close+1].GetTokenType()) {
 			start = open
+		}
+	}
+	// A promoted group/function can be the right operand of a comparison or
+	// arithmetic chain. Include the complete left operand through the nearest
+	// Boolean or pipeline boundary at this depth.
+	if start > 0 && membershipScalarOperator(tokens[start-1].GetTokenType()) {
+		base := depths[start]
+		for j := start - 1; j >= 0; j-- {
+			budget.step()
+			if depths[j] < base || depths[j] == base && membershipAtomBoundary(tokens[j]) {
+				start = j + 1
+				break
+			}
+			if j == 0 {
+				start = 0
+			}
 		}
 	}
 	return membershipAtomEnd(tokens, depths, start, rhsEnd, budget)
 }
 
-func membershipScalarSuffix(kind int) bool {
+func membershipAtomBoundary(token antlr.Token) bool {
+	switch token.GetTokenType() {
+	case KQLLexerWHERE, KQLLexerAND, KQLLexerOR, KQLLexerNOT,
+		KQLLexerPIPE, KQLLexerSEMICOLON:
+		return true
+	}
+	return token.GetTokenType() == KQLLexerIDENTIFIER && strings.EqualFold(token.GetText(), "filter")
+}
+
+func membershipScalarOperator(kind int) bool {
 	switch kind {
 	case KQLLexerEQ, KQLLexerNEQ, KQLLexerLT, KQLLexerGT,
 		KQLLexerLTE, KQLLexerGTE, KQLLexerEQTILDE, KQLLexerNEQTILDE,
@@ -343,9 +369,48 @@ func validateMembershipRHS(rhs string, budget *parseBudget) {
 			membershipFailure("unvalidated tabular stage")
 		}
 	}
-	validateMembershipConstructor(rhs, budget)
+	validateMembershipConstructors(rhs, budget)
 	protected, _ := protectMembershipSources(rhs, budget)
 	validateMembershipQuery(protected, budget)
+}
+
+// Validate every constructor before normalizers can replace it with a dummy
+// table name, including constructors nested in union/join branches.
+func validateMembershipConstructors(rhs string, budget *parseBudget) {
+	tokens := membershipTokens(rhs, budget)
+	positions := searchRuneBytes(rhs, budget)
+	for i := 0; i < len(tokens)-1; i++ {
+		budget.step()
+		kind := tokens[i].GetTokenType()
+		if kind != KQLLexerDATATABLE && kind != KQLLexerEXTERNALDATA {
+			continue
+		}
+		if i+1 >= len(tokens)-1 || tokens[i+1].GetTokenType() != KQLLexerLPAREN {
+			membershipFailure("invalid tabular constructor schema")
+		}
+		close, _ := membershipParenEnd(tokens, i+1, budget)
+		if close < 0 || close+1 >= len(tokens)-1 {
+			membershipFailure("invalid tabular constructor data")
+		}
+		end := close + 2 // one bracket-data token after the schema
+		if kind == KQLLexerEXTERNALDATA && end < len(tokens)-1 && tokens[end].GetTokenType() == KQLLexerWITH {
+			if end+1 >= len(tokens)-1 || tokens[end+1].GetTokenType() != KQLLexerLPAREN {
+				membershipFailure("invalid externaldata options")
+			}
+			optionClose, _ := membershipParenEnd(tokens, end+1, budget)
+			if optionClose < 0 {
+				membershipFailure("invalid externaldata options")
+			}
+			end = optionClose + 1
+		}
+		startByte := positions[tokens[i].GetStart()]
+		endByte := len(rhs)
+		if end < len(tokens)-1 {
+			endByte = positions[tokens[end].GetStart()]
+		}
+		validateMembershipConstructor(rhs[startByte:endByte], budget)
+		i = end - 1
+	}
 }
 
 // The generated grammar cannot parse adjacent bracketed constructor data: its
@@ -574,6 +639,9 @@ func (p *membershipProtection) bind(tree antlr.Tree, normalized string, budget *
 				if entry := byMarker[token.GetText()]; entry != nil && positions[entry.marker] == token.GetStart() {
 					if owner == nil || entry.bound {
 						membershipFailure("unbound private identity")
+					}
+					if owner.GetText() != entry.marker {
+						membershipFailure("protected atom does not own complete comparison")
 					}
 					if previous := p.byContext[owner]; previous != nil && previous != entry {
 						membershipFailure("ambiguous predicate ownership")
