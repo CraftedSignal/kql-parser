@@ -73,6 +73,42 @@ func membershipWhere(tokens []antlr.Token, depths []int, index int, budget *pars
 		case KQLLexerPIPE, KQLLexerSEMICOLON:
 			return false
 		}
+		if tokens[j].GetTokenType() == KQLLexerIDENTIFIER && strings.EqualFold(tokens[j].GetText(), "filter") {
+			return true
+		}
+	}
+	return false
+}
+
+func membershipTabularRHS(tokens []antlr.Token, open, close int, pipe bool, budget *parseBudget) bool {
+	budget.step()
+	if pipe {
+		return true
+	}
+	for j := open + 1; j < close; j++ {
+		budget.step()
+		if tokens[j].GetTokenType() == KQLLexerLPAREN {
+			continue
+		}
+		switch tokens[j].GetTokenType() {
+		case KQLLexerDATATABLE, KQLLexerEXTERNALDATA:
+			return true
+		}
+		return false
+	}
+	return false
+}
+
+func membershipUnsupportedScalarSubquery(tokens []antlr.Token, depths []int, operator int, budget *parseBudget) bool {
+	for j := operator - 1; j > 0; j-- {
+		budget.step()
+		if tokens[j].GetTokenType() != KQLLexerLPAREN || depths[j] >= depths[operator] {
+			continue
+		}
+		close, _ := membershipParenEnd(tokens, j, budget)
+		if close > operator && tokens[j-1].GetTokenType() == KQLLexerTOSCALAR {
+			return true
+		}
 	}
 	return false
 }
@@ -106,6 +142,10 @@ func membershipAtomSpan(tokens []antlr.Token, depths []int, operator, rhsEnd int
 				start = j + 1
 				j = -1
 			}
+			if j >= 0 && tokens[j].GetTokenType() == KQLLexerIDENTIFIER && strings.EqualFold(tokens[j].GetText(), "filter") {
+				start = j + 1
+				j = -1
+			}
 		}
 	}
 	// Parenthesized Boolean groups and outer NOT own structure, not source.
@@ -115,38 +155,49 @@ func membershipAtomSpan(tokens []antlr.Token, depths []int, operator, rhsEnd int
 		if kind != KQLLexerNOT && kind != KQLLexerLPAREN {
 			break
 		}
-		if kind == KQLLexerLPAREN {
-			close, _ := membershipParenEnd(tokens, start, budget)
-			if close >= 0 && close+1 < len(tokens) {
-				switch tokens[close+1].GetTokenType() {
-				case KQLLexerAND, KQLLexerOR, KQLLexerPIPE, KQLLexerSEMICOLON, KQLLexerRPAREN, antlr.TokenEOF:
-				default:
-					// The group is an operand of a larger comparison or
-					// arithmetic atom and belongs in its source.
-					return membershipAtomEnd(tokens, depths, start, rhsEnd, budget)
-				}
-			}
-		}
 		start++
 	}
-	// If the membership is inside a function argument, the function call is
-	// the complete atomic predicate represented by this one scalar leaf.
-	for start > 1 && depths[start] > 0 {
+	// Walk every enclosing parenthesis. A Boolean group belongs to its parent
+	// atom when it is a function argument or an operand of a comparison or
+	// arithmetic expression, even when another Boolean branch precedes IN.
+	for level := depths[operator] - 1; level >= 0; level-- {
 		budget.step()
 		open := -1
-		for j := start - 1; j >= 0; j-- {
+		for j := operator - 1; j >= 0; j-- {
 			budget.step()
-			if tokens[j].GetTokenType() == KQLLexerLPAREN && depths[j] == depths[start]-1 {
+			if tokens[j].GetTokenType() == KQLLexerLPAREN && depths[j] == level {
 				open = j
 				break
 			}
 		}
-		if open <= 0 || tokens[open-1].GetTokenType() != KQLLexerIDENTIFIER {
-			break
+		if open < 0 {
+			continue
 		}
-		start = open - 1
+		close, _ := membershipParenEnd(tokens, open, budget)
+		if close < 0 {
+			continue
+		}
+		if open > 0 && tokens[open-1].GetTokenType() == KQLLexerIDENTIFIER {
+			start = open - 1
+			continue
+		}
+		if close+1 < len(tokens) && membershipScalarSuffix(tokens[close+1].GetTokenType()) {
+			start = open
+		}
 	}
 	return membershipAtomEnd(tokens, depths, start, rhsEnd, budget)
+}
+
+func membershipScalarSuffix(kind int) bool {
+	switch kind {
+	case KQLLexerEQ, KQLLexerNEQ, KQLLexerLT, KQLLexerGT,
+		KQLLexerLTE, KQLLexerGTE, KQLLexerEQTILDE, KQLLexerNEQTILDE,
+		KQLLexerPLUS, KQLLexerMINUS, KQLLexerSTAR, KQLLexerSLASH,
+		KQLLexerPERCENT, KQLLexerIN, KQLLexerNOT_IN,
+		KQLLexerIN_CS, KQLLexerNOT_IN_CS:
+		return true
+	}
+	return false
 }
 
 func membershipAtomEnd(tokens []antlr.Token, depths []int, start, rhsEnd int, budget *parseBudget) (int, int) {
@@ -193,11 +244,14 @@ func protectMembershipSources(query string, budget *parseBudget) (string, *membe
 			continue
 		}
 		close, pipe := membershipParenEnd(tokens, i+1, budget)
-		if !pipe {
+		if close < 0 {
+			if pipe {
+				membershipFailure("unmatched tabular RHS")
+			}
 			continue
 		}
-		if close < 0 {
-			membershipFailure("unmatched tabular RHS")
+		if !membershipTabularRHS(tokens, i+1, close, pipe, budget) {
+			continue
 		}
 		startToken, endToken := membershipAtomSpan(tokens, depths, i, close, budget)
 		start := positions[tokens[startToken].GetStart()]
@@ -208,15 +262,11 @@ func protectMembershipSources(query string, budget *parseBudget) (string, *membe
 		if start < last || start >= end {
 			membershipFailure("overlapping predicate atoms")
 		}
-		rhsStart := positions[tokens[i+1].GetStop()+1]
-		rhsStop := positions[tokens[close].GetStart()]
-		if rhsStart > rhsStop || rhsStop > len(query) {
-			membershipFailure("invalid tabular RHS span")
-		}
 		if start >= selectedStart {
-			validateMembershipRHS(query[rhsStart:rhsStop], budget)
-			probe := query[start:rhsStart] + `"membership"` + query[rhsStop:end]
-			validateMembershipQuery("T | where "+probe, budget)
+			if membershipUnsupportedScalarSubquery(tokens, depths, i, budget) {
+				membershipFailure("unsupported membership inside scalar subquery")
+			}
+			validateMembershipOwner(query, tokens, positions, startToken, endToken, budget)
 		}
 		marker := "__kql_membership_" + strconv.Itoa(len(protection.entries)) + "__"
 		for strings.Contains(query, marker) {
@@ -240,13 +290,224 @@ func protectMembershipSources(query string, budget *parseBudget) (string, *membe
 	return out.String(), protection
 }
 
+func validateMembershipOwner(query string, tokens []antlr.Token, positions []int, startToken, endToken int, budget *parseBudget) {
+	budget.step()
+	start := positions[tokens[startToken].GetStart()]
+	end := len(query)
+	if endToken < len(tokens) && tokens[endToken].GetStart() >= 0 {
+		end = positions[tokens[endToken].GetStart()]
+	}
+	var probe strings.Builder
+	last := start
+	for j := startToken; j+1 < endToken; j++ {
+		budget.step()
+		if !membershipToken(tokens[j].GetTokenType()) || tokens[j+1].GetTokenType() != KQLLexerLPAREN {
+			continue
+		}
+		close, pipe := membershipParenEnd(tokens, j+1, budget)
+		if close < 0 {
+			membershipFailure("unmatched tabular RHS")
+		}
+		if !membershipTabularRHS(tokens, j+1, close, pipe, budget) {
+			continue
+		}
+		rhsStart, rhsStop := positions[tokens[j+1].GetStop()+1], positions[tokens[close].GetStart()]
+		if rhsStart > rhsStop || rhsStop > end {
+			membershipFailure("invalid tabular RHS span")
+		}
+		validateMembershipRHS(query[rhsStart:rhsStop], budget)
+		reserveSearchBytes(probe.Len()+rhsStart-last+len(`"membership"`)+end-rhsStop, budget)
+		probe.WriteString(query[last:rhsStart])
+		probe.WriteString(`"membership"`)
+		last = rhsStop
+		j = close
+	}
+	probe.WriteString(query[last:end])
+	validateMembershipQuery("T | where "+probe.String(), budget)
+}
+
 func validateMembershipRHS(rhs string, budget *parseBudget) {
 	budget.step()
 	if strings.TrimSpace(rhs) == "" {
 		membershipFailure("empty tabular RHS")
 	}
+	// These normalizers deliberately delete their subquery or parse body. Until
+	// those bodies have their own validator, accepting them would launder errors.
+	for _, token := range membershipTokens(rhs, budget) {
+		budget.step()
+		switch token.GetTokenType() {
+		case KQLLexerMV_APPLY, KQLLexerPARSE, KQLLexerPARSE_WHERE, KQLLexerPARSE_KV:
+			membershipFailure("unvalidated tabular stage")
+		}
+		if token.GetTokenType() == KQLLexerIDENTIFIER && strings.EqualFold(token.GetText(), "mvapply") {
+			membershipFailure("unvalidated tabular stage")
+		}
+	}
+	validateMembershipConstructor(rhs, budget)
 	protected, _ := protectMembershipSources(rhs, budget)
 	validateMembershipQuery(protected, budget)
+}
+
+// The generated grammar cannot parse adjacent bracketed constructor data: its
+// lexer emits the whole [..] as a quoted identifier. Validate that discarded
+// source explicitly before the normalizer substitutes its table reference.
+func validateMembershipConstructor(rhs string, budget *parseBudget) {
+	tokens := membershipTokens(rhs, budget)
+	first := 0
+	limit := len(tokens) - 1 // exclude EOF and enclosing grouping parentheses
+	for first < len(tokens) && tokens[first].GetTokenType() == KQLLexerLPAREN {
+		budget.step()
+		close, _ := membershipParenEnd(tokens, first, budget)
+		if close != limit-1 {
+			break
+		}
+		first++
+		limit--
+	}
+	if first >= len(tokens) {
+		return
+	}
+	kind := tokens[first].GetTokenType()
+	if kind != KQLLexerDATATABLE && kind != KQLLexerEXTERNALDATA {
+		return
+	}
+	if first+1 >= len(tokens) || tokens[first+1].GetTokenType() != KQLLexerLPAREN {
+		membershipFailure("invalid tabular constructor schema")
+	}
+	close, _ := membershipParenEnd(tokens, first+1, budget)
+	if close < 0 || close+1 >= limit {
+		membershipFailure("invalid tabular constructor schema")
+	}
+	columns := 0
+	for j := first + 2; j < close; {
+		budget.step()
+		if j+2 >= close || !isSimpleIdentifier(tokens[j].GetText()) || tokens[j+1].GetTokenType() != KQLLexerCOLON || !isSimpleIdentifier(tokens[j+2].GetText()) {
+			membershipFailure("invalid tabular constructor column")
+		}
+		columns++
+		j += 3
+		if j < close {
+			if tokens[j].GetTokenType() != KQLLexerCOMMA {
+				membershipFailure("invalid tabular constructor schema")
+			}
+			j++
+			if j == close {
+				membershipFailure("trailing constructor column comma")
+			}
+		}
+	}
+	if columns == 0 {
+		membershipFailure("empty tabular constructor schema")
+	}
+	data := tokens[close+1].GetText()
+	if len(data) < 2 || data[0] != '[' || data[len(data)-1] != ']' {
+		membershipFailure("invalid tabular constructor data")
+	}
+	values := membershipSplitValues(data[1:len(data)-1], budget)
+	if kind == KQLLexerDATATABLE && len(values)%columns != 0 {
+		membershipFailure("incomplete datatable row")
+	}
+	if kind == KQLLexerEXTERNALDATA && len(values) == 0 {
+		membershipFailure("externaldata needs a URI")
+	}
+	for _, value := range values {
+		budget.step()
+		if kind == KQLLexerEXTERNALDATA && !strings.HasPrefix(value, `@"`) && !strings.HasPrefix(value, `"`) && !strings.HasPrefix(value, `'`) {
+			membershipFailure("invalid externaldata URI")
+		}
+		for _, token := range membershipTokens(value, budget) {
+			budget.step()
+			if token.GetTokenType() == KQLLexerPIPE || token.GetTokenType() == KQLLexerSEMICOLON {
+				membershipFailure("invalid constructor value")
+			}
+		}
+		validateMembershipQuery("T | where x == "+value, budget)
+	}
+	next := close + 2
+	if kind == KQLLexerEXTERNALDATA && next < limit && tokens[next].GetTokenType() == KQLLexerWITH {
+		if next+1 >= limit || tokens[next+1].GetTokenType() != KQLLexerLPAREN {
+			membershipFailure("invalid externaldata options")
+		}
+		optionEnd, _ := membershipParenEnd(tokens, next+1, budget)
+		if optionEnd < 0 || optionEnd == next+2 {
+			membershipFailure("invalid externaldata options")
+		}
+		for j := next + 2; j < optionEnd; {
+			budget.step()
+			if j+2 >= optionEnd || !isSimpleIdentifier(tokens[j].GetText()) || tokens[j+1].GetTokenType() != KQLLexerASSIGN {
+				membershipFailure("invalid externaldata option")
+			}
+			validateMembershipQuery("T | where x == "+tokens[j+2].GetText(), budget)
+			j += 3
+			if j < optionEnd {
+				if tokens[j].GetTokenType() != KQLLexerCOMMA {
+					membershipFailure("invalid externaldata option")
+				}
+				j++
+			}
+		}
+		next = optionEnd + 1
+	}
+	if next < limit && tokens[next].GetTokenType() != KQLLexerPIPE {
+		membershipFailure("invalid tabular constructor suffix")
+	}
+}
+
+func membershipSplitValues(data string, budget *parseBudget) []string {
+	if strings.TrimSpace(data) == "" {
+		return nil
+	}
+	var values []string
+	start, depth := 0, 0
+	quote := byte(0)
+	for i := 0; i < len(data); i++ {
+		budget.step()
+		ch := data[i]
+		if quote != 0 {
+			if ch == '\\' && i+1 < len(data) {
+				i++
+				continue
+			}
+			if ch == quote {
+				if i+1 < len(data) && data[i+1] == quote {
+					i++
+				} else {
+					quote = 0
+				}
+			}
+			continue
+		}
+		switch ch {
+		case '"', '\'':
+			quote = ch
+		case '(', '[':
+			depth++
+		case ')', ']':
+			depth--
+			if depth < 0 {
+				membershipFailure("unbalanced constructor value")
+			}
+		case ',':
+			if depth == 0 {
+				value := strings.TrimSpace(data[start:i])
+				if value == "" {
+					membershipFailure("empty constructor value")
+				}
+				budget.reserveOutput(1)
+				values = append(values, value)
+				start = i + 1
+			}
+		}
+	}
+	if quote != 0 || depth != 0 {
+		membershipFailure("unbalanced constructor value")
+	}
+	value := strings.TrimSpace(data[start:])
+	if value == "" {
+		membershipFailure("trailing constructor value comma")
+	}
+	budget.reserveOutput(1)
+	return append(values, value)
 }
 
 func validateMembershipQuery(query string, budget *parseBudget) {
@@ -333,6 +594,34 @@ func (p *membershipProtection) bind(tree antlr.Tree, normalized string, budget *
 			membershipFailure("selected predicate was not parsed")
 		}
 	}
+}
+
+func unprotectedMembershipFilter(tree antlr.Tree, offsets []int, budget *parseBudget) bool {
+	if len(offsets) == 0 {
+		return false
+	}
+	var visit func(antlr.Tree) bool
+	visit = func(node antlr.Tree) bool {
+		budget.step()
+		if comparison, ok := node.(IComparisonExpressionContext); ok && isKQLFilterContext(comparison, budget) {
+			start, stop := comparison.GetStart(), comparison.GetStop()
+			if start != nil && stop != nil {
+				for _, offset := range offsets {
+					budget.step()
+					if start.GetStart() <= offset && offset <= stop.GetStop() {
+						return true
+					}
+				}
+			}
+		}
+		for i := 0; i < node.GetChildCount(); i++ {
+			if visit(node.GetChild(i)) {
+				return true
+			}
+		}
+		return false
+	}
+	return visit(tree)
 }
 
 // Recursive join extraction receives source text, never parser placeholders.

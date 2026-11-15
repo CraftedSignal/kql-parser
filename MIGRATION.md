@@ -55,6 +55,9 @@ legacy placeholder output are retained for compatibility with normalization
 tools; neither represents an executable membership condition. A consumer must
 handle or explicitly reject the opaque scalar. Malformed tabular RHS syntax or
 lost source association yields a failure-only result without partial filters.
+Membership within an enclosing scalar subquery or a normalization stage whose
+body cannot be validated also fails explicitly rather than exposing a partial
+filter or an internal source marker.
 
 This parser change does not update or release the platform dependency. Before
 adopting it, the platform adapter must handle scalar leaves or return an

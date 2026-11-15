@@ -5764,18 +5764,21 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 			return
 		}
 	}
+	// A generated legacy placeholder in a row filter is never a literal
+	// membership value. If early source protection missed an enclosing path,
+	// fail the entire result instead of lowering a fabricated condition.
+	for _, offset := range e.subqueryMarkers {
+		e.budget.step()
+		if ctx.GetStart().GetStart() <= offset && offset <= ctx.GetStop().GetStop() {
+			e.unsupportedSubquery = true
+			return
+		}
+	}
 	if e.expressionLeaves == nil {
 		e.expressionLeaves = make(map[IComparisonExpressionContext]*ConditionExpression)
 	}
 	scalar := func() {
 		e.budget.step()
-		for _, offset := range e.subqueryMarkers {
-			e.budget.step()
-			if ctx.GetStart().GetStart() <= offset && offset <= ctx.GetStop().GetStop() {
-				e.unsupportedSubquery = true
-				return
-			}
-		}
 		e.budget.reserveOutput(1)
 		e.expressionLeaves[ctx] = &ConditionExpression{Operator: BooleanScalar, Scalar: &ScalarPredicate{Text: kqlSourceText(ctx, e.budget), PipeStage: e.currentStage, Pipeline: e.currentPipeline()}}
 	}

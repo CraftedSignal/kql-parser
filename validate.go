@@ -44,6 +44,9 @@ func validateContext(ctx context.Context, query string, limits parseLimits) (err
 	if normalization.membership != nil {
 		normalization.membership.bind(tree, normalized, budget)
 	}
+	if unprotectedMembershipFilter(tree, normalization.subqueryOffsets, budget) {
+		return []string{"unsupported scalar predicate: unresolved IN subquery"}
+	}
 	if count, diagnostic := validateKQLSearches(tree, budget); normalization.searchCount > 0 || count > 0 {
 		if diagnostic != "" {
 			return []string{diagnostic}
