@@ -114,15 +114,30 @@ func TestAnalyzeContextRejectsCanceledRequest(t *testing.T) {
 
 func TestAnalyzeSharesBudgetWithSemanticConversion(t *testing.T) {
 	limits := defaultParseLimits()
-	// The typed RHS and its source/value bytes now consume extraction output.
-	// Nine items admit extraction but leave no room for semantic copies.
+	// The old tiny cap still fails without exposing a partial graph or filter.
 	limits.maxOutputItems = 9
 	query := "T | where x == 1"
-	if result := extractConditionsContext(context.Background(), query, limits); len(result.Errors) != 0 || len(result.Conditions) != 1 {
-		t.Fatalf("extraction must fit this budget: %+v", result)
+	if result := extractConditionsContext(context.Background(), query, limits); len(result.Conditions) != 0 || result.Dataflow != nil || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "output items") {
+		t.Fatalf("tiny extraction budget exposed partial output: %+v", result)
+	}
+	if result := analyzeQueryContext(context.Background(), query, limits); len(result.Conditions) != 0 || result.Dataflow != nil || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "output items") {
+		t.Fatalf("tiny analysis budget exposed partial output: %+v", result)
+	}
+
+	// The graph-aware cap admits either operation alone but not their combined
+	// output on the shared request budget.
+	limits.maxOutputItems = 100
+	parsed := extractConditionsContext(context.Background(), query, limits)
+	if len(parsed.Errors) != 0 || len(parsed.Conditions) != 1 || parsed.Dataflow == nil {
+		t.Fatalf("extraction must fit shared-budget fixture: %+v", parsed)
+	}
+	freshBudget, cancel := newParseBudget(context.Background(), limits)
+	defer cancel()
+	if standalone := semanticFromExtraction(parsed, freshBudget); standalone == nil || len(standalone.Errors) != 0 || len(standalone.Conditions) != 1 || standalone.Dataflow == nil {
+		t.Fatalf("fresh semantic conversion must fit fixture: %+v", standalone)
 	}
 	result := analyzeQueryContext(context.Background(), query, limits)
-	if len(result.Conditions) != 0 || result.Expression != nil || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "output items") {
+	if len(result.Conditions) != 0 || result.Expression != nil || result.Dataflow != nil || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "output items") {
 		t.Fatalf("semantic conversion must share the exhausted budget without partial output: %+v", result)
 	}
 }

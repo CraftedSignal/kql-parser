@@ -525,11 +525,11 @@ CFPhishing
 	}
 	assertLetStatement(t, result.LetStatements, "CFPhishing", `externaldata(Url:string)
 [h'https://gist.githubusercontent.com/whichbuffer/4dab8a4d4ce4fea0dbfe73b7e3c3f6a7/raw/df8993ea4ebdb069905ec7c4f22531299759e55a/PhishingDomains']`)
-	if result.ComputedFields["domains"] != "Url" {
-		t.Fatalf("expected Domains source field Url, got %q in %+v", result.ComputedFields["domains"], result.ComputedFields)
+	if result.ComputedFields["Domains"] != "Url" {
+		t.Fatalf("expected Domains source field Url, got %q in %+v", result.ComputedFields["Domains"], result.ComputedFields)
 	}
-	if result.ComputedExpressions["domains"] != `extract(@"https?://([^/]+)",1,Url)` {
-		t.Fatalf("expected Domains extract expression, got %q", result.ComputedExpressions["domains"])
+	if result.ComputedExpressions["Domains"] != `extract(@"https?://([^/]+)",1,Url)` {
+		t.Fatalf("expected Domains extract expression, got %q", result.ComputedExpressions["Domains"])
 	}
 	if !containsString(result.ProjectedFields, "Domains") {
 		t.Fatalf("expected Domains projected field, got %v", result.ProjectedFields)
@@ -995,11 +995,11 @@ func TestExtractConditions_SummarizeAliasComputedFields(t *testing.T) {
 		t.Logf("Condition: %+v", c)
 	}
 
-	// "failedattempts" should be in ComputedFields
-	if got, ok := result.ComputedFields["failedattempts"]; !ok {
-		t.Errorf("Expected 'failedattempts' to be in ComputedFields, got: %v", result.ComputedFields)
+	// The authored alias keeps its exact case in ComputedFields.
+	if got, ok := result.ComputedFields["FailedAttempts"]; !ok {
+		t.Errorf("Expected 'FailedAttempts' to be in ComputedFields, got: %v", result.ComputedFields)
 	} else if got != "count()" {
-		t.Errorf("Expected failedattempts source count(), got %q", got)
+		t.Errorf("Expected FailedAttempts source count(), got %q", got)
 	}
 
 	// The "FailedAttempts > 10" condition should be marked as computed
@@ -1027,13 +1027,13 @@ func TestExtractConditions_SummarizeAggregationComputedFields(t *testing.T) {
 		{
 			name:     "sum",
 			query:    `SecurityEvent | summarize TotalBytes = sum(Bytes) by SourceIP`,
-			alias:    "totalbytes",
+			alias:    "TotalBytes",
 			expected: "sum(Bytes)",
 		},
 		{
 			name:     "dcount",
 			query:    `SecurityEvent | summarize UniqueUsers = dcount(UserPrincipalName) by SourceIP`,
-			alias:    "uniqueusers",
+			alias:    "UniqueUsers",
 			expected: "dcount(UserPrincipalName)",
 		},
 	}

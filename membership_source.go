@@ -248,6 +248,10 @@ func membershipFailure(message string) {
 // Run before the lossy normalizers, after selecting the same main-query
 // boundary as search protection. Every occurrence has a distinct identifier.
 func protectMembershipSources(query string, budget *parseBudget) (string, *membershipProtection) {
+	return protectMembershipSourcesWithSource(query, budget, nil)
+}
+
+func protectMembershipSourcesWithSource(query string, budget *parseBudget, recorder *kqlSourceRecorder) (string, *membershipProtection) {
 	if budget == nil {
 		bounded, cancel := newParseBudget(context.Background(), defaultParseLimits())
 		defer cancel()
@@ -264,6 +268,7 @@ func protectMembershipSources(query string, budget *parseBudget) (string, *membe
 	selectedStart := skipLetStatements(query)
 	var out strings.Builder
 	last := 0
+	var sourceEdits []kqlSourceEdit
 	for i := 0; i+1 < len(tokens); i++ {
 		budget.step()
 		if !membershipToken(tokens[i].GetTokenType()) || tokens[i+1].GetTokenType() != KQLLexerLPAREN || !membershipWhere(tokens, depths, i, budget) {
@@ -303,6 +308,15 @@ func protectMembershipSources(query string, budget *parseBudget) (string, *membe
 		entry := &protectedMembership{marker: marker, source: strings.TrimRight(query[start:end], " \t\r\n"), selected: start >= selectedStart}
 		protection.entries = append(protection.entries, entry)
 		replacement := " " + marker + " "
+		if recorder != nil && recorder.Source.Text == query {
+			recorder.Source.Protected[marker] = kqlPiecesInRange(recorder.Source, start, end, budget)
+			owner := kqlOccurrenceAt(recorder.Source, start, budget)
+			origin := originOfEdit(recorder.Source, kqlSourceEdit{Start: start, End: end}, budget)
+			if owner >= 0 {
+				origin = recorder.Source.Occurrences[owner].Span
+			}
+			sourceEdits = append(sourceEdits, kqlSourceEdit{Start: start, End: end, Parts: []kqlSourcePart{{Text: replacement, Origin: origin, OccurrenceID: owner}}})
+		}
 		reserveSearchBytes(out.Len()+start-last+len(replacement)+len(query)-end, budget)
 		out.WriteString(query[last:start])
 		out.WriteString(replacement)
@@ -313,7 +327,14 @@ func protectMembershipSources(query string, budget *parseBudget) (string, *membe
 		return query, protection
 	}
 	out.WriteString(query[last:])
-	return out.String(), protection
+	result := out.String()
+	if len(sourceEdits) > 0 {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, sourceEdits, budget)
+		if recorder.Source.Text != result {
+			sourceAbort("membership protection edit mismatch")
+		}
+	}
+	return result, protection
 }
 
 func validateMembershipOwner(query string, tokens []antlr.Token, positions []int, startToken, endToken int, budget *parseBudget) {

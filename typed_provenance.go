@@ -15,24 +15,39 @@ type literalRewrite struct {
 	replacement string
 }
 
-func rewriteLiteralSources(query string, rewrites []literalRewrite, p *typedProtection, budget *parseBudget) string {
+func rewriteLiteralSources(query string, rewrites []literalRewrite, p *typedProtection, budget *parseBudget, recorders ...*kqlSourceRecorder) string {
 	if len(rewrites) == 0 {
 		return query
 	}
 	var out strings.Builder
 	last := 0
+	var recorder *kqlSourceRecorder
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder = recorders[0]
+	}
 	for _, rewrite := range rewrites {
 		budget.step()
 		if rewrite.start < last {
 			continue
 		}
 		out.WriteString(query[last:rewrite.start])
-		out.WriteString(p.mark(letOrigin{source: query[rewrite.start:rewrite.end], normalized: rewrite.replacement}, budget))
+		marker := p.mark(letOrigin{source: query[rewrite.start:rewrite.end], normalized: rewrite.replacement}, budget)
+		out.WriteString(marker)
 		out.WriteString(rewrite.replacement)
+		if recorder != nil {
+			recorder.replace(rewrite.start, rewrite.end, marker+rewrite.replacement, "")
+		}
 		last = rewrite.end
 	}
 	out.WriteString(query[last:])
-	return out.String()
+	result := out.String()
+	if recorder != nil && len(recorder.Edits) > 0 {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, recorder.Edits, budget)
+		if recorder.Source.Text != result {
+			sourceAbort("typed literal edit mismatch")
+		}
+	}
+	return result
 }
 
 func protectedKQLBytes(query string, budget *parseBudget) []bool {
@@ -65,7 +80,7 @@ func protectedKQLBytes(query string, budget *parseBudget) []bool {
 	return protected
 }
 
-func markedRegexLiterals(query string, pattern *regexp.Regexp, replacement string, p *typedProtection, budget *parseBudget) string {
+func markedRegexLiterals(query string, pattern *regexp.Regexp, replacement string, p *typedProtection, budget *parseBudget, recorders ...*kqlSourceRecorder) string {
 	protected := protectedKQLBytes(query, budget)
 	var rewrites []literalRewrite
 	for _, loc := range pattern.FindAllStringIndex(query, -1) {
@@ -79,10 +94,14 @@ func markedRegexLiterals(query string, pattern *regexp.Regexp, replacement strin
 			rewrites = append(rewrites, literalRewrite{loc[0], loc[1], next})
 		}
 	}
-	return rewriteLiteralSources(query, rewrites, p, budget)
+	return rewriteLiteralSources(query, rewrites, p, budget, recorders...)
 }
 
-func replaceRegexOutsideProtected(query string, pattern *regexp.Regexp, replacement string, budget *parseBudget) string {
+func replaceRegexOutsideProtected(query string, pattern *regexp.Regexp, replacement string, budget *parseBudget, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	protected := protectedKQLBytes(query, budget)
 	var out strings.Builder
 	last := 0
@@ -99,14 +118,18 @@ func replaceRegexOutsideProtected(query string, pattern *regexp.Regexp, replacem
 			continue
 		}
 		out.WriteString(query[last:loc[0]])
-		out.Write(pattern.ExpandString(nil, replacement, query, loc))
+		rewritten := string(pattern.ExpandString(nil, replacement, query, loc))
+		out.WriteString(rewritten)
+		if recorder != nil {
+			recorder.Replace(loc[0], loc[1], rewritten, "")
+		}
 		last = loc[1]
 	}
 	if last == 0 {
 		return query
 	}
 	out.WriteString(query[last:])
-	return out.String()
+	return finishKQLRecorded(query, out.String(), recorder)
 }
 
 var typedTimespanSuffix = regexp.MustCompile(`(?i)\b[0-9]+(?:minutes|minute|min|seconds|second|sec|hours|hour|days|day)\b`)
@@ -178,10 +201,14 @@ func provenBracketReference(source, normalized string) string {
 	return normalized
 }
 
-func markReferenceSources(query string, pattern *regexp.Regexp, transform func(string) string, p *typedProtection, budget *parseBudget) string {
+func markReferenceSources(query string, pattern *regexp.Regexp, transform func(string) string, p *typedProtection, budget *parseBudget, recorders ...*kqlSourceRecorder) string {
 	protected := protectedKQLBytes(query, budget)
 	var out strings.Builder
 	last := 0
+	var recorder *kqlSourceRecorder
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder = recorders[0]
+	}
 	for _, loc := range pattern.FindAllStringIndex(query, -1) {
 		budget.step()
 		if loc[0] < last {
@@ -218,18 +245,29 @@ func markReferenceSources(query string, pattern *regexp.Regexp, transform func(s
 			origin.referenceValue = original
 		}
 		out.WriteString(query[last:loc[0]])
-		out.WriteString(p.mark(origin, budget))
+		marker := p.mark(origin, budget)
+		out.WriteString(marker)
 		out.WriteString(replacement)
+		if recorder != nil {
+			recorder.replace(loc[0], loc[1], marker+replacement, "")
+		}
 		last = loc[1]
 	}
 	if last == 0 {
 		return query
 	}
 	out.WriteString(query[last:])
-	return out.String()
+	result := out.String()
+	if recorder != nil && len(recorder.Edits) > 0 {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, recorder.Edits, budget)
+		if recorder.Source.Text != result {
+			sourceAbort("typed reference edit mismatch")
+		}
+	}
+	return result
 }
 
-func normalizeTimespanLiteralsTracked(query string, p *typedProtection, budget *parseBudget) string {
+func normalizeTimespanLiteralsTracked(query string, p *typedProtection, budget *parseBudget, recorders ...*kqlSourceRecorder) string {
 	protected := protectedKQLBytes(query, budget)
 	var rewrites []literalRewrite
 	for _, loc := range typedTimespanSuffix.FindAllStringIndex(query, -1) {
@@ -243,10 +281,10 @@ func normalizeTimespanLiteralsTracked(query string, p *typedProtection, budget *
 			rewrites = append(rewrites, literalRewrite{loc[0], loc[1], next})
 		}
 	}
-	return rewriteLiteralSources(query, rewrites, p, budget)
+	return rewriteLiteralSources(query, rewrites, p, budget, recorders...)
 }
 
-func normalizeTrailingDecimalsTracked(query string, p *typedProtection, budget *parseBudget) string {
+func normalizeTrailingDecimalsTracked(query string, p *typedProtection, budget *parseBudget, recorders ...*kqlSourceRecorder) string {
 	protected := protectedKQLBytes(query, budget)
 	var rewrites []literalRewrite
 	for _, loc := range typedTrailingDecimal.FindAllStringIndex(query, -1) {
@@ -259,10 +297,10 @@ func normalizeTrailingDecimalsTracked(query string, p *typedProtection, budget *
 		}
 		rewrites = append(rewrites, literalRewrite{loc[0], loc[1], query[loc[0]:loc[1]] + "0"})
 	}
-	return rewriteLiteralSources(query, rewrites, p, budget)
+	return rewriteLiteralSources(query, rewrites, p, budget, recorders...)
 }
 
-func joinAdjacentStringLiteralsTracked(query string, p *typedProtection, budget *parseBudget) string {
+func joinAdjacentStringLiteralsTracked(query string, p *typedProtection, budget *parseBudget, recorders ...*kqlSourceRecorder) string {
 	var rewrites []literalRewrite
 	for i := 0; i < len(query); {
 		budget.step()
@@ -308,10 +346,10 @@ func joinAdjacentStringLiteralsTracked(query string, p *typedProtection, budget 
 		}
 		i = end
 	}
-	return rewriteLiteralSources(query, rewrites, p, budget)
+	return rewriteLiteralSources(query, rewrites, p, budget, recorders...)
 }
 
-func markNullEscapeStrings(query string, p *typedProtection, budget *parseBudget) string {
+func markNullEscapeStrings(query string, p *typedProtection, budget *parseBudget, recorders ...*kqlSourceRecorder) string {
 	var rewrites []literalRewrite
 	for i := 0; i < len(query); {
 		budget.step()
@@ -341,7 +379,7 @@ func markNullEscapeStrings(query string, p *typedProtection, budget *parseBudget
 		}
 		i = end
 	}
-	return rewriteLiteralSources(query, rewrites, p, budget)
+	return rewriteLiteralSources(query, rewrites, p, budget, recorders...)
 }
 
 // letOrigin is attached to a proven inlining occurrence, never recovered by
@@ -362,6 +400,19 @@ type typedProtection struct {
 	budget        *parseBudget
 }
 
+func (p *typedProtection) normalizesField(authored, normalized string) bool {
+	if p == nil {
+		return false
+	}
+	for _, origin := range p.byStart {
+		p.budget.step()
+		if origin.referenceValue == authored && origin.normalized == normalized {
+			return true
+		}
+	}
+	return false
+}
+
 func newTypedProtection(query string, budgets ...*parseBudget) *typedProtection {
 	prefix := "__kql_typed_origin_"
 	for strings.Contains(query, prefix) {
@@ -370,7 +421,7 @@ func newTypedProtection(query string, budgets ...*parseBudget) *typedProtection 
 	return &typedProtection{markers: make(map[string]letOrigin), shields: make(map[string]string), prefix: prefix, budget: suppliedBudget(budgets)}
 }
 
-func (p *typedProtection) shieldNative(query string, budget *parseBudget) string {
+func (p *typedProtection) shieldNative(query string, budget *parseBudget, recorders ...*kqlSourceRecorder) string {
 	budget.step()
 	selected := skipLetStatements(query)
 	var stream *antlr.CommonTokenStream
@@ -385,6 +436,7 @@ func (p *typedProtection) shieldNative(query string, budget *parseBudget) string
 	positions := searchRuneBytes(query, budget)
 	var out strings.Builder
 	last := 0
+	var sourceEdits []kqlSourceEdit
 	for i := 0; i < stream.Size(); i++ {
 		budget.step()
 		token := stream.Get(i)
@@ -404,6 +456,12 @@ func (p *typedProtection) shieldNative(query string, budget *parseBudget) string
 		p.next++
 		budget.reserveOutput(1 + len(marker) + end - start)
 		p.shields[marker] = query[start:end]
+		if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+			recorder := recorders[0]
+			recorder.Source.Protected[marker] = kqlPiecesInRange(recorder.Source, start, end, budget)
+			owner := kqlOccurrenceAt(recorder.Source, start, budget)
+			sourceEdits = append(sourceEdits, kqlSourceEdit{Start: start, End: end, Parts: []kqlSourcePart{{Text: marker, Origin: originOfEdit(recorder.Source, kqlSourceEdit{Start: start, End: end}, budget), OccurrenceID: owner}}})
+		}
 		out.WriteString(query[last:start])
 		out.WriteString(marker)
 		last = end
@@ -412,10 +470,18 @@ func (p *typedProtection) shieldNative(query string, budget *parseBudget) string
 		return query
 	}
 	out.WriteString(query[last:])
-	return out.String()
+	result := out.String()
+	if len(sourceEdits) > 0 {
+		recorder := recorders[0]
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, sourceEdits, budget)
+		if recorder.Source.Text != result {
+			sourceAbort("typed shield edit mismatch")
+		}
+	}
+	return result
 }
 
-func (p *typedProtection) restoreShields(query string, budget *parseBudget) string {
+func (p *typedProtection) restoreShields(query string, budget *parseBudget, recorders ...*kqlSourceRecorder) string {
 	budget.step()
 	if len(p.shields) == 0 {
 		return query
@@ -424,6 +490,8 @@ func (p *typedProtection) restoreShields(query string, budget *parseBudget) stri
 	protected := protectedKQLBytes(query, budget)
 	var out strings.Builder
 	offset := 0
+	originalInput := query
+	var sourceEdits []kqlSourceEdit
 	for len(query) > 0 {
 		budget.step()
 		index := strings.Index(query, prefix)
@@ -450,13 +518,32 @@ func (p *typedProtection) restoreShields(query string, budget *parseBudget) stri
 		marker := query[:end+2]
 		if source, ok := p.shields[marker]; ok {
 			out.WriteString(source)
+			if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == originalInput {
+				var parts []kqlSourcePart
+				for _, piece := range recorders[0].Source.Protected[marker] {
+					budget.step()
+					parts = append(parts, kqlSourcePart{Text: piece.Text, Origin: piece.Origin, OccurrenceID: piece.OccurrenceID})
+				}
+				if len(parts) == 0 {
+					sourceAbort("typed shield lost protected source")
+				}
+				sourceEdits = append(sourceEdits, kqlSourceEdit{Start: offset + index, End: offset + index + end + 2, Parts: parts})
+			}
 		} else {
 			out.WriteString(marker)
 		}
 		query = query[end+2:]
 		offset += index + end + 2
 	}
-	return out.String()
+	result := out.String()
+	if len(sourceEdits) > 0 {
+		recorder := recorders[0]
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, sourceEdits, budget)
+		if recorder.Source.Text != result {
+			sourceAbort("typed shield restoration edit mismatch")
+		}
+	}
+	return result
 }
 
 func (p *typedProtection) mark(origin letOrigin, budget *parseBudget) string {
@@ -470,7 +557,7 @@ func (p *typedProtection) mark(origin letOrigin, budget *parseBudget) string {
 	return marker + " "
 }
 
-func (p *typedProtection) restore(query string, budget *parseBudget) string {
+func (p *typedProtection) restore(query string, budget *parseBudget, recorders ...*kqlSourceRecorder) string {
 	budget.step()
 	if len(p.markers) == 0 {
 		return query
@@ -480,6 +567,7 @@ func (p *typedProtection) restore(query string, budget *parseBudget) string {
 	p.starts = p.starts[:0]
 	var out strings.Builder
 	runes := 0
+	var sourceEdits []kqlSourceEdit
 	for i := 0; i < len(query); {
 		budget.step()
 		if isStringLiteralStart(query, i) {
@@ -496,6 +584,7 @@ func (p *typedProtection) restore(query string, budget *parseBudget) string {
 				end += i + 4
 				marker := query[i:end]
 				if origin, ok := p.markers[marker]; ok {
+					markerStart := i
 					if _, present := p.byStart[runes]; !present {
 						budget.reserveOutput(1)
 						p.byStart[runes] = origin
@@ -505,6 +594,9 @@ func (p *typedProtection) restore(query string, budget *parseBudget) string {
 					i = end
 					if i < len(query) && query[i] == ' ' {
 						i++ // Consume the marker's guaranteed separator.
+					}
+					if len(recorders) > 0 && recorders[0] != nil {
+						sourceEdits = append(sourceEdits, kqlSourceEdit{Start: markerStart, End: i})
 					}
 					continue
 				}
@@ -521,7 +613,15 @@ func (p *typedProtection) restore(query string, budget *parseBudget) string {
 		i++
 	}
 	sort.Ints(p.starts)
-	return out.String()
+	result := out.String()
+	if len(sourceEdits) > 0 && recorders[0].Source.Text == query {
+		recorder := recorders[0]
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, sourceEdits, budget)
+		if recorder.Source.Text != result {
+			sourceAbort("typed marker restoration edit mismatch")
+		}
+	}
+	return result
 }
 
 // reinsert carries only authenticated occurrences into a recursively parsed
@@ -602,14 +702,6 @@ func (p *typedProtection) apply(operand *Operand, tree antlr.Tree) *Operand {
 		}
 	}
 	return &copy
-}
-
-func (p *typedProtection) applyKQLOperand(operand kqlOperand, tree antlr.Tree) kqlOperand {
-	operand.rhs = p.apply(operand.rhs, tree)
-	if operand.reference && operand.rhs != nil && operand.rhs.Kind == OperandField {
-		operand.text = operand.rhs.Value
-	}
-	return operand
 }
 
 func (p *typedProtection) hasOpaqueReference(ctx antlr.ParserRuleContext) bool {

@@ -24,22 +24,27 @@ const (
 
 // Condition represents a field condition extracted from a KQL query
 type Condition struct {
-	Field          string   `json:"field"`
-	Operator       string   `json:"operator"`
-	Value          string   `json:"value"`
-	RHS            *Operand `json:"rhs,omitempty"`             // Authored right operand; nil for legacy or unary conditions
-	ValueReference string   `json:"value_reference,omitempty"` // Variable or symbol referenced by the value expression
-	Negated        bool     `json:"negated"`
-	PipeStage      int      `json:"pipe_stage"`
-	LogicalOp      string   `json:"logical_op"`             // "AND" or "OR" connecting to previous condition
-	Alternatives   []string `json:"alternatives,omitempty"` // For OR conditions on same field
-	IsComputed     bool     `json:"is_computed,omitempty"`  // True if field was created by extend/project
-	SourceField    string   `json:"source_field,omitempty"` // Original field before transformation (for computed fields)
-	Pipeline       int      `json:"pipeline"`               // Index in ParseResult.Pipelines of the pipeline the condition filters
+	StageID        string           `json:"stage_id,omitempty"`
+	InputScopeID   string           `json:"input_scope_id,omitempty"`
+	FieldBinding   *FieldBindingRef `json:"field_binding,omitempty"`
+	Field          string           `json:"field"`
+	Operator       string           `json:"operator"`
+	Value          string           `json:"value"`
+	RHS            *Operand         `json:"rhs,omitempty"`             // Authored right operand; nil for legacy or unary conditions
+	ValueReference string           `json:"value_reference,omitempty"` // Variable or symbol referenced by the value expression
+	Negated        bool             `json:"negated"`
+	PipeStage      int              `json:"pipe_stage"`
+	LogicalOp      string           `json:"logical_op"`             // "AND" or "OR" connecting to previous condition
+	Alternatives   []string         `json:"alternatives,omitempty"` // For OR conditions on same field
+	IsComputed     bool             `json:"is_computed,omitempty"`  // True if field was created by extend/project
+	SourceField    string           `json:"source_field,omitempty"` // Original field before transformation (for computed fields)
+	Pipeline       int              `json:"pipeline"`               // Index in ParseResult.Pipelines of the pipeline the condition filters
 }
 
 // ParseResult contains all conditions extracted from the query
 type ParseResult struct {
+	Dataflow            *QueryDataflow       `json:"dataflow,omitempty"`
+	Warnings            []string             `json:"warnings,omitempty"`
 	Conditions          []Condition          `json:"conditions"`
 	Expression          *ConditionExpression `json:"expression,omitempty"`
 	DataSources         []string             `json:"data_sources,omitempty"`         // Table/source names referenced by the query
@@ -59,6 +64,8 @@ type ParseResult struct {
 // Aggregation is one summarize aggregation and the column it outputs.
 // Conditions with a higher PipeStage filter the summarized rows.
 type Aggregation struct {
+	StageID   string `json:"stage_id,omitempty"`
+	BindingID string `json:"binding_id,omitempty"`
 	Function  string `json:"function"`        // Lower-case aggregation function, e.g. count, dcount, sum
 	Field     string `json:"field,omitempty"` // Aggregated column when the first argument is a plain column
 	Column    string `json:"column"`          // Output column: the alias, or KQL's default name such as count_ or dcount_Field
@@ -129,7 +136,13 @@ var kqlKeywords = map[string]bool{
 
 // conditionExtractor walks the parse tree to extract conditions
 type conditionExtractor struct {
-	budget *parseBudget
+	budget              *parseBudget
+	dataflowOperators   map[*TabularOperatorContext]dataflowOperatorInfo
+	dataflowPipelines   map[*TabularExpressionContext]int
+	dataflowFrames      []dataflowOwnerFrame
+	aggregationContexts []*AggregationItemContext // Positional owners parallel to aggregations
+
+	sourceOwners *kqlSourceOwners
 	*BaseKQLParserListener
 	conditions          []Condition
 	computedFields      map[string]string // Fields created by extend/project: computed field -> source field
@@ -160,6 +173,121 @@ type conditionExtractor struct {
 	subqueryMarkers     []int // Rune offsets of synthetic unresolved IN-subquery literals
 	unsupportedSubquery bool
 	originalQuery       string // normalized query text for extracting subexpressions
+}
+
+func (e *conditionExtractor) authoredIdentifier(ctx antlr.ParserRuleContext) string {
+	if ctx == nil {
+		return ""
+	}
+	decode := func(authored string) string {
+		name := decodeKQLIdentifier(authored, e.budget)
+		// Dynamic accessors are normalized by the existing simple-reference
+		// path (bag['key'] -> bag.key); only a standalone authored name may
+		// replace that normalized identity.
+		if name == authored && strings.ContainsAny(authored, "[]()") {
+			return decodeKQLIdentifier(ctx.GetText(), e.budget)
+		}
+		return name
+	}
+	if e.typed != nil && e.typed.hasOrigin(ctx) {
+		return decode(e.typed.sourceOf(ctx))
+	}
+	if e.sourceOwners != nil {
+		if authored, ok := e.sourceOwners.authoredContext(ctx, e.budget); ok {
+			return decode(authored)
+		}
+	}
+	return decodeKQLIdentifier(ctx.GetText(), e.budget)
+}
+
+// applyAuthoredOperand restores only a recognized field occurrence. Literal
+// and let-definition provenance stays with typedProtection; opaque references
+// are rejected by the predicate boundary before this seam.
+func (e *conditionExtractor) applyAuthoredOperand(operand *Operand, tree antlr.Tree) *Operand {
+	operand = e.typed.apply(operand, tree)
+	if operand == nil || operand.Kind != OperandField || operand.Binding != "" || e.sourceOwners == nil {
+		return operand
+	}
+	ctx, ok := tree.(antlr.ParserRuleContext)
+	if !ok {
+		return operand
+	}
+	authored, ok := e.sourceOwners.authoredContext(ctx, e.budget)
+	if !ok {
+		sourceAbort("field operand lacks authored occurrence")
+	}
+	copy := *operand
+	copy.Source = authored
+	// Typed provenance may already prove a normalized accessor/numeric
+	// reference (3bag['key'] -> 3bag.key). Keep that occurrence's proof.
+	if e.typed.provesReferenceIn(ctx, operand.Value) {
+		return &copy
+	}
+	// Parentheses belong to Source, not to the field's decoded identity.
+	identity := tree
+	for {
+		child := kqlTransparentScalarChild(identity, e.budget)
+		if child == nil {
+			break
+		}
+		identity = child
+	}
+	copy.Value = e.authoredIdentifier(identity.(antlr.ParserRuleContext))
+	return &copy
+}
+
+func (e *conditionExtractor) applyAuthoredKQLOperand(operand kqlOperand, tree antlr.Tree) kqlOperand {
+	operand.rhs = e.applyAuthoredOperand(operand.rhs, tree)
+	if operand.reference && operand.rhs != nil && operand.rhs.Kind == OperandField {
+		operand.text = operand.rhs.Value
+	}
+	return operand
+}
+
+func (e *conditionExtractor) authoredComparisonField(ctx *ComparisonExpressionContext, field string) string {
+	if e.sourceOwners == nil {
+		return field
+	}
+	for _, expression := range ctx.AllAdditiveExpression() {
+		e.budget.step()
+		if decodeKQLIdentifier(expression.GetText(), e.budget) == field || e.typed != nil && e.typed.sourceOf(expression) == field {
+			return e.authoredIdentifier(expression)
+		}
+	}
+	return field
+}
+
+func (e *conditionExtractor) ownsDataflow(ctx antlr.ParserRuleContext) bool {
+	e.budget.step()
+	if e.sourceOwners == nil && len(e.dataflowFrames) == 0 {
+		// Direct predicate helpers do not enter the query listener. Their
+		// existing budget and extraction behavior still applies.
+		return ctx != nil
+	}
+	if len(e.dataflowFrames) == 0 || e.dataflowFrames[len(e.dataflowFrames)-1].ExternalChild {
+		return false
+	}
+	if e.sourceOwners == nil || ctx == nil {
+		return false
+	}
+	return true
+}
+
+func (e *conditionExtractor) enterDataflowOwner(ctx *TabularExpressionContext) {
+	owner, ok := e.sourceOwners.Queries[ctx]
+	if !ok {
+		sourceAbort("tabular expression lacks authored owner")
+	}
+	parentExternal := len(e.dataflowFrames) != 0 && e.dataflowFrames[len(e.dataflowFrames)-1].ExternalChild
+	_, joinChild := ctx.GetParent().(*JoinOperatorContext)
+	e.dataflowFrames = append(e.dataflowFrames, dataflowOwnerFrame{OwnerID: owner, Pipeline: e.currentPipeline(), Selected: owner == e.sourceOwners.source.SelectedOwnerID, ExternalChild: parentExternal || joinChild})
+}
+
+func (e *conditionExtractor) leaveDataflowOwner() {
+	if len(e.dataflowFrames) == 0 {
+		sourceAbort("tabular owner stack underflow")
+	}
+	e.dataflowFrames = e.dataflowFrames[:len(e.dataflowFrames)-1]
 }
 
 // errorListener collects parse errors
@@ -211,56 +339,61 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 		// Select the same main query before shielding its newlines. Keep let
 		// prefixes available for the existing scoped constant normalization.
 		if start := skipLetStatements(query); start < len(query) {
-			query = query[:start] + extractMainQuery(query)
+			selected := mainQuerySpan(query)
+			if metadata != nil && metadata.mapped != nil && metadata.mapped.Text == query {
+				copySpan := selected
+				*metadata.mapped = *applyKQLSourceEdits(metadata.mapped, []kqlSourceEdit{{Start: start, End: len(query), Parts: []kqlSourcePart{{Copy: &copySpan}}}}, budget)
+			}
+			query = query[:start] + query[selected.Start:selected.End]
 		}
 	}
 	// Let bodies are intentionally outside the selected query. A search in the
 	// selected portion must survive every later normalization rewrite.
 	normalized := query
 	if metadata != nil {
-		normalized, metadata.membership = protectMembershipSources(normalized, budget)
+		normalized, metadata.membership = protectMembershipSourcesWithSource(normalized, budget, kqlRecorder(metadata, budget))
 	}
-	normalized, searches := protectSearchClauses(normalized, budget, skipLetStatements(normalized))
+	normalized, searches := protectSearchClausesWithSource(normalized, budget, kqlRecorder(metadata, budget), skipLetStatements(normalized))
 
 	// Remove line continuation backslashes (backslash followed by newline)
 	// Common in PowerShell-style queries copied from scripts
-	normalized = strings.ReplaceAll(normalized, "\\\n", "\n")
+	normalized = replaceAllKQLMapped(normalized, "\\\n", "\n", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
-	normalized = strings.ReplaceAll(normalized, "\\\r\n", "\r\n")
+	normalized = replaceAllKQLMapped(normalized, "\\\r\n", "\r\n", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Fix escaped newlines from JSON extraction - but only outside of string literals
 	// This handles queries extracted from YAML/JSON where \r\n became literal characters
 	if !strict {
-		normalized = normalizeEscapeSequences(normalized)
+		normalized = normalizeEscapeSequences(normalized, kqlRecorder(metadata, budget))
 		budget.input(normalized)
 		budget.step()
 	}
 
 	// Normalize actual UTF-8 whitespace runes that the lexer does not treat as WS.
 	// Sentinel exports occasionally contain NBSP after query text.
-	normalized = normalizeUnicodeWhitespace(normalized)
+	normalized = normalizeUnicodeWhitespace(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Strip documentation preambles like "Description:...Query:..."
 	// These are common in documentation templates where the actual query follows "Query:"
 	if !strict {
-		normalized = stripDocumentationPreamble(normalized)
+		normalized = stripDocumentationPreamble(normalized, kqlRecorder(metadata, budget))
 		budget.input(normalized)
 		budget.step()
 	}
 
 	// Strip leading comments to get to the actual query
-	normalized = stripLeadingComments(normalized, strict)
+	normalized = stripLeadingComments(normalized, strict, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Strip declare query_parameters(...) statements
 	// These define query parameters but aren't needed for condition extraction
-	normalized = stripDeclareStatements(normalized)
+	normalized = stripDeclareStatements(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
@@ -275,11 +408,11 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 			}
 		}
 		metadata.typed = protection
-		normalized = metadata.typed.shieldNative(normalized, budget)
+		normalized = metadata.typed.shieldNative(normalized, budget, kqlRecorder(metadata, budget))
 		budget.input(normalized)
 	}
 	if metadata != nil {
-		normalized = inlineLetConstants(normalized, extractLetStatements(normalized), budget, metadata.typed)
+		normalized = inlineLetConstantsWithSource(normalized, extractLetStatements(normalized), budget, metadata.typed, kqlRecorder(metadata, budget))
 	} else {
 		normalized = inlineLetConstants(normalized, extractLetStatements(normalized), budget)
 	}
@@ -289,115 +422,115 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 	// Replace parameterized placeholders with dummy values
 	// e.g., {TimeRange} -> 1d, {SourceTable} -> DummyTable
 	if !strict {
-		normalized = replaceParameters(normalized)
+		normalized = replaceParametersWithSource(normalized, metadata, budget)
 		budget.input(normalized)
 		budget.step()
 	}
 
 	// Convert ASIM functions to dummy table names (these are parser functions that return tables)
 	// Handle both simple calls (imAuthentication) and parameterized calls (_Im_Dns(param=value))
-	normalized = replaceASIMFunctions(normalized)
+	normalized = replaceASIMFunctions(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Handle externaldata operator by replacing with dummy table
-	normalized = replaceExternalData(normalized)
+	normalized = replaceExternalData(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Handle datatable with inline data by replacing with dummy table
-	normalized = replaceDatatableWithData(normalized)
+	normalized = replaceDatatableWithData(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Handle arg() cross-workspace function: arg("...").Table -> Table
 	// Azure Resource Graph queries use arg("sub-id").Resources pattern
-	normalized = replaceArgFunction(normalized)
+	normalized = replaceArgFunction(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Handle materialize by stripping it (handles both with and without space)
-	normalized = replaceAllOutsideStrings(normalized, "materialize(", "(")
+	normalized = replaceAllOutsideStrings(normalized, "materialize(", "(", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
-	normalized = replaceAllOutsideStrings(normalized, "materialize (", "(")
+	normalized = replaceAllOutsideStrings(normalized, "materialize (", "(", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
-	normalized = replaceAllOutsideStrings(normalized, "materialize  (", "(")
+	normalized = replaceAllOutsideStrings(normalized, "materialize  (", "(", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Rename reserved keywords used as field names
 	// "pattern" is a reserved word in the grammar but used as a field name in some queries
-	normalized = renameReservedFieldNames(normalized)
+	normalized = renameReservedFieldNames(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Convert make_set and make_list aliases used by existing parser fixtures.
 	// Handle both make_set( and make_set ( with space.
-	normalized = replaceAllOutsideStrings(normalized, "make_set(", "makeset(")
+	normalized = replaceAllOutsideStrings(normalized, "make_set(", "makeset(", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
-	normalized = replaceAllOutsideStrings(normalized, "make_set (", "makeset(")
+	normalized = replaceAllOutsideStrings(normalized, "make_set (", "makeset(", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
-	normalized = replaceAllOutsideStrings(normalized, "make_list(", "makelist(")
+	normalized = replaceAllOutsideStrings(normalized, "make_list(", "makelist(", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
-	normalized = replaceAllOutsideStrings(normalized, "make_list (", "makelist(")
+	normalized = replaceAllOutsideStrings(normalized, "make_list (", "makelist(", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Normalize string operator aliases commonly found in Sentinel content.
-	normalized = normalizeStringOperatorAliases(normalized)
+	normalized = normalizeStringOperatorAliases(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Handle summarize without aggregation (summarize by x -> summarize count() by x)
 	// The grammar requires aggregation before BY, but KQL allows just "summarize by"
-	normalized = normalizeSummarizeBy(normalized)
+	normalized = normalizeSummarizeBy(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Convert SQL-style <> to KQL != (handle all spacing variations)
-	normalized = normalizeNotEqualOperator(normalized)
+	normalized = normalizeNotEqualOperator(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Normalize timespan literals without space: 0min -> 0 min, 30min -> 30 min
 	// The lexer expects space or recognizes combined form only for certain patterns
 	if metadata != nil {
-		normalized = normalizeTimespanLiteralsTracked(normalized, metadata.typed, budget)
+		normalized = normalizeTimespanLiteralsTracked(normalized, metadata.typed, budget, kqlRecorder(metadata, budget))
 	} else {
 		normalized = normalizeTimespanLiterals(normalized)
 	}
 	budget.input(normalized)
 	budget.step()
 	if metadata != nil {
-		normalized = markedRegexLiterals(normalized, datetimeWithSpaceRe, "datetime(${1}T${2})", metadata.typed, budget)
+		normalized = markedRegexLiterals(normalized, datetimeWithSpaceRe, "datetime(${1}T${2})", metadata.typed, budget, kqlRecorder(metadata, budget))
 	} else {
 		normalized = normalizeDatetimeLiterals(normalized)
 	}
 	budget.input(normalized)
 	budget.step()
 	if metadata != nil {
-		normalized = joinAdjacentStringLiteralsTracked(normalized, metadata.typed, budget)
+		normalized = joinAdjacentStringLiteralsTracked(normalized, metadata.typed, budget, kqlRecorder(metadata, budget))
 	} else {
 		normalized = joinAdjacentStringLiterals(normalized)
 	}
 	budget.input(normalized)
 	budget.step()
-	normalized = normalizeMakeGraphEdges(normalized)
+	normalized = normalizeMakeGraphEdges(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
-	normalized = stripGraphMatchStages(normalized)
+	normalized = stripGraphMatchStages(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Normalize trailing decimals: 1000. -> 1000.0
 	// The grammar requires at least one digit after the decimal point
 	if metadata != nil {
-		normalized = normalizeTrailingDecimalsTracked(normalized, metadata.typed, budget)
+		normalized = normalizeTrailingDecimalsTracked(normalized, metadata.typed, budget, kqlRecorder(metadata, budget))
 	} else {
 		normalized = normalizeTrailingDecimals(normalized)
 	}
@@ -407,97 +540,97 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 	// Normalize \0 escape sequences to \x00 (null character)
 	// The grammar only supports \x hex escapes, not bare \0
 	if metadata != nil {
-		normalized = markNullEscapeStrings(normalized, metadata.typed, budget)
+		normalized = markNullEscapeStrings(normalized, metadata.typed, budget, kqlRecorder(metadata, budget))
 	}
-	normalized = normalizeNullEscapes(normalized)
+	normalized = normalizeNullEscapes(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Convert operator aliases to standard forms
-	normalized = replaceAllOutsideStrings(normalized, "| mvexpand ", "| mv-expand ")
+	normalized = replaceAllOutsideStrings(normalized, "| mvexpand ", "| mv-expand ", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
-	normalized = replaceAllOutsideStrings(normalized, "\nmvexpand ", "\nmv-expand ")
+	normalized = replaceAllOutsideStrings(normalized, "\nmvexpand ", "\nmv-expand ", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
-	normalized = replaceAllOutsideStrings(normalized, "| mvapply ", "| mv-apply ")
+	normalized = replaceAllOutsideStrings(normalized, "| mvapply ", "| mv-apply ", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Convert "filter" to "where" (filter is a legacy alias)
-	normalized = replaceAllOutsideStrings(normalized, "| filter ", "| where ")
+	normalized = replaceAllOutsideStrings(normalized, "| filter ", "| where ", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
-	normalized = replaceAllOutsideStrings(normalized, "\nfilter ", "\nwhere ")
+	normalized = replaceAllOutsideStrings(normalized, "\nfilter ", "\nwhere ", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Strip kind= from lookup operator (grammar doesn't support it)
-	normalized = replaceAllOutsideStrings(normalized, "lookup kind=leftouter ", "lookup ")
+	normalized = replaceAllOutsideStrings(normalized, "lookup kind=leftouter ", "lookup ", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
-	normalized = replaceAllOutsideStrings(normalized, "lookup kind=inner ", "lookup ")
+	normalized = replaceAllOutsideStrings(normalized, "lookup kind=inner ", "lookup ", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
-	normalized = replaceAllOutsideStrings(normalized, "lookup kind=rightouter ", "lookup ")
+	normalized = replaceAllOutsideStrings(normalized, "lookup kind=rightouter ", "lookup ", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
-	normalized = replaceAllOutsideStrings(normalized, "lookup kind=fullouter ", "lookup ")
+	normalized = replaceAllOutsideStrings(normalized, "lookup kind=fullouter ", "lookup ", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Normalize lookup subqueries: lookup (union ...) -> lookup (LookupTable)
 	// The grammar doesn't support complex expressions inside lookup
-	normalized = normalizeLookupSubquery(normalized)
+	normalized = normalizeLookupSubquery(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Normalize make-series: convert "in range(...)" to "from ... to ... step ..."
 	// and add default step if missing
-	normalized = normalizeMakeSeries(normalized)
+	normalized = normalizeMakeSeries(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Normalize join kind aliases (grammar supports leftanti/rightsemi but not combined forms)
-	normalized = replaceAllOutsideStrings(normalized, "kind=leftantisemi", "kind=leftanti")
+	normalized = replaceAllOutsideStrings(normalized, "kind=leftantisemi", "kind=leftanti", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
-	normalized = replaceAllOutsideStrings(normalized, "kind=rightantisemi", "kind=rightanti")
+	normalized = replaceAllOutsideStrings(normalized, "kind=rightantisemi", "kind=rightanti", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
-	normalized = replaceAllOutsideStrings(normalized, "kind=leftsemijoin", "kind=leftsemi")
+	normalized = replaceAllOutsideStrings(normalized, "kind=leftsemijoin", "kind=leftsemi", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
-	normalized = replaceAllOutsideStrings(normalized, "kind=rightsemijoin", "kind=rightsemi")
+	normalized = replaceAllOutsideStrings(normalized, "kind=rightsemijoin", "kind=rightsemi", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Normalize join condition 'and' to comma (grammar expects comma-separated conditions)
 	// on $left.A == $right.B and $left.C == $right.D -> on $left.A == $right.B, $left.C == $right.D
-	normalized = replaceRegexOutsideProtected(normalized, joinConditionAndRe, ", $$$1.", budget)
+	normalized = replaceRegexOutsideProtected(normalized, joinConditionAndRe, ", $$$1.", budget, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Strip all hint.xxx=value patterns (hint.strategy=broadcast, hint.shufflekey=x, etc.)
 	// The grammar doesn't support these join hints
-	normalized = stripJoinHints(normalized)
+	normalized = stripJoinHints(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Strip mv-apply subqueries: mv-apply x on (subquery) -> mv-apply x
 	// The subquery isn't needed for condition extraction
-	normalized = stripMvApplySubquery(normalized)
+	normalized = stripMvApplySubquery(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Strip parse statements: parse field with pattern -> (removed)
 	// The parse operator extracts substrings but isn't needed for condition extraction
-	normalized = stripParseStatements(normalized)
+	normalized = stripParseStatements(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Strip return type annotations from evaluate: evaluate func(x) : (col:type) -> evaluate func(x)
-	normalized = stripReturnTypeAnnotations(normalized)
+	normalized = stripReturnTypeAnnotations(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
@@ -506,15 +639,15 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 	if metadata != nil {
 		normalized = markReferenceSources(normalized, typedBracketReference, func(source string) string {
 			return convertBracketAccess(replaceAllOutsideStrings(source, ".[", "["))
-		}, metadata.typed, budget)
+		}, metadata.typed, budget, kqlRecorder(metadata, budget))
 	}
-	normalized = replaceAllOutsideStrings(normalized, ".[", "[")
+	normalized = replaceAllOutsideStrings(normalized, ".[", "[", kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Convert bracket property access to dot notation
 	// obj['key'] -> obj._key_ (the lexer's QUOTED_IDENTIFIER conflicts with bracket access)
-	normalized = convertBracketAccess(normalized)
+	normalized = convertBracketAccess(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
@@ -527,48 +660,58 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 		// adjacent literals. Select provenance markers only after that step.
 		membership := metadata.membership
 		typed := metadata.typed
+		mapped := metadata.mapped
 		*metadata = *newKQLNormalizationMetadata(normalized+"\n"+query, budget)
 		metadata.membership = membership
 		metadata.typed = typed
+		metadata.mapped = mapped
 		placeholder = metadata.subqueryMarker
 	}
-	normalized = normalizeInSubqueriesWithPlaceholder(normalized, placeholder, budget)
+	normalized = normalizeInSubqueriesWithPlaceholderTracked(normalized, placeholder, budget, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Fix identifiers that start with numbers by prepending underscore
 	// e.g., 3plogTime -> _3plogTime
 	if metadata != nil {
-		normalized = markReferenceSources(normalized, typedNumericReference, fixNumericIdentifiers, metadata.typed, budget)
+		normalized = markReferenceSources(normalized, typedNumericReference, func(source string) string { return fixNumericIdentifiers(source) }, metadata.typed, budget, kqlRecorder(metadata, budget))
 	}
-	normalized = fixNumericIdentifiers(normalized)
+	normalized = fixNumericIdentifiers(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Convert tuple unpacking to single assignment
 	// (a, b, c) = func() -> _tuple_result = func()
-	normalized = convertTupleUnpacking(normalized)
+	normalized = convertTupleUnpacking(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Extract main query from let statements (parse only the final query for conditions)
 	// This MUST happen before union normalization so (union ...) after lets is handled
 	if strict {
-		normalized = normalized[skipLetStatements(normalized):]
+		start := skipLetStatements(normalized)
+		if metadata != nil && metadata.mapped != nil && metadata.mapped.Text == normalized {
+			*metadata.mapped = *applyKQLSourceEdits(metadata.mapped, []kqlSourceEdit{{Start: 0, End: start}}, budget)
+		}
+		normalized = normalized[start:]
 		budget.input(normalized)
 		budget.step()
 	} else {
-		normalized = extractMainQuery(normalized)
+		selected := mainQuerySpan(normalized)
+		if metadata != nil && metadata.mapped != nil && metadata.mapped.Text == normalized {
+			*metadata.mapped = *applyKQLSourceEdits(metadata.mapped, []kqlSourceEdit{{Start: 0, End: selected.Start}, {Start: selected.End, End: len(normalized)}}, budget)
+		}
+		normalized = normalized[selected.Start:selected.End]
 		budget.input(normalized)
 		budget.step()
-		normalized = rescueOperatorFirstQuery(normalized)
+		normalized = rescueOperatorFirstQuery(normalized, kqlRecorder(metadata, budget))
 		budget.input(normalized)
 		budget.step()
 	}
 
 	// Strip function parameters in union statements (grammar doesn't support them)
 	// union Func('a'), Func2('b') -> union Func, Func2
-	normalized = stripUnionFunctionParams(normalized)
+	normalized = stripUnionFunctionParams(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
@@ -576,29 +719,31 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 	// union withsource=... -> union
 	// union isfuzzy=true -> union
 	// Also handles (union ...) wrapped queries
-	normalized = normalizeUnionParameters(normalized)
+	normalized = normalizeUnionParameters(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Handle queries that start with union (grammar requires union to follow a table reference)
 	if hasKeywordPrefix(strings.TrimLeft(strings.ToLower(normalized), " \t\r\n"), "union") {
-		normalized = "DummyTable | " + normalized
+		recorder := kqlRecorder(metadata, budget)
+		recordKQLInsertion(recorder, 0, "DummyTable | ", "normalizeUnionParameters")
+		normalized = finishKQLRecorded(normalized, "DummyTable | "+normalized, recorder)
 		budget.input(normalized)
 		budget.step()
 	}
 
 	// Handle union inside join parentheses: join (union ...) -> join (DummyTable | union ...)
 	// The grammar requires a tabularSource before union, even inside join
-	normalized = normalizeJoinUnion(normalized)
+	normalized = normalizeJoinUnion(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
-	normalized = normalizeBracketedUnion(normalized)
+	normalized = normalizeBracketedUnion(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Handle find operator: find in (Table1, Table2, ...) where ... -> extract conditions from where clause
 	// The find operator isn't in the grammar, so convert to table + where
-	normalized = normalizeFindOperator(normalized)
+	normalized = normalizeFindOperator(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
@@ -610,46 +755,46 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 
 	// Normalize top-nested operator: top-nested N of X by count() -> summarize count() by X
 	// The grammar doesn't support the "of" keyword in top-nested
-	normalized = normalizeTopNested(normalized)
+	normalized = normalizeTopNested(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Normalize partition bodies that start with an operator rather than a table
 	// source, e.g. `partition by aid (top 1 by TimeGenerated desc)`.
-	normalized = normalizePartitionOperator(normalized)
+	normalized = normalizePartitionOperator(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Strip named parameters from function calls: func(param=value) -> func()
 	// These are common in user-defined function calls like parser(pack=true)
-	normalized = stripNamedFunctionParams(normalized)
+	normalized = stripNamedFunctionParams(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Normalize distinct clauses: distinct a, tostring(b) -> distinct a, b
 	// The grammar doesn't support function calls in distinct column lists
-	normalized = normalizeDistinctColumns(normalized)
+	normalized = normalizeDistinctColumns(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Strip render operator parameters: render areachart kind=stacked -> render areachart
 	// The grammar doesn't support all render parameter forms
-	normalized = stripRenderParameters(normalized)
+	normalized = stripRenderParameters(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
 	// Strip trailing semicolons and comments (common in saved queries and function definitions)
 	// Must handle cases like "| where x == 1; // comment" -> "| where x == 1"
-	normalized = stripTrailingSemicolonsAndComments(normalized)
+	normalized = stripTrailingSemicolonsAndComments(normalized, kqlRecorder(metadata, budget))
 	budget.input(normalized)
 	budget.step()
 
-	normalized = searches.restore(normalized, budget)
+	normalized = searches.restore(normalized, budget, kqlRecorder(metadata, budget))
 	if metadata != nil {
-		normalized = metadata.restoreSubqueryMarkers(normalized, budget)
+		normalized = metadata.restoreSubqueryMarkersWithSource(normalized, budget, kqlRecorder(metadata, budget))
 		if metadata.typed != nil {
-			normalized = metadata.typed.restoreShields(normalized, budget)
-			normalized = metadata.typed.restore(normalized, budget)
+			normalized = metadata.typed.restoreShields(normalized, budget, kqlRecorder(metadata, budget))
+			normalized = metadata.typed.restore(normalized, budget, kqlRecorder(metadata, budget))
 		}
 		metadata.searchCount = searches.restored
 	}
@@ -659,15 +804,31 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 // rescueOperatorFirstQuery gives a query that starts with a pipe (workbook
 // queries) or an operator (Azure Resource Graph queries start with "where",
 // workbook queries with "extend") a placeholder table to filter.
-func rescueOperatorFirstQuery(query string) string {
-	query = strings.TrimLeft(query, " \t")
+func rescueOperatorFirstQuery(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
+	trimmed := strings.TrimLeft(query, " \t")
+	if recorder != nil && len(trimmed) != len(query) {
+		recorder.Replace(0, len(query)-len(trimmed), "", "rescueOperatorFirstQuery")
+		finishKQLRecorded(query, trimmed, recorder)
+		recorder.Edits = nil
+	}
+	query = trimmed
 	if strings.HasPrefix(query, "|") {
-		return "DummyTable " + query
+		if recorder != nil {
+			recordKQLInsertion(recorder, 0, "DummyTable ", "")
+		}
+		return finishKQLRecorded(query, "DummyTable "+query, recorder)
 	}
 	lower := strings.ToLower(query)
 	for _, operator := range []string{"where", "extend", "project", "summarize"} {
 		if strings.HasPrefix(lower, operator) && len(lower) > len(operator) && strings.ContainsRune(" \t\n", rune(lower[len(operator)])) {
-			return "DummyTable | " + query
+			if recorder != nil {
+				recordKQLInsertion(recorder, 0, "DummyTable | ", "")
+			}
+			return finishKQLRecorded(query, "DummyTable | "+query, recorder)
 		}
 	}
 	return query
@@ -709,13 +870,11 @@ func skipLetStatements(query string) int {
 	return i
 }
 
-// extractMainQuery extracts the main query from a let statement sequence
-// For "let x = ...; let y = ...; Table | where ...", returns "Table | where ..."
-func extractMainQuery(query string) string {
+func mainQuerySpan(query string) kqlByteSpan {
 	n := len(query)
 	i := skipLetStatements(query)
 	if i >= n {
-		return query // No main query found
+		return kqlByteSpan{0, n} // No main query found
 	}
 
 	// Find where this main query ends (before any subsequent query)
@@ -795,7 +954,7 @@ func extractMainQuery(query string) string {
 		}
 	}
 
-	return query[mainQueryStart:mainQueryEnd]
+	return kqlByteSpan{mainQueryStart, mainQueryEnd}
 }
 
 // skipLineTrackingDepth advances from i to the end of the line, or past a
@@ -915,8 +1074,12 @@ func skipLetStatement(query string, i int) int {
 // Handles: obj['key'] -> obj.key, obj["key"] -> obj.key, array[0] -> array._0
 // Also handles: ['Column Name'] = expr -> _Column_Name_ = expr (column aliases with special chars)
 // This works around the lexer's QUOTED_IDENTIFIER rule that captures [...]
-func convertBracketAccess(query string) string {
+func convertBracketAccess(query string, recorders ...*kqlSourceRecorder) string {
 	var result strings.Builder
+	var recorder *kqlSourceRecorder
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder = recorders[0]
+	}
 	i := 0
 	inString := false
 	stringChar := byte(0)
@@ -994,10 +1157,14 @@ func convertBracketAccess(query string) string {
 					// Check if key is a valid identifier (alphanumeric + underscore
 					// only) the grammar does not read as a keyword
 					if isValidPropertyKey(key) && !grammarReservedWords[strings.ToLower(key)] {
+						before := result.Len()
 						if precededByIdent {
 							result.WriteByte('.')
 						}
 						result.WriteString(key)
+						if recorder != nil {
+							recorder.Replace(i, end+2, result.String()[before:], "")
+						}
 						i = end + 2
 						continue
 					}
@@ -1014,16 +1181,23 @@ func convertBracketAccess(query string) string {
 						// Convert to valid identifier by replacing non-alphanumeric chars
 						sanitized := sanitizeIdentifier(key)
 						result.WriteString(sanitized)
+						if recorder != nil {
+							recorder.Replace(i, end+2, sanitized, "")
+						}
 						i = end + 2
 						continue
 					}
 					// Property access with special characters in key (like obj['$kind'])
 					// Sanitize the key name
 					sanitized := sanitizeIdentifier(key)
+					before := result.Len()
 					if precededByIdent {
 						result.WriteByte('.')
 					}
 					result.WriteString(sanitized)
+					if recorder != nil {
+						recorder.Replace(i, end+2, result.String()[before:], "")
+					}
 					i = end + 2
 					continue
 				}
@@ -1043,6 +1217,7 @@ func convertBracketAccess(query string) string {
 				// Check if it ends with ]
 				if end < len(query) && query[end] == ']' {
 					// Convert [0] to ._idx0 or _idx0 depending on context
+					before := result.Len()
 					if precededByIdent {
 						result.WriteByte('.')
 					}
@@ -1052,6 +1227,9 @@ func convertBracketAccess(query string) string {
 						result.WriteString(query[i+2 : end])
 					} else {
 						result.WriteString(query[i+1 : end])
+					}
+					if recorder != nil {
+						recorder.Replace(i, end+1, result.String()[before:], "")
 					}
 					i = end + 1
 					continue
@@ -1085,10 +1263,14 @@ func convertBracketAccess(query string) string {
 			}
 			if depth == 0 && end > i+2 {
 				// Replace entire [...] with ._dyn or _dyn depending on context
+				before := result.Len()
 				if precededByIdent {
 					result.WriteByte('.')
 				}
 				result.WriteString("_dyn")
+				if recorder != nil {
+					recorder.Replace(i, end, result.String()[before:], "")
+				}
 				i = end
 				continue
 			}
@@ -1097,14 +1279,25 @@ func convertBracketAccess(query string) string {
 		i++
 	}
 
-	return result.String()
+	text := result.String()
+	if recorder != nil && len(recorder.Edits) > 0 {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, recorder.Edits, recorder.Budget)
+		if recorder.Source.Text != text {
+			sourceAbort("bracket access edit mismatch")
+		}
+	}
+	return text
 }
 
 // fixNumericIdentifiers fixes identifiers that start with a digit by prepending underscore
 // This handles cases like: 3plogTime -> _3plogTime, 3p_observed_Time -> _3p_observed_Time
 // KQL grammar requires identifiers to start with letter or underscore
-func fixNumericIdentifiers(query string) string {
+func fixNumericIdentifiers(query string, recorders ...*kqlSourceRecorder) string {
 	var result strings.Builder
+	var recorder *kqlSourceRecorder
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder = recorders[0]
+	}
 	i := 0
 	inString := false
 	stringChar := byte(0)
@@ -1201,6 +1394,9 @@ func fixNumericIdentifiers(query string) string {
 
 					if !isTimeLiteral {
 						// This is an identifier starting with digits, prepend underscore
+						if recorder != nil {
+							recorder.Replace(i, i, "_", "")
+						}
 						result.WriteByte('_')
 					}
 				}
@@ -1211,14 +1407,25 @@ func fixNumericIdentifiers(query string) string {
 		i++
 	}
 
-	return result.String()
+	text := result.String()
+	if recorder != nil && len(recorder.Edits) > 0 {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, recorder.Edits, recorder.Budget)
+		if recorder.Source.Text != text {
+			sourceAbort("numeric identifier edit mismatch")
+		}
+	}
+	return text
 }
 
 // convertTupleUnpacking converts tuple unpacking syntax to simple assignment
 // (a, b, c) = func() -> _tuple_result = func()
 // This handles patterns like: extend (Anomalies, Score, Baseline) = series_decompose_anomalies(...)
-func convertTupleUnpacking(query string) string {
+func convertTupleUnpacking(query string, recorders ...*kqlSourceRecorder) string {
 	var result strings.Builder
+	var recorder *kqlSourceRecorder
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder = recorders[0]
+	}
 	i := 0
 
 	for i < len(query) {
@@ -1249,6 +1456,9 @@ func convertTupleUnpacking(query string) string {
 					}
 					if eqIdx < len(query) && query[eqIdx] == '=' && (eqIdx+1 >= len(query) || query[eqIdx+1] != '=') {
 						// This is tuple unpacking, replace with simple assignment
+						if recorder != nil {
+							recorder.Replace(i, end, "_tuple_result", "convertTupleUnpacking")
+						}
 						result.WriteString("_tuple_result")
 						i = end
 						continue
@@ -1260,7 +1470,14 @@ func convertTupleUnpacking(query string) string {
 		i++
 	}
 
-	return result.String()
+	text := result.String()
+	if recorder != nil && len(recorder.Edits) > 0 {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, recorder.Edits, recorder.Budget)
+		if recorder.Source.Text != text {
+			sourceAbort("tuple unpack edit mismatch")
+		}
+	}
+	return text
 }
 
 // looksLikeTupleUnpacking checks if content looks like "identifier, identifier, ..."
@@ -1335,8 +1552,12 @@ func sanitizeIdentifier(s string) string {
 }
 
 // normalizeEscapeSequences converts literal \r\n to actual newlines and \uXXXX to Unicode chars, but only outside strings
-func normalizeEscapeSequences(query string) string {
+func normalizeEscapeSequences(query string, recorders ...*kqlSourceRecorder) string {
 	var result strings.Builder
+	var recorder *kqlSourceRecorder
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder = recorders[0]
+	}
 	inString := false
 	stringChar := byte(0)
 	i := 0
@@ -1376,14 +1597,23 @@ func normalizeEscapeSequences(query string) string {
 			switch next {
 			case 'n':
 				result.WriteByte('\n')
+				if recorder != nil {
+					recorder.replace(i, i+2, "\n", "")
+				}
 				i += 2
 				continue
 			case 'r':
 				result.WriteByte('\r')
+				if recorder != nil {
+					recorder.replace(i, i+2, "\r", "")
+				}
 				i += 2
 				continue
 			case 't':
 				result.WriteByte('\t')
+				if recorder != nil {
+					recorder.replace(i, i+2, "\t", "")
+				}
 				i += 2
 				continue
 			case 'u':
@@ -1391,8 +1621,13 @@ func normalizeEscapeSequences(query string) string {
 				if i+5 < len(query) {
 					hex := query[i+2 : i+6]
 					if isValidHex(hex) {
+						start := i
 						i += 6
+						before := result.Len()
 						handleUnicodeEscape(hex, &result)
+						if recorder != nil {
+							recorder.replace(start, i, result.String()[before:], "")
+						}
 						continue
 					}
 				}
@@ -1401,8 +1636,13 @@ func normalizeEscapeSequences(query string) string {
 				if i+6 < len(query) && query[i+2] == 'u' {
 					hex := query[i+3 : i+7]
 					if isValidHex(hex) {
+						start := i
 						i += 7
+						before := result.Len()
 						handleUnicodeEscape(hex, &result)
+						if recorder != nil {
+							recorder.replace(start, i, result.String()[before:], "")
+						}
 						continue
 					}
 				}
@@ -1413,18 +1653,29 @@ func normalizeEscapeSequences(query string) string {
 		i++
 	}
 
-	return result.String()
+	text := result.String()
+	if recorder != nil && len(recorder.Edits) > 0 {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, recorder.Edits, recorder.Budget)
+		if recorder.Source.Text != text {
+			sourceAbort("escaped sequence edit mismatch")
+		}
+	}
+	return text
 }
 
 // normalizeUnicodeWhitespace converts non-ASCII whitespace outside string
 // literals to regular spaces so the lexer does not emit ERROR_CHAR tokens.
-func normalizeUnicodeWhitespace(query string) string {
+func normalizeUnicodeWhitespace(query string, recorders ...*kqlSourceRecorder) string {
 	var result strings.Builder
 	result.Grow(len(query))
 
 	inString := false
 	stringChar := byte(0)
 	isVerbatim := false
+	var recorder *kqlSourceRecorder
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder = recorders[0]
+	}
 
 	for i := 0; i < len(query); {
 		c := query[i]
@@ -1506,15 +1757,28 @@ func normalizeUnicodeWhitespace(query string) string {
 		switch {
 		case r == 0x200b || r == 0x200c || r == 0x200d || r == 0x2060 || r == 0xfeff:
 			// Drop zero-width formatting characters outside string literals.
+			if recorder != nil {
+				recorder.replace(i, i+size, "", "")
+			}
 		case unicode.IsSpace(r):
 			result.WriteByte(' ')
+			if recorder != nil {
+				recorder.replace(i, i+size, " ", "")
+			}
 		default:
 			result.WriteRune(r)
 		}
 		i += size
 	}
 
-	return result.String()
+	text := result.String()
+	if recorder != nil && len(recorder.Edits) > 0 {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, recorder.Edits, recorder.Budget)
+		if recorder.Source.Text != text {
+			sourceAbort("Unicode whitespace edit mismatch")
+		}
+	}
+	return text
 }
 
 // isValidHex checks if a 4-character string is valid hexadecimal
@@ -1562,13 +1826,14 @@ func handleUnicodeEscape(hex string, result *strings.Builder) {
 
 // normalizeSummarizeBy adds a dummy aggregation when summarize has only BY clause
 // KQL allows "summarize by x" but grammar requires aggregation before BY
-func normalizeSummarizeBy(query string) string {
+func normalizeSummarizeBy(query string, recorders ...*kqlSourceRecorder) string {
 	lowerQuery := strings.ToLower(query)
 	var b strings.Builder
 	b.Grow(len(query) + 32)
 	lastCopied := 0
 	changed := false
 	searchFrom := 0
+	var insertions []int
 
 	for {
 		idx := indexKeyword(lowerQuery, "summarize", searchFrom)
@@ -1585,6 +1850,7 @@ func normalizeSummarizeBy(query string) string {
 		if hasKeywordPrefix(lowerQuery[byStart:], "by") {
 			b.WriteString(query[lastCopied:byStart])
 			b.WriteString("count() ")
+			insertions = append(insertions, byStart)
 			lastCopied = byStart
 			changed = true
 		}
@@ -1596,18 +1862,34 @@ func normalizeSummarizeBy(query string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder := recorders[0]
+		edits := make([]kqlSourceEdit, 0, len(insertions))
+		for _, at := range insertions {
+			owner := kqlOccurrenceAt(recorder.Source, at, recorder.Budget)
+			edits = append(edits, kqlSourceEdit{Start: at, End: at, Parts: []kqlSourcePart{{Text: "count() ", OccurrenceID: owner}}, Rewrite: "normalizeSummarizeBy"})
+		}
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, edits, recorder.Budget)
+		if recorder.Source.Text != b.String() {
+			sourceAbort("summarize-by edit output mismatch")
+		}
+	}
 	return b.String()
 }
 
 // stripReturnTypeAnnotations removes return type annotations from evaluate statements
 // evaluate func(x) : (col:type, ...) -> evaluate func(x)
-func stripReturnTypeAnnotations(query string) string {
+func stripReturnTypeAnnotations(query string, recorders ...*kqlSourceRecorder) string {
 	lowerQuery := strings.ToLower(query)
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
 	changed := false
 	searchFrom := 0
+	var recorder *kqlSourceRecorder
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder = recorders[0]
+	}
 
 	for {
 		// Find "evaluate"
@@ -1714,6 +1996,9 @@ func stripReturnTypeAnnotations(query string) string {
 		// Remove from colon to closing paren: "evaluate func(...) : (...)" -> "evaluate func(...)"
 		// Copy everything up to parenEnd (keep the function call), skip parenEnd..typeEnd (the type annotation)
 		b.WriteString(query[lastCopied:parenEnd])
+		if recorder != nil {
+			recorder.Replace(parenEnd, typeEnd, "", "stripReturnTypeAnnotations")
+		}
 		lastCopied = typeEnd
 		searchFrom = typeEnd
 		changed = true
@@ -1723,19 +2008,30 @@ func stripReturnTypeAnnotations(query string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	result := b.String()
+	if recorder != nil {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, recorder.Edits, recorder.Budget)
+		if recorder.Source.Text != result {
+			sourceAbort("return type deletion edit mismatch")
+		}
+	}
+	return result
 }
 
 // normalizeLookupSubquery simplifies complex expressions inside lookup subqueries
 // lookup (union T1, T2) -> lookup (LookupTable)
 // The grammar only supports simple table references inside lookup
-func normalizeLookupSubquery(query string) string {
+func normalizeLookupSubquery(query string, recorders ...*kqlSourceRecorder) string {
 	lowerQuery := strings.ToLower(query)
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
 	changed := false
 	searchFrom := 0
+	var recorder *kqlSourceRecorder
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder = recorders[0]
+	}
 
 	for {
 		idx := indexKeyword(lowerQuery, "lookup", searchFrom)
@@ -1795,6 +2091,9 @@ func normalizeLookupSubquery(query string) string {
 			// Keep the parens: copy up to parenStart+1, write "LookupTable", skip to parenEnd-1
 			b.WriteString(query[lastCopied : parenStart+1])
 			b.WriteString("LookupTable")
+			if recorder != nil {
+				recorder.Replace(parenStart+1, parenEnd-1, "LookupTable", "normalizeLookupSubquery")
+			}
 			lastCopied = parenEnd - 1
 			searchFrom = parenEnd
 			changed = true
@@ -1808,19 +2107,30 @@ func normalizeLookupSubquery(query string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	result := b.String()
+	if recorder != nil {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, recorder.Edits, recorder.Budget)
+		if recorder.Source.Text != result {
+			sourceAbort("lookup subquery edit mismatch")
+		}
+	}
+	return result
 }
 
 // stripMvApplySubquery removes entire mv-apply statements that have on (subquery)
 // | mv-apply x = col on (subquery) -> (removed entirely)
 // The mv-apply with subquery isn't needed for condition extraction
-func stripMvApplySubquery(query string) string {
+func stripMvApplySubquery(query string, recorders ...*kqlSourceRecorder) string {
 	lowerQuery := strings.ToLower(query)
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
 	changed := false
 	searchFrom := 0
+	var recorder *kqlSourceRecorder
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder = recorders[0]
+	}
 
 	for {
 		// Find "| mv-apply" (the full operator with pipe)
@@ -1896,6 +2206,9 @@ func stripMvApplySubquery(query string) string {
 		}
 
 		// Remove entire mv-apply statement from "| mv-apply" to closing paren
+		if recorder != nil {
+			recorder.Replace(idx, parenEnd, "", "stripMvApplySubquery")
+		}
 		b.WriteString(query[lastCopied:idx])
 		lastCopied = parenEnd
 		searchFrom = parenEnd
@@ -1906,19 +2219,27 @@ func stripMvApplySubquery(query string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	result := b.String()
+	if recorder != nil {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, recorder.Edits, recorder.Budget)
+		if recorder.Source.Text != result {
+			sourceAbort("mv-apply deletion edit mismatch")
+		}
+	}
+	return result
 }
 
 // stripParseStatements removes parse operator statements
 // parse field with 'pattern' var1 'pattern2' var2 -> (entire statement removed)
 // The parse operator extracts substrings but isn't needed for condition extraction
-func stripParseStatements(query string) string {
+func stripParseStatements(query string, recorders ...*kqlSourceRecorder) string {
 	lowerQuery := strings.ToLower(query)
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
 	changed := false
 	searchFrom := 0
+	var sourceEdits []kqlSourceEdit
 
 	for {
 		// Find "| parse" or "\nparse" (parse operator at start of pipe stage)
@@ -2051,6 +2372,9 @@ func stripParseStatements(query string) string {
 		}
 
 		// Remove the parse statement (keep the delimiter for the next statement if any)
+		if len(recorders) > 0 && recorders[0] != nil {
+			sourceEdits = append(sourceEdits, kqlSourceEdit{Start: idx, End: pipeOrEnd, Rewrite: "stripParseStatements"})
+		}
 		b.WriteString(query[lastCopied:idx])
 		if pipeOrEnd < len(query) {
 			delim := query[pipeOrEnd]
@@ -2071,34 +2395,56 @@ func stripParseStatements(query string) string {
 	if !changed {
 		return query
 	}
+	if len(sourceEdits) > 0 {
+		recorder := recorders[0]
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, sourceEdits, recorder.Budget)
+	}
 	b.WriteString(query[lastCopied:])
 	return b.String()
 }
 
 // normalizeNotEqualOperator converts SQL-style <> to KQL !=
 // Handles all spacing variations: x<>y, x<> y, x <> y, x<>"foo"
-func normalizeNotEqualOperator(query string) string {
+func normalizeNotEqualOperator(query string, recorders ...*kqlSourceRecorder) string {
 	var result strings.Builder
 	result.Grow(len(query))
+	var recorder *kqlSourceRecorder
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder = recorders[0]
+	}
 
 	i := 0
 	for i < len(query) {
 		// Check for <> pattern
 		if i+1 < len(query) && query[i] == '<' && query[i+1] == '>' {
 			result.WriteString("!=")
+			if recorder != nil {
+				recorder.replace(i, i+2, "!=", "")
+			}
 			i += 2
 			continue
 		}
 		result.WriteByte(query[i])
 		i++
 	}
-	return result.String()
+	text := result.String()
+	if recorder != nil && len(recorder.Edits) > 0 {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, recorder.Edits, recorder.Budget)
+		if recorder.Source.Text != text {
+			sourceAbort("not-equal edit mismatch")
+		}
+	}
+	return text
 }
 
 // normalizeDistinctColumns strips function wrappers from distinct column lists
 // distinct a, tostring(b), c -> distinct a, b, c
 // The grammar only supports simple column names in distinct, not expressions
-func normalizeDistinctColumns(query string) string {
+func normalizeDistinctColumns(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	// Find each distinct clause
 	lowerQuery := strings.ToLower(query)
 	var b strings.Builder
@@ -2127,6 +2473,9 @@ func normalizeDistinctColumns(query string) string {
 		// Process the column list
 		columnPart := query[distinctStart:endPos]
 		normalizedCols := normalizeDistinctColumnList(columnPart)
+		if recorder != nil && normalizedCols != columnPart {
+			recorder.Replace(distinctStart, endPos, normalizedCols, "normalizeDistinctColumns")
+		}
 
 		// Write everything up to distinctStart, then the normalized columns
 		b.WriteString(query[lastCopied:distinctStart])
@@ -2142,7 +2491,7 @@ func normalizeDistinctColumns(query string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	return finishKQLRecorded(query, b.String(), recorder)
 }
 
 // normalizeDistinctColumnList processes the column list portion of a distinct clause
@@ -2342,7 +2691,7 @@ func normalizeDistinctColumnList(columns string) string {
 
 // stripTrailingSemicolonsAndComments removes trailing semicolons and line comments
 // Handles patterns like "| where x == 1; // comment" -> "| where x == 1"
-func stripTrailingSemicolonsAndComments(query string) string {
+func stripTrailingSemicolonsAndComments(query string, recorders ...*kqlSourceRecorder) string {
 	result := query
 
 	for {
@@ -2406,13 +2755,24 @@ func stripTrailingSemicolonsAndComments(query string) string {
 		break
 	}
 
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query && len(result) < len(query) {
+		recorder := recorders[0]
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, []kqlSourceEdit{{Start: len(result), End: len(query)}}, recorder.Budget)
+		if recorder.Source.Text != result {
+			sourceAbort("trailing suffix edit mismatch")
+		}
+	}
 	return result
 }
 
 // stripRenderParameters removes parameters from render operator
 // render areachart kind=stacked -> render areachart
 // The grammar doesn't support all render parameter forms (like kind=value without parens)
-func stripRenderParameters(query string) string {
+func stripRenderParameters(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	// Find render operator
 	lowerQuery := strings.ToLower(query)
 	idx := strings.Index(lowerQuery, "| render ")
@@ -2461,7 +2821,10 @@ func stripRenderParameters(query string) string {
 		for end < len(query) && query[end] != '\n' && query[end] != '|' {
 			end++
 		}
-		return query[:chartTypeStart] + query[chartTypeStart:renderStart-1] + query[end:]
+		if recorder != nil {
+			recorder.Replace(renderStart-1, end, "", "stripRenderParameters")
+		}
+		return finishKQLRecorded(query, query[:chartTypeStart]+query[chartTypeStart:renderStart-1]+query[end:], recorder)
 	}
 
 	return query
@@ -2620,13 +2983,17 @@ func isTrailingDecimalBoundary(query string, idx int) bool {
 
 // normalizeNullEscapes converts \0 to \x00 in regular strings
 // The KQL grammar only supports \x hex escapes, not bare \0
-func normalizeNullEscapes(query string) string {
+func normalizeNullEscapes(query string, recorders ...*kqlSourceRecorder) string {
 	var result strings.Builder
 	result.Grow(len(query) + 50) // Extra space for expanded escapes
 
 	inSingleQuote := false
 	inDoubleQuote := false
 	inVerbatim := false // @"..." or @'...'
+	var recorder *kqlSourceRecorder
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder = recorders[0]
+	}
 
 	for i := 0; i < len(query); i++ {
 		c := query[i]
@@ -2684,6 +3051,9 @@ func normalizeNullEscapes(query string) string {
 			nextAfter := i + 2
 			if nextAfter >= len(query) || (!isDigit(query[nextAfter]) && query[nextAfter] != 'x') {
 				// Convert \0 to \x00
+				if recorder != nil {
+					recorder.Replace(i, i+2, "\\x00", "")
+				}
 				result.WriteString("\\x00")
 				i++ // Skip the '0'
 				continue
@@ -2701,7 +3071,14 @@ func normalizeNullEscapes(query string) string {
 		result.WriteByte(c)
 	}
 
-	return result.String()
+	text := result.String()
+	if recorder != nil && len(recorder.Edits) > 0 {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, recorder.Edits, recorder.Budget)
+		if recorder.Source.Text != text {
+			sourceAbort("null escape edit mismatch")
+		}
+	}
+	return text
 }
 
 // isDigit checks if a byte is a digit
@@ -2818,7 +3195,10 @@ func normalizeInSubqueries(query string) string {
 }
 
 func normalizeInSubqueriesWithPlaceholder(query, placeholder string, budgets ...*parseBudget) string {
-	budget := suppliedBudget(budgets)
+	return normalizeInSubqueriesWithPlaceholderTracked(query, placeholder, suppliedBudget(budgets), nil)
+}
+
+func normalizeInSubqueriesWithPlaceholderTracked(query, placeholder string, budget *parseBudget, recorder *kqlSourceRecorder) string {
 	budget.step()
 	var b strings.Builder
 	b.Grow(len(query))
@@ -2874,7 +3254,11 @@ func normalizeInSubqueriesWithPlaceholder(query, placeholder string, budgets ...
 		b.WriteString(query[lastCopied : i+1])
 		// A synthetic literal distinguishes this legacy unresolved marker
 		// from a genuine reference to a column named SubqueryResult.
-		b.WriteString(strconv.Quote(placeholder))
+		replacement := strconv.Quote(placeholder)
+		b.WriteString(replacement)
+		if recorder != nil {
+			recorder.Replace(i+1, close, replacement, "normalizeInSubqueriesWithPlaceholder")
+		}
 		lastCopied = close
 		changed = true
 		i = close
@@ -2884,7 +3268,7 @@ func normalizeInSubqueriesWithPlaceholder(query, placeholder string, budgets ...
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	return finishKQLRecorded(query, b.String(), recorder)
 }
 
 func precededByInOperator(query string, openParen int) bool {
@@ -2940,13 +3324,17 @@ func containsPipeOutsideStrings(s string) bool {
 	return false
 }
 
-func normalizeStringOperatorAliases(query string) string {
+func normalizeStringOperatorAliases(query string, recorders ...*kqlSourceRecorder) string {
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
 	changed := false
 	var quote byte
 	verbatim := false
+	var recorder *kqlSourceRecorder
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder = recorders[0]
+	}
 
 	for i := 0; i < len(query); i++ {
 		ch := query[i]
@@ -2978,6 +3366,9 @@ func normalizeStringOperatorAliases(query string) string {
 		}
 
 		if alias, ok := legacyNegatedContains(query, i); ok {
+			if recorder != nil {
+				recorder.replace(i, i+len(alias.token), alias.replacement, "")
+			}
 			b.WriteString(query[lastCopied:i])
 			b.WriteString(alias.replacement)
 			i += len(alias.token) - 1
@@ -2986,6 +3377,9 @@ func normalizeStringOperatorAliases(query string) string {
 			continue
 		}
 		if hasOperatorTokenAt(query, i, "!containscs") {
+			if recorder != nil {
+				recorder.replace(i, i+len("!containscs"), "!contains_cs", "")
+			}
 			b.WriteString(query[lastCopied:i])
 			b.WriteString("!contains_cs")
 			i += len("!containscs") - 1
@@ -2994,6 +3388,9 @@ func normalizeStringOperatorAliases(query string) string {
 			continue
 		}
 		if hasOperatorTokenAt(query, i, "containscs") {
+			if recorder != nil {
+				recorder.replace(i, i+len("containscs"), "contains_cs", "")
+			}
 			b.WriteString(query[lastCopied:i])
 			b.WriteString("contains_cs")
 			i += len("containscs") - 1
@@ -3006,7 +3403,14 @@ func normalizeStringOperatorAliases(query string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	text := b.String()
+	if recorder != nil && len(recorder.Edits) > 0 {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, recorder.Edits, recorder.Budget)
+		if recorder.Source.Text != text {
+			sourceAbort("string operator alias edit mismatch")
+		}
+	}
+	return text
 }
 
 // legacyNegatedContains matches notcontains and notcontainscs, the legacy
@@ -3039,7 +3443,7 @@ func hasOperatorTokenAt(query string, idx int, token string) bool {
 
 // removeUnionParam removes all occurrences of a case-insensitive parameter (e.g., "isfuzzy")
 // along with its =value and any trailing comma/whitespace, using a single-pass Builder.
-func removeUnionParam(input string, paramLower string, paramLen int) string {
+func removeUnionParam(input string, paramLower string, paramLen int, recorder *kqlSourceRecorder) string {
 	lowerInput := strings.ToLower(input)
 	var b strings.Builder
 	b.Grow(len(input))
@@ -3069,6 +3473,9 @@ func removeUnionParam(input string, paramLower string, paramLen int) string {
 			end++
 		}
 		b.WriteString(input[lastCopied:idx])
+		if recorder != nil {
+			recorder.Replace(idx, end, "", "normalizeUnionParameters")
+		}
 		lastCopied = end
 		searchFrom = end
 		changed = true
@@ -3078,12 +3485,20 @@ func removeUnionParam(input string, paramLower string, paramLen int) string {
 		return input
 	}
 	b.WriteString(input[lastCopied:])
-	return b.String()
+	result := finishKQLRecorded(input, b.String(), recorder)
+	if recorder != nil {
+		recorder.Edits = nil
+	}
+	return result
 }
 
 // normalizeUnionParameters removes union parameters like isfuzzy=true, withsource=...
 // Also handles queries that start with (union ...) by stripping outer parens
-func normalizeUnionParameters(query string) string {
+func normalizeUnionParameters(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	result := query
 
 	// Handle outer parens around union: (union ...) | ... -> union ... | ...
@@ -3104,10 +3519,29 @@ func normalizeUnionParameters(query string) string {
 					if len(afterClose) == 0 {
 						// Entire query wrapped in parens: (union ...) -> union ...
 						result = trimmed[1:i]
+						if recorder != nil {
+							leading := len(query) - len(strings.TrimLeft(query, " \t\r\n"))
+							recorder.Replace(0, leading+1, "", "")
+							recorder.Replace(leading+i, len(query), "", "")
+							finishKQLRecorded(query, result, recorder)
+							recorder.Edits = nil
+						}
 					} else if strings.HasPrefix(afterClose, "|") || strings.HasPrefix(afterClose, "//") {
 						// Pattern: (union ...) | more... -> union ... | more...
 						// or: (union ...) // comment... -> union ... // comment...
 						result = trimmed[1:i] + " " + afterClose
+						if recorder != nil {
+							leading := len(query) - len(strings.TrimLeft(query, " \t\r\n"))
+							afterSpace := len(trimmed[i+1:]) - len(strings.TrimLeft(trimmed[i+1:], " \t\r\n"))
+							recorder.Replace(0, leading+1, "", "")
+							recorder.Replace(leading+i, leading+i+1+afterSpace, " ", "")
+							keptEnd := leading + i + 1 + afterSpace + len(afterClose)
+							if keptEnd < len(query) {
+								recorder.Replace(keptEnd, len(query), "", "")
+							}
+							finishKQLRecorded(query, result, recorder)
+							recorder.Edits = nil
+						}
 					}
 					// Otherwise don't modify (complex nesting)
 					break
@@ -3117,11 +3551,11 @@ func normalizeUnionParameters(query string) string {
 	}
 
 	// Remove isfuzzy=... parameter (up to next whitespace or comma)
-	result = removeUnionParam(result, "isfuzzy", 7)
+	result = removeUnionParam(result, "isfuzzy", 7, recorder)
 
 	// Remove withsource=... parameter
-	result = removeUnionParam(result, "withsource", 10)
-	result = removeUnionParam(result, "with_source", 11)
+	result = removeUnionParam(result, "withsource", 10, recorder)
+	result = removeUnionParam(result, "with_source", 11, recorder)
 
 	// Also handle kind= parameter in union
 	{
@@ -3157,24 +3591,32 @@ func normalizeUnionParameters(query string) string {
 				end++
 			}
 			b.WriteString(result[lastCopied:kindIdx])
+			if recorder != nil {
+				recorder.Replace(kindIdx, end, "", "normalizeUnionParameters")
+			}
 			lastCopied = end
 			searchFrom = end
 			changed = true
 		}
 		if changed {
 			b.WriteString(result[lastCopied:])
-			result = b.String()
+			updated := b.String()
+			finishKQLRecorded(result, updated, recorder)
+			if recorder != nil {
+				recorder.Edits = nil
+			}
+			result = updated
 		}
 	}
 
 	// Replace wildcard * in union with dummy table name
 	// "union *" -> "union AllTables"
 	// This handles patterns like: union *, union withsource=T *
-	result = replaceUnionWildcard(result)
+	result = replaceUnionWildcard(result, recorder)
 
 	// Strip * suffixes from table name patterns like Device*, Table_*
 	// "union Device*" -> "union Device"
-	result = stripTableWildcards(result)
+	result = stripTableWildcards(result, recorder)
 
 	return result
 }
@@ -3182,7 +3624,11 @@ func normalizeUnionParameters(query string) string {
 // normalizeJoinUnion handles union inside join parentheses
 // join (union T1, T2) -> join (DummyTable | union T1, T2)
 // The grammar requires a tabularSource before union
-func normalizeJoinUnion(query string) string {
+func normalizeJoinUnion(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	lowerQuery := strings.ToLower(query)
 	var b strings.Builder
 	b.Grow(len(query) + 64)
@@ -3267,6 +3713,7 @@ func normalizeJoinUnion(query string) string {
 				}
 				b.WriteString(query[lastCopied:insertPoint])
 				b.WriteString("DummyTable | ")
+				recordKQLInsertion(recorder, insertPoint, "DummyTable | ", "normalizeJoinUnion")
 				lastCopied = insertPoint
 				searchFrom = j + 5 // skip past "union"
 				changed = true
@@ -3278,12 +3725,16 @@ func normalizeJoinUnion(query string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	return finishKQLRecorded(query, b.String(), recorder)
 }
 
 // stripJoinHints removes hint.xxx=value patterns from join statements
 // Common hints: hint.strategy=broadcast, hint.shufflekey=x, hint.remote=auto
-func stripJoinHints(query string) string {
+func stripJoinHints(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	lowerQuery := strings.ToLower(query)
 	var b strings.Builder
 	b.Grow(len(query))
@@ -3341,6 +3792,9 @@ func stripJoinHints(query string) string {
 		}
 
 		b.WriteString(query[lastCopied:hintIdx])
+		if recorder != nil {
+			recorder.Replace(hintIdx, trailing, "", "stripJoinHints")
+		}
 		lastCopied = trailing
 		searchFrom = trailing
 		changed = true
@@ -3350,11 +3804,15 @@ func stripJoinHints(query string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	return finishKQLRecorded(query, b.String(), recorder)
 }
 
 // replaceUnionWildcard replaces the * wildcard in union statements with a dummy table
-func replaceUnionWildcard(query string) string {
+func replaceUnionWildcard(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	// Look for patterns like "union *" or "union  *" (with extra spaces)
 	// Also handles after parameter stripping: "union *" from "union withsource=T *"
 
@@ -3428,6 +3886,9 @@ func replaceUnionWildcard(query string) string {
 				if inUnionContext {
 					b.WriteString(query[lastCopied:i])
 					b.WriteString("AllTables")
+					if recorder != nil {
+						recorder.Replace(i, i+1, "AllTables", "normalizeUnionParameters")
+					}
 					lastCopied = i + 1
 					changed = true
 				}
@@ -3439,12 +3900,20 @@ func replaceUnionWildcard(query string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	result := finishKQLRecorded(query, b.String(), recorder)
+	if recorder != nil {
+		recorder.Edits = nil
+	}
+	return result
 }
 
 // stripTableWildcards removes * from table name patterns like Device*, *_CL, Table_*
 // These are valid KQL but the grammar doesn't support them
-func stripTableWildcards(query string) string {
+func stripTableWildcards(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	// Look for patterns like "union TableName*", "union *_CL", or "union TableName*, OtherTable"
 	// The * is attached to an identifier (no space on one side)
 	// Single-pass: scan forward and skip * characters that are table wildcards
@@ -3483,6 +3952,9 @@ func stripTableWildcards(query string) string {
 
 			if shouldRemove {
 				b.WriteString(query[lastCopied:i])
+				if recorder != nil {
+					recorder.Replace(i, i+1, "", "normalizeUnionParameters")
+				}
 				lastCopied = i + 1
 				changed = true
 			}
@@ -3493,13 +3965,21 @@ func stripTableWildcards(query string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	result := finishKQLRecorded(query, b.String(), recorder)
+	if recorder != nil {
+		recorder.Edits = nil
+	}
+	return result
 }
 
 // stripNamedFunctionParams removes named parameter assignments from function calls
 // that appear at the start of a query (user-defined function calls)
 // Example: parser(pack=true) -> parser or parser (pack=pack) -> parser
-func stripNamedFunctionParams(query string) string {
+func stripNamedFunctionParams(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	trimmed := strings.TrimSpace(query)
 	if len(trimmed) == 0 {
 		return query
@@ -3572,13 +4052,35 @@ func stripNamedFunctionParams(query string) string {
 
 	// Reconstruct: keep identifier, drop params, keep rest
 	result := trimmed[:i] + " " + afterParen
-	return strings.TrimSpace(result)
+	result = strings.TrimSpace(result)
+	if recorder != nil {
+		leading := len(query) - len(strings.TrimLeft(query, " \t\r\n"))
+		trailing := leading + len(trimmed)
+		if leading > 0 {
+			recorder.Replace(0, leading, "", "stripNamedFunctionParams")
+		}
+		after := trimmed[parenEnd:]
+		space := len(after) - len(strings.TrimLeft(after, " \t\r\n"))
+		separator := ""
+		if afterParen != "" {
+			separator = " "
+		}
+		recorder.Replace(leading+i, leading+parenEnd+space, separator, "stripNamedFunctionParams")
+		if trailing < len(query) {
+			recorder.Replace(trailing, len(query), "", "stripNamedFunctionParams")
+		}
+	}
+	return finishKQLRecorded(query, result, recorder)
 }
 
 // normalizeMakeSeries handles make-series syntax variants:
 // 1. "in range(start, end, step)" -> "from start to end step step"
 // 2. Missing step -> add "step 1h"
-func normalizeMakeSeries(query string) string {
+func normalizeMakeSeries(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	lowerQuery := strings.ToLower(query)
 	var b strings.Builder
 	b.Grow(len(query) + 64)
@@ -3655,6 +4157,10 @@ func normalizeMakeSeries(query string) string {
 						b.WriteString(strings.TrimSpace(parts[1]))
 						b.WriteString(" step ")
 						b.WriteString(strings.TrimSpace(parts[2]))
+						if recorder != nil {
+							replacement := " from " + strings.TrimSpace(parts[0]) + " to " + strings.TrimSpace(parts[1]) + " step " + strings.TrimSpace(parts[2])
+							recorder.Replace(pos+rangeIdx, rangeEnd, replacement, "normalizeMakeSeries")
+						}
 						lastCopied = rangeEnd
 						changed = true
 					}
@@ -3672,6 +4178,7 @@ func normalizeMakeSeries(query string) string {
 			}
 			b.WriteString(query[lastCopied:insertPos])
 			b.WriteString(" step 1h")
+			recordKQLInsertion(recorder, insertPos, " step 1h", "normalizeMakeSeries")
 			lastCopied = insertPos
 			changed = true
 		}
@@ -3683,7 +4190,7 @@ func normalizeMakeSeries(query string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	return finishKQLRecorded(query, b.String(), recorder)
 }
 
 // splitByTopLevelComma splits a string by commas that are not inside parentheses
@@ -3712,7 +4219,11 @@ func splitByTopLevelComma(s string) []string {
 // stripUnionFunctionParams removes function call parameters from union statements
 // The grammar doesn't support: union Func('a'), Func2('b')
 // Converts to: union Func, Func2
-func stripUnionFunctionParams(query string) string {
+func stripUnionFunctionParams(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	result := query
 	lowerResult := strings.ToLower(result)
 
@@ -3784,7 +4295,7 @@ func stripUnionFunctionParams(query string) string {
 		// Stop when we hit a pipe (end of union operands)
 		if c == '|' {
 			newResult.WriteString(result[i:])
-			return newResult.String()
+			return finishKQLRecorded(query, newResult.String(), recorder)
 		}
 
 		// Look for function call pattern: identifier followed by (
@@ -3840,6 +4351,9 @@ func stripUnionFunctionParams(query string) string {
 				}
 				// Write just the function name (no params)
 				newResult.WriteString(ident)
+				if recorder != nil {
+					recorder.Replace(afterIdent, i, "", "stripUnionFunctionParams")
+				}
 				afterEquals = false
 				continue
 			}
@@ -3861,7 +4375,7 @@ func stripUnionFunctionParams(query string) string {
 		i++
 	}
 
-	return newResult.String()
+	return finishKQLRecorded(query, newResult.String(), recorder)
 }
 
 // asimEntry holds a pre-computed lowercase ASIM function name and its length.
@@ -3906,7 +4420,11 @@ func init() {
 // replaceASIMFunctions replaces ASIM function calls with dummy table references.
 // Handles both simple calls (imAuthentication) and parameterised calls
 // (_Im_Dns(param=value)) in a single pass over the query.
-func replaceASIMFunctions(query string) string {
+func replaceASIMFunctions(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	lowerQuery := strings.ToLower(query)
 	qLen := len(query)
 
@@ -3971,6 +4489,9 @@ func replaceASIMFunctions(query string) string {
 
 				b.WriteString(query[lastCopied:i])
 				b.WriteString("ASIMResult")
+				if recorder != nil {
+					recorder.Replace(i, closeParen, "ASIMResult", "replaceASIMFunctions")
+				}
 				lastCopied = closeParen
 				i = closeParen
 				changed = true
@@ -3987,6 +4508,9 @@ func replaceASIMFunctions(query string) string {
 
 			b.WriteString(query[lastCopied:i])
 			b.WriteString("ASIMResult")
+			if recorder != nil {
+				recorder.Replace(i, end, "ASIMResult", "replaceASIMFunctions")
+			}
 			lastCopied = end
 			i = end
 			changed = true
@@ -4003,12 +4527,16 @@ func replaceASIMFunctions(query string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	return finishKQLRecorded(query, b.String(), recorder)
 }
 
 // replaceDatatableWithData replaces datatable(...) [ data ] with a dummy table reference
 // This handles inline data definitions that conflict with the lexer's QUOTED_IDENTIFIER rule
-func replaceDatatableWithData(query string) string {
+func replaceDatatableWithData(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	lowerQuery := strings.ToLower(query)
 	var b strings.Builder
 	b.Grow(len(query))
@@ -4084,6 +4612,9 @@ func replaceDatatableWithData(query string) string {
 				// Replace datatable(...) [ data ] with DatatableResult
 				b.WriteString(query[lastCopied:idx])
 				b.WriteString("DatatableResult")
+				if recorder != nil {
+					recorder.Replace(idx, dataEnd, "DatatableResult", "replaceDatatableWithData")
+				}
 				lastCopied = dataEnd
 				searchFrom = dataEnd
 				changed = true
@@ -4099,12 +4630,16 @@ func replaceDatatableWithData(query string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	return finishKQLRecorded(query, b.String(), recorder)
 }
 
 // replaceArgFunction replaces arg("...").Table patterns with just Table
 // Azure Resource Graph uses arg("subscription-id").Resources for cross-workspace queries
-func replaceArgFunction(query string) string {
+func replaceArgFunction(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	lowerQuery := strings.ToLower(query)
 	var b strings.Builder
 	b.Grow(len(query))
@@ -4157,12 +4692,18 @@ func replaceArgFunction(query string) string {
 		if closeParen < len(query) && query[closeParen] == '.' {
 			// Remove the entire arg(...). prefix — keep what's after the dot
 			b.WriteString(query[lastCopied:idx])
+			if recorder != nil {
+				recorder.Replace(idx, closeParen+1, "", "replaceArgFunction")
+			}
 			lastCopied = closeParen + 1
 			searchFrom = closeParen + 1
 		} else {
 			// No dot after, replace with ArgResult
 			b.WriteString(query[lastCopied:idx])
 			b.WriteString("ArgResult")
+			if recorder != nil {
+				recorder.Replace(idx, closeParen, "ArgResult", "replaceArgFunction")
+			}
 			lastCopied = closeParen
 			searchFrom = closeParen
 		}
@@ -4173,12 +4714,16 @@ func replaceArgFunction(query string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	return finishKQLRecorded(query, b.String(), recorder)
 }
 
 // replaceExternalData replaces externaldata(...) [...] with (...) with a dummy table reference
 // Full syntax: externaldata (Column:Type, ...) [ @"url" ] with (option=value)
-func replaceExternalData(query string) string {
+func replaceExternalData(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
@@ -4247,6 +4792,9 @@ func replaceExternalData(query string) string {
 		// Replace entire externaldata expression with ExtDataResult
 		b.WriteString(query[lastCopied:idx])
 		b.WriteString("ExtDataResult")
+		if recorder != nil {
+			recorder.Replace(idx, end, "ExtDataResult", "replaceExternalData")
+		}
 		lastCopied = end
 		searchFrom = end
 		changed = true
@@ -4256,32 +4804,54 @@ func replaceExternalData(query string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	return finishKQLRecorded(query, b.String(), recorder)
 }
 
 // stripDocumentationPreamble removes documentation wrappers from queries
 // Some queries are wrapped with "Description:...Query:..." headers
-func stripDocumentationPreamble(query string) string {
+func stripDocumentationPreamble(query string, recorders ...*kqlSourceRecorder) string {
 	// Process line by line, skipping documentation and finding where KQL starts
 	lines := strings.Split(query, "\n")
+	lineStarts := make([]int, len(lines))
+	for i := 1; i < len(lines); i++ {
+		lineStarts[i] = lineStarts[i-1] + len(lines[i-1]) + 1
+	}
+	var recorder *kqlSourceRecorder
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder = recorders[0]
+	}
 	for i, line := range lines {
 		lineTrimmed := strings.TrimSpace(line)
 		lowerLine := strings.ToLower(lineTrimmed)
 		for _, marker := range []string{"query:", "kql query:", "kql:"} {
 			if lowerLine == marker {
-				return strings.TrimSpace(strings.Join(lines[i+1:], "\n"))
+				start := lineStarts[i] + len(line)
+				if start < len(query) {
+					start++
+				}
+				span := trimKQLSpaceSpan(query, start, len(query))
+				return recordKQLSelectedSource(query, query[span.Start:span.End], []kqlByteSpan{span}, recorder)
 			}
 			if strings.HasPrefix(lowerLine, marker+" ") {
 				markerStart := strings.Index(strings.ToLower(line), marker)
 				if markerStart == -1 {
 					continue
 				}
-				afterMarker := strings.TrimSpace(line[markerStart+len(marker):])
-				rest := strings.TrimSpace(strings.Join(lines[i+1:], "\n"))
-				if rest == "" {
-					return afterMarker
+				afterSpan := trimKQLSpaceSpan(query, lineStarts[i]+markerStart+len(marker), lineStarts[i]+len(line))
+				afterMarker := query[afterSpan.Start:afterSpan.End]
+				restStart := lineStarts[i] + len(line)
+				if restStart < len(query) {
+					restStart++
 				}
-				return strings.TrimSpace(afterMarker + "\n" + rest)
+				restSpan := trimKQLSpaceSpan(query, restStart, len(query))
+				rest := query[restSpan.Start:restSpan.End]
+				if rest == "" {
+					return recordKQLSelectedSource(query, afterMarker, []kqlByteSpan{afterSpan}, recorder)
+				}
+				if afterMarker == "" {
+					return recordKQLSelectedSource(query, rest, []kqlByteSpan{restSpan}, recorder)
+				}
+				return recordKQLSelectedSource(query, strings.TrimSpace(afterMarker+"\n"+rest), []kqlByteSpan{afterSpan, restSpan}, recorder)
 			}
 		}
 	}
@@ -4303,7 +4873,8 @@ func stripDocumentationPreamble(query string) string {
 		// Parenthesized tabular expressions are common in KQL, especially
 		// `(union ...)` and `(Table | where ...)` query roots.
 		if strings.HasPrefix(lineTrimmed, "(") {
-			return strings.Join(lines[i:], "\n")
+			span := kqlByteSpan{lineStarts[i], len(query)}
+			return recordKQLSelectedSource(query, query[span.Start:span.End], []kqlByteSpan{span}, recorder)
 		}
 
 		// Skip documentation-style lines (Key: Value pattern)
@@ -4419,11 +4990,39 @@ func stripDocumentationPreamble(query string) string {
 
 		if isLikelyKQL {
 			// Return from this line onwards
-			return strings.Join(lines[i:], "\n")
+			span := kqlByteSpan{lineStarts[i], len(query)}
+			return recordKQLSelectedSource(query, query[span.Start:span.End], []kqlByteSpan{span}, recorder)
 		}
 	}
 
 	return query
+}
+
+func trimKQLSpaceSpan(query string, start, end int) kqlByteSpan {
+	raw := query[start:end]
+	left := len(raw) - len(strings.TrimLeftFunc(raw, unicode.IsSpace))
+	raw = raw[left:]
+	right := len(raw) - len(strings.TrimRightFunc(raw, unicode.IsSpace))
+	return kqlByteSpan{start + left, end - right}
+}
+
+func recordKQLSelectedSource(query, result string, spans []kqlByteSpan, recorder *kqlSourceRecorder) string {
+	if recorder == nil || result == query {
+		return result
+	}
+	edit := kqlSourceEdit{Start: 0, End: len(query)}
+	for i, span := range spans {
+		copySpan := span
+		edit.Parts = append(edit.Parts, kqlSourcePart{Copy: &copySpan})
+		if i+1 < len(spans) {
+			edit.Parts = append(edit.Parts, kqlSourcePart{Text: "\n", OccurrenceID: -1})
+		}
+	}
+	*recorder.Source = *applyKQLSourceEdits(recorder.Source, []kqlSourceEdit{edit}, recorder.Budget)
+	if recorder.Source.Text != result {
+		sourceAbort("documentation selection edit mismatch")
+	}
+	return result
 }
 
 func hasKQLStarterPrefix(lowerLine string) bool {
@@ -4438,13 +5037,14 @@ func hasKQLStarterPrefix(lowerLine string) bool {
 
 // stripDeclareStatements removes declare query_parameters(...) statements
 // These define query parameters but aren't part of the actual query
-func stripDeclareStatements(query string) string {
+func stripDeclareStatements(query string, recorders ...*kqlSourceRecorder) string {
 	lowerQuery := strings.ToLower(query)
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
 	changed := false
 	searchFrom := 0
+	var sourceEdits []kqlSourceEdit
 
 	// Find "declare query_parameters"
 	for {
@@ -4486,28 +5086,56 @@ func stripDeclareStatements(query string) string {
 		}
 
 		// Remove the entire declare statement
+		if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+			sourceEdits = append(sourceEdits, kqlSourceEdit{Start: idx, End: end})
+		}
 		b.WriteString(query[lastCopied:idx])
 		lastCopied = end
 		searchFrom = end
 		changed = true
 	}
 
-	if !changed {
-		return strings.TrimLeft(query, " \t\n\r")
+	if changed {
+		b.WriteString(query[lastCopied:])
+	} else {
+		b.WriteString(query)
 	}
-	b.WriteString(query[lastCopied:])
-	return strings.TrimLeft(b.String(), " \t\n\r")
+	intermediate := b.String()
+	result := strings.TrimLeft(intermediate, " \t\n\r")
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder := recorders[0]
+		if len(sourceEdits) > 0 {
+			*recorder.Source = *applyKQLSourceEdits(recorder.Source, sourceEdits, recorder.Budget)
+			if recorder.Source.Text != intermediate {
+				sourceAbort("declare deletion edit mismatch")
+			}
+		}
+		if len(result) < len(intermediate) {
+			*recorder.Source = *applyKQLSourceEdits(recorder.Source, []kqlSourceEdit{{Start: 0, End: len(intermediate) - len(result)}}, recorder.Budget)
+		}
+		if recorder.Source.Text != result {
+			sourceAbort("declare prefix edit mismatch")
+		}
+	}
+	return result
 }
 
 // stripLeadingComments removes leading // comments from a query. Unless
 // strict, it also removes what is not KQL: leading # comments and URL lines,
 // and /| lines (a mistyped // commenting out a pipe stage).
-func stripLeadingComments(query string, strict bool) string {
+func stripLeadingComments(query string, strict bool, recorders ...*kqlSourceRecorder) string {
 	lines := strings.Split(query, "\n")
 	var result []string
+	var kept []kqlByteSpan
+	lineStart := 0
+	for _, line := range lines {
+		kept = append(kept, kqlByteSpan{Start: lineStart, End: lineStart + len(line)})
+		lineStart += len(line) + 1
+	}
+	var retained []kqlByteSpan
 	foundCode := false
 
-	for _, line := range lines {
+	for index, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		// Skip empty lines, comment lines (// and #), and URL lines at the start
 		if !foundCode {
@@ -4517,6 +5145,7 @@ func stripLeadingComments(query string, strict bool) string {
 			if strict {
 				foundCode = true
 				result = append(result, line)
+				retained = append(retained, kept[index])
 				continue
 			}
 			if strings.HasPrefix(trimmed, "#") {
@@ -4539,13 +5168,28 @@ func stripLeadingComments(query string, strict bool) string {
 		}
 
 		result = append(result, line)
+		retained = append(retained, kept[index])
 	}
-
-	return strings.Join(result, "\n")
+	text := strings.Join(result, "\n")
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query && text != query {
+		recorder := recorders[0]
+		edit := kqlSourceEdit{Start: 0, End: len(query)}
+		for i, span := range retained {
+			copySpan := span
+			edit.Parts = append(edit.Parts, kqlSourcePart{Copy: &copySpan})
+			if i+1 < len(retained) {
+				edit.Parts = append(edit.Parts, kqlSourcePart{Text: "\n", OccurrenceID: -1})
+			}
+		}
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, []kqlSourceEdit{edit}, recorder.Budget)
+		if recorder.Source.Text != text {
+			sourceAbort("leading comments edit mismatch")
+		}
+	}
+	return text
 }
 
-// replaceParameters replaces {Parameter} placeholders with dummy values
-func replaceParameters(query string) string {
+func replaceParametersWithSource(query string, metadata *kqlNormalizationMetadata, budget *parseBudget) string {
 	// Common parameter patterns (non-time-related)
 	replacements := []struct {
 		param string
@@ -4561,29 +5205,33 @@ func replaceParameters(query string) string {
 
 	// Handle double curly braces {{param}} (Jinja2/Sentinel/Logic Apps style)
 	// Convert to single curly braces first, then let regular handling take over
-	result = collapseDoubleCurlyParametersOutsideStrings(result)
+	result = collapseDoubleCurlyParametersOutsideStrings(result, kqlRecorder(metadata, budget))
 
 	for _, replacement := range replacements {
-		result = replaceAllOutsideStrings(result, replacement.param, replacement.value)
+		result = replaceAllOutsideStrings(result, replacement.param, replacement.value, kqlRecorder(metadata, budget))
 	}
 
 	// Handle time range parameters with context awareness
 	// {TimeRange} after a time field should become "> ago(1d)" not just "1d"
-	result = replaceTimeRangeParams(result)
+	result = replaceTimeRangeParams(result, kqlRecorder(metadata, budget))
 
 	// Generic replacement for any remaining {param} patterns
 	// Replace {word} with a dummy identifier or expression depending on context
-	result = replaceGenericParametersOutsideStrings(result)
+	result = replaceGenericParametersOutsideStrings(result, kqlRecorder(metadata, budget))
 
 	return result
 }
 
-func collapseDoubleCurlyParametersOutsideStrings(query string) string {
+func collapseDoubleCurlyParametersOutsideStrings(query string, recorders ...*kqlSourceRecorder) string {
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
 	changed := false
 	searchFrom := 0
+	var recorder *kqlSourceRecorder
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder = recorders[0]
+	}
 	for {
 		start := indexOutsideStrings(query, "{{", searchFrom, false)
 		if start == -1 {
@@ -4598,6 +5246,9 @@ func collapseDoubleCurlyParametersOutsideStrings(query string) string {
 		b.WriteByte('{')
 		b.WriteString(query[start+2 : end])
 		b.WriteByte('}')
+		if recorder != nil {
+			recorder.Replace(start, end+2, "{"+query[start+2:end]+"}", "")
+		}
 		lastCopied = end + 2
 		searchFrom = lastCopied
 		changed = true
@@ -4607,15 +5258,23 @@ func collapseDoubleCurlyParametersOutsideStrings(query string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	result := b.String()
+	if recorder != nil {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, recorder.Edits, recorder.Budget)
+		if recorder.Source.Text != result {
+			sourceAbort("double-curly edit mismatch")
+		}
+	}
+	return result
 }
 
-func replaceAllOutsideStrings(query, old, new string) string {
+func replaceAllOutsideStrings(query, old, new string, recorders ...*kqlSourceRecorder) string {
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
 	changed := false
 	searchFrom := 0
+	var matches []kqlByteSpan
 	for {
 		idx := indexOutsideStrings(query, old, searchFrom, false)
 		if idx == -1 {
@@ -4623,6 +5282,9 @@ func replaceAllOutsideStrings(query, old, new string) string {
 		}
 		b.WriteString(query[lastCopied:idx])
 		b.WriteString(new)
+		if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+			matches = append(matches, kqlByteSpan{idx, idx + len(old)})
+		}
 		lastCopied = idx + len(old)
 		searchFrom = lastCopied
 		changed = true
@@ -4631,10 +5293,17 @@ func replaceAllOutsideStrings(query, old, new string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
+	if len(matches) > 0 {
+		recorder := recorders[0]
+		recordKQLLiteralEdits(recorder.Source, matches, old, new, recorder.Budget)
+		if recorder.Source.Text != b.String() {
+			sourceAbort("literal edit output mismatch")
+		}
+	}
 	return b.String()
 }
 
-func replaceGenericParametersOutsideStrings(query string) string {
+func replaceGenericParametersOutsideStrings(query string, recorders ...*kqlSourceRecorder) string {
 	result := query
 	searchFrom := 0
 	for {
@@ -4666,18 +5335,34 @@ func replaceGenericParametersOutsideStrings(query string) string {
 			}
 		}
 
+		entry := result
 		result = result[:start] + replacement + result[end+1:]
+		if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == entry {
+			// The scanner has already selected the current placeholder span.
+			recorder := recorders[0]
+			recorder.Replace(start, end+1, replacement, "")
+			*recorder.Source = *applyKQLSourceEdits(recorder.Source, recorder.Edits, recorder.Budget)
+			recorder.Edits = nil
+			if recorder.Source.Text != result {
+				sourceAbort("generic parameter edit mismatch")
+			}
+		}
 		searchFrom = start + len(replacement)
 	}
 	return result
 }
 
 // replaceTimeRangeParams handles {TimeRange} and similar time placeholders with context
-func replaceTimeRangeParams(query string) string {
+func replaceTimeRangeParams(query string, recorders ...*kqlSourceRecorder) string {
 	result := query
 	timeParams := []string{"{TimeRange}", "{timerange}", "{Timerange}", "{timeRange}"}
 
 	for _, param := range timeParams {
+		entry := result
+		var recorder *kqlSourceRecorder
+		if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == entry {
+			recorder = recorders[0]
+		}
 		var b strings.Builder
 		b.Grow(len(result))
 		lastCopied := 0
@@ -4709,6 +5394,9 @@ func replaceTimeRangeParams(query string) string {
 
 			b.WriteString(result[lastCopied:idx])
 			b.WriteString(replacement)
+			if recorder != nil {
+				recorder.Replace(idx, idx+len(param), replacement, "")
+			}
 			lastCopied = idx + len(param)
 			searchFrom = lastCopied
 			changed = true
@@ -4717,6 +5405,13 @@ func replaceTimeRangeParams(query string) string {
 		if changed {
 			b.WriteString(result[lastCopied:])
 			result = b.String()
+			if recorder != nil {
+				*recorder.Source = *applyKQLSourceEdits(recorder.Source, recorder.Edits, recorder.Budget)
+				recorder.Edits = nil
+				if recorder.Source.Text != result {
+					sourceAbort("time-range parameter edit mismatch")
+				}
+			}
 		}
 	}
 
@@ -4724,7 +5419,11 @@ func replaceTimeRangeParams(query string) string {
 }
 
 // renameReservedFieldNames replaces reserved keywords used as field names with safe alternatives
-func renameReservedFieldNames(query string) string {
+func renameReservedFieldNames(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	// Reserved words that are sometimes used as field names
 	reserved := map[string]string{
 		"pattern": "_pattern_",
@@ -4734,13 +5433,17 @@ func renameReservedFieldNames(query string) string {
 	result := query
 	for word, replacement := range reserved {
 		// Match word when preceded by whitespace, comma, ( and followed by operators or whitespace
-		result = renameFieldWord(result, word, replacement)
+		result = renameFieldWord(result, word, replacement, recorder)
 	}
 	return result
 }
 
 // renameFieldWord replaces a word when used as a field name (not as a keyword)
-func renameFieldWord(query, word, replacement string) string {
+func renameFieldWord(query, word, replacement string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	wordLen := len(word)
 	var b strings.Builder
 	b.Grow(len(query) + 32) // allow some growth for replacements
@@ -4767,6 +5470,9 @@ func renameFieldWord(query, word, replacement string) string {
 			if prevOk && afterOk {
 				b.WriteString(query[lastCopied:i])
 				b.WriteString(replacement)
+				if recorder != nil {
+					recorder.Replace(i, afterIdx, replacement, "")
+				}
 				lastCopied = afterIdx
 				i = afterIdx
 				changed = true
@@ -4779,7 +5485,7 @@ func renameFieldWord(query, word, replacement string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	return finishKQLRecorded(query, b.String(), recorder)
 }
 
 // getLastWord extracts the last identifier/word from a string
@@ -4801,7 +5507,11 @@ func getLastWord(s string) string {
 // find in (T1, T2, ...) where condition | ... -> DummyTable | where condition | ...
 // find in (T1, T2) where SHA1 == "x" -> DummyTable | where SHA1 == "x"
 // find in (T1) where x project a, b -> DummyTable | where x | project a, b
-func normalizeFindOperator(query string) string {
+func normalizeFindOperator(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	lowerQuery := strings.ToLower(strings.TrimSpace(query))
 
 	// Check if query starts with "find"
@@ -4821,7 +5531,10 @@ func normalizeFindOperator(query string) string {
 	if whereIdx == -1 {
 		// No where clause, the find statement is just table searching
 		// Convert to DummyTable with no conditions
-		return "DummyTable"
+		if recorder != nil {
+			recorder.Replace(0, len(query), "DummyTable", "normalizeFindOperator")
+		}
+		return finishKQLRecorded(query, "DummyTable", recorder)
 	}
 
 	// Extract everything from "where" onwards
@@ -4853,17 +5566,21 @@ func normalizeFindOperator(query string) string {
 		}
 		if !hasPipe {
 			// Insert a pipe before project
+			recordKQLInsertion(recorder, whereIdx+1+projectIdx, " |", "normalizeFindOperator")
 			afterWhere = afterWhere[:projectIdx] + " |" + afterWhere[projectIdx:]
 		}
 	}
 
-	return "DummyTable | " + afterWhere
+	if recorder != nil {
+		recorder.Replace(0, whereIdx+1, "DummyTable | ", "normalizeFindOperator")
+	}
+	return finishKQLRecorded(query, "DummyTable | "+afterWhere, recorder)
 }
 
 // normalizeTopNested converts top-nested clauses to simpler summarize form
 // The top-nested operator has complex hierarchical semantics that aren't needed for condition extraction
 // We simplify: find the entire top-nested chain and replace with summarize count()
-func normalizeTopNested(query string) string {
+func normalizeTopNested(query string, recorders ...*kqlSourceRecorder) string {
 	result := query
 
 	// Keep processing until no more top-nested clauses with "of"
@@ -4954,6 +5671,22 @@ func normalizeTopNested(query string) string {
 
 		// Construct new result
 		newResult := result[:idx] + replacement + afterChain
+		if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == result {
+			recorder := recorders[0]
+			owner := kqlOccurrenceAt(recorder.Source, idx, recorder.Budget)
+			for owner >= 0 && recorder.Source.Occurrences[owner].Kind != "stage" {
+				owner = recorder.Source.Occurrences[owner].ParentID
+			}
+			if owner < 0 {
+				sourceAbort("top-nested rewrite lacks stage owner")
+			}
+			origin := recorder.Source.Occurrences[owner].Span
+			edit := kqlSourceEdit{Start: idx, End: endIdx, Rewrite: "normalizeTopNested", Parts: []kqlSourcePart{{Text: replacement, Origin: origin, OccurrenceID: owner}}}
+			*recorder.Source = *applyKQLSourceEdits(recorder.Source, []kqlSourceEdit{edit}, recorder.Budget)
+			if recorder.Source.Text != newResult {
+				sourceAbort("top-nested edit mismatch")
+			}
+		}
 
 		// Verify we made progress to avoid infinite loop
 		if newResult == result {
@@ -4965,7 +5698,11 @@ func normalizeTopNested(query string) string {
 	return result
 }
 
-func normalizePartitionOperator(query string) string {
+func normalizePartitionOperator(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	lowerQuery := strings.ToLower(query)
 	var b strings.Builder
 	b.Grow(len(query))
@@ -5018,6 +5755,9 @@ func normalizePartitionOperator(query string) string {
 		b.WriteString(query[lastCopied:idx])
 		b.WriteString("| summarize count() by ")
 		b.WriteString(key)
+		if recorder != nil {
+			recorder.Replace(idx, close+1, "| summarize count() by "+key, "normalizePartitionOperator")
+		}
 		lastCopied = close + 1
 		searchFrom = close + 1
 		changed = true
@@ -5027,7 +5767,7 @@ func normalizePartitionOperator(query string) string {
 		return query
 	}
 	b.WriteString(query[lastCopied:])
-	return b.String()
+	return finishKQLRecorded(query, b.String(), recorder)
 }
 
 // normalizeSearchOperator converts search statements to standard where clauses
@@ -5079,13 +5819,32 @@ func extractConditionsContext(ctx context.Context, query string, limits parseLim
 }
 
 func extractConditionsInternal(query string, budget *parseBudget, inherited ...map[string]letOrigin) (result *ParseResult) {
+	source := kqlExtractionSource{Authored: query}
+	if len(inherited) > 0 {
+		source.Inherited = inherited[0]
+	}
+	return extractConditionsSource(source, budget)
+}
+
+func extractConditionsSource(source kqlExtractionSource, budget *parseBudget) (result *ParseResult) {
+	query := source.Authored
 	budget.input(query)
 	preflight(query, budget, false, nil)
-	normalization := &kqlNormalizationMetadata{}
-	if len(inherited) > 0 && len(inherited[0]) > 0 {
-		normalization.typed = &typedProtection{markers: inherited[0]}
+	mappedSource := source.Mapped
+	if mappedSource == nil {
+		mappedSource = newKQLMappedSource(query, budget)
+	} else {
+		restoreChildMembershipMarkers(mappedSource, budget)
 	}
-	normalizedQuery := normalizeBudgetedMetadata(query, false, budget, normalization)
+	normalization := &kqlNormalizationMetadata{}
+	normalization.mapped = mappedSource
+	if len(source.Inherited) > 0 {
+		normalization.typed = &typedProtection{markers: source.Inherited}
+	}
+	normalizedQuery := normalizeBudgetedMetadata(mappedSource.Text, false, budget, normalization)
+	if mappedSource.Text != normalizedQuery {
+		sourceAbort("normalization source edits incomplete")
+	}
 	lexerErrors := &errorListener{budget: budget}
 	stream := preflight(normalizedQuery, budget, true, lexerErrors)
 	parser := NewKQLParser(&budgetTokenStream{CommonTokenStream: stream, budget: budget})
@@ -5112,8 +5871,10 @@ func extractConditionsInternal(query string, budget *parseBudget, inherited ...m
 	}
 
 	// Walk the tree to extract conditions
+	owners := associateKQLSource(tree, mappedSource, budget)
 	extractor := &conditionExtractor{
 		budget:              budget,
+		sourceOwners:        owners,
 		conditions:          make([]Condition, 0),
 		computedFields:      make(map[string]string), // computed field -> source field
 		computedExpressions: make(map[string]string), // computed field -> expression
@@ -5146,6 +5907,17 @@ func extractConditionsInternal(query string, budget *parseBudget, inherited ...m
 	// Combine errors
 	allErrors := append(lexerErrors.errors, parserErrors.errors...)
 	allErrors = append(allErrors, extractor.errors...)
+	var dataflow *QueryDataflow
+	var dataflowWarnings []string
+	if len(allErrors) == 0 {
+		dataflow = buildKQLDataflow(tree, owners, extractor, budget)
+		for _, diagnostic := range dataflow.Diagnostics {
+			budget.step()
+			warning := fmt.Sprintf("dataflow:%s: %s", diagnostic.Code, diagnostic.Message)
+			budget.reserveOutput(1 + len(warning))
+			dataflowWarnings = append(dataflowWarnings, warning)
+		}
+	}
 
 	// Post-process to group OR conditions on same field. The expression tree
 	// knows the grouping; the flat operator sequence cannot tell
@@ -5168,7 +5940,18 @@ func extractConditionsInternal(query string, budget *parseBudget, inherited ...m
 			// The tree walker already captured conditions on computed
 			// columns, marked as computed; the text fallback cannot tell
 			// them from raw columns.
-			if _, computed := extractor.computedFields[strings.ToLower(condition.Field)]; computed {
+			if _, computed := extractor.computedFields[condition.Field]; computed {
+				continue
+			}
+			covered := false
+			for _, native := range conditions {
+				budget.step()
+				if native.Operator == condition.Operator && native.Value == condition.Value && normalization.typed.normalizesField(native.Field, condition.Field) {
+					covered = true
+					break
+				}
+			}
+			if covered {
 				continue
 			}
 			condition.Pipeline = extractor.queryPipeline
@@ -5214,7 +5997,9 @@ func extractConditionsInternal(query string, budget *parseBudget, inherited ...m
 	budget.outputSize(len(conditions))
 	budget.check()
 
-	return &ParseResult{
+	result = &ParseResult{
+		Dataflow:            dataflow,
+		Warnings:            dataflowWarnings,
 		Conditions:          conditions,
 		Expression:          expression,
 		DataSources:         dataSources,
@@ -5230,11 +6015,13 @@ func extractConditionsInternal(query string, budget *parseBudget, inherited ...m
 		Joins:               extractor.joins,
 		Errors:              allErrors,
 	}
+	finalizeDataflow(result, budget)
+	return result
 }
 
 // EnterJoinOperator extracts join metadata and recursively parses the right side
 func (e *conditionExtractor) EnterJoinOperator(ctx *JoinOperatorContext) {
-	if e.inSearch > 0 {
+	if e.inSearch > 0 || !e.ownsDataflow(ctx) {
 		return
 	}
 	e.commands = append(e.commands, "join")
@@ -5274,12 +6061,13 @@ func (e *conditionExtractor) EnterJoinOperator(ctx *JoinOperatorContext) {
 		info.RightTable = ctx.TableName().GetText()
 	} else if ctx.TabularExpression() != nil {
 		// Subquery: join kind=inner (SubQuery | where ...) on field
-		subText, inherited := e.extractTabularExpressionWithOrigins(ctx.TabularExpression())
-		if subText != "" {
-			info.Subsearch = extractConditionsInternal(subText, e.budget, inherited)
-			allJoinFields := append(info.JoinFields, info.LeftFields...)
-			info.ExposedFields = deriveExposedFields(info.Subsearch, allJoinFields)
+		subsource, ok := e.extractTabularExpressionSource(ctx.TabularExpression())
+		if !ok || subsource.Authored == "" {
+			sourceAbort("join child has no authored owner")
 		}
+		info.Subsearch = extractConditionsSource(subsource, e.budget)
+		allJoinFields := append(info.JoinFields, info.LeftFields...)
+		info.ExposedFields = deriveExposedFields(info.Subsearch, allJoinFields)
 	}
 
 	e.joins = append(e.joins, info)
@@ -5291,9 +6079,46 @@ func (e *conditionExtractor) EnterJoinOperator(ctx *JoinOperatorContext) {
 	}
 }
 
+func (e *conditionExtractor) extractTabularExpressionSource(ctx ITabularExpressionContext) (kqlExtractionSource, bool) {
+	if ctx == nil {
+		return kqlExtractionSource{}, false
+	}
+	if e.sourceOwners == nil {
+		sourceAbort("missing source owners for child")
+	}
+	if child, ok := e.sourceOwners.childSource(ctx, e.budget); ok {
+		if e.typed != nil {
+			reinserted, inherited := e.typed.reinsert(ctx)
+			child.Inherited = inherited
+			if len(inherited) != 0 {
+				if child.Mapped.Text != kqlSourceText(ctx, e.budget) {
+					sourceAbort("child typed reinsertion input mismatch")
+				}
+				positions := newKQLRuneByteIndex(child.Mapped.Text, e.budget)
+				recorder := &kqlEditSink{Source: child.Mapped, Budget: e.budget}
+				start, stop := ctx.GetStart().GetStart(), ctx.GetStop().GetStop()
+				for i := sort.SearchInts(e.typed.starts, start); i < len(e.typed.starts) && e.typed.starts[i] <= stop; i++ {
+					marker := e.typed.markerByStart[e.typed.starts[i]]
+					if marker == "" {
+						continue
+					}
+					relative := e.typed.starts[i] - start
+					if relative < 0 || relative >= len(positions) {
+						sourceAbort("child typed reinsertion offset invalid")
+					}
+					recordKQLInsertion(recorder, positions[relative], marker+" ", "")
+				}
+				finishKQLRecorded(child.Mapped.Text, reinserted, recorder)
+			}
+		}
+		return child, true
+	}
+	return kqlExtractionSource{}, false
+}
+
 // ExitJoinOperator decrements subquery depth when leaving a join with a subquery
 func (e *conditionExtractor) ExitJoinOperator(ctx *JoinOperatorContext) {
-	if e.inSearch > 0 {
+	if e.inSearch > 0 || !e.ownsDataflow(ctx) {
 		return
 	}
 	if ctx.TabularExpression() != nil {
@@ -5432,6 +6257,12 @@ func (e *conditionExtractor) EnterTabularOperator(ctx *TabularOperatorContext) {
 	if e.inSearch > 0 {
 		return
 	}
+	if e.dataflowOperators == nil {
+		e.dataflowOperators = make(map[*TabularOperatorContext]dataflowOperatorInfo)
+	}
+	if e.ownsDataflow(ctx) {
+		e.dataflowOperators[ctx] = dataflowOperatorInfo{PipeStage: e.currentStage, Pipeline: e.currentPipeline()}
+	}
 	e.operatorStages = append(e.operatorStages, e.currentStage)
 }
 
@@ -5469,6 +6300,11 @@ func (e *conditionExtractor) EnterTabularExpression(ctx *TabularExpressionContex
 		source = ctx.TabularSource().TableName().GetText()
 	}
 	e.pushPipeline(operator, source)
+	if e.dataflowPipelines == nil {
+		e.dataflowPipelines = make(map[*TabularExpressionContext]int)
+	}
+	e.dataflowPipelines[ctx] = e.currentPipeline()
+	e.enterDataflowOwner(ctx)
 	if _, ok := ctx.GetParent().(*QueryContext); ok {
 		e.queryPipeline = e.currentPipeline()
 	}
@@ -5479,6 +6315,7 @@ func (e *conditionExtractor) ExitTabularExpression(ctx *TabularExpressionContext
 	if e.inSearch > 0 {
 		return
 	}
+	e.leaveDataflowOwner()
 	e.pipelineStack = e.pipelineStack[:len(e.pipelineStack)-1]
 }
 
@@ -5526,20 +6363,14 @@ func (e *conditionExtractor) ExitFunctionCall(ctx *FunctionCallContext) {
 }
 
 // EnterLetStatement tracks computed fields from let statements
-func (e *conditionExtractor) EnterLetStatement(ctx *LetStatementContext) {
-	if ctx.Identifier() != nil {
-		field := ctx.Identifier().GetText()
-		// Let statements can have complex expressions, so we don't track source field
-		e.computedFields[strings.ToLower(field)] = ""
-	}
-}
+func (e *conditionExtractor) EnterLetStatement(*LetStatementContext) {}
 
 // EnterAggregationItem tracks computed fields from summarize aggregation aliases.
 // e.g., summarize FailedAttempts=count() registers "failedattempts" as computed.
 // This prevents post-aggregation filters (| where FailedAttempts > 5) from being
 // treated as required raw data fields in test validation.
 func (e *conditionExtractor) EnterAggregationItem(ctx *AggregationItemContext) {
-	if e.inSearch > 0 {
+	if e.inSearch > 0 || e.inSubquery > 0 || !e.ownsDataflow(ctx) {
 		return
 	}
 	// Two grammar forms:
@@ -5547,12 +6378,12 @@ func (e *conditionExtractor) EnterAggregationItem(ctx *AggregationItemContext) {
 	//   aggregationFunction AS identifier        (e.g., count() as EventCount)
 	alias := ""
 	if ctx.Identifier() != nil && (ctx.ASSIGN() != nil || ctx.AS() != nil) {
-		alias = ctx.Identifier().GetText()
+		alias = e.authoredIdentifier(ctx.Identifier())
 		sourceField := ""
 		if ctx.AggregationFunction() != nil {
 			sourceField = aggregationFunctionText(ctx.AggregationFunction())
 		}
-		e.computedFields[strings.ToLower(alias)] = sourceField
+		e.computedFields[alias] = sourceField
 	}
 
 	if e.inSubquery > 0 {
@@ -5560,7 +6391,9 @@ func (e *conditionExtractor) EnterAggregationItem(ctx *AggregationItemContext) {
 	}
 	aggregation := newAggregation(ctx.AggregationFunction(), alias, e.currentStage)
 	aggregation.Pipeline = e.currentPipeline()
+	e.budget.reserveOutput(1)
 	e.aggregations = append(e.aggregations, aggregation)
+	e.aggregationContexts = append(e.aggregationContexts, ctx)
 }
 
 func aggregationFunctionText(ctx IAggregationFunctionContext) string {
@@ -5616,7 +6449,7 @@ func defaultAggregationColumn(function, field string) string {
 
 // EnterGroupByItem extracts field names from summarize BY clauses.
 func (e *conditionExtractor) EnterGroupByItem(ctx *GroupByItemContext) {
-	if e.inSearch > 0 {
+	if e.inSearch > 0 || !e.ownsDataflow(ctx) {
 		return
 	}
 	if e.inSubquery > 0 {
@@ -5628,17 +6461,17 @@ func (e *conditionExtractor) EnterGroupByItem(ctx *GroupByItemContext) {
 	// for aliased items, take the alias (identifier) name.
 	if ctx.Identifier() != nil && (ctx.ASSIGN() != nil || ctx.AS() != nil) {
 		// Aliased: "Count = count()" or "count() AS Count" — the alias is the group-by result name
-		alias := ctx.Identifier().GetText()
+		alias := e.authoredIdentifier(ctx.Identifier())
 		e.groupByFields = append(e.groupByFields, alias)
-		e.computedFields[strings.ToLower(alias)] = ""
+		e.computedFields[alias] = ""
 	} else if ctx.Expression() != nil {
 		if e.typed.hasOpaqueReference(ctx.Expression()) {
 			e.groupByExpressions = append(e.groupByExpressions, e.typed.sourceOf(ctx.Expression()))
 			return
 		}
 		text := ctx.Expression().GetText()
-		if isValidFieldName(text) {
-			e.groupByFields = append(e.groupByFields, text)
+		if isValidFieldName(text) || decodeKQLIdentifier(text, e.budget) != text {
+			e.groupByFields = append(e.groupByFields, e.authoredIdentifier(ctx.Expression()))
 		} else {
 			e.groupByExpressions = append(e.groupByExpressions, text)
 		}
@@ -5647,12 +6480,12 @@ func (e *conditionExtractor) EnterGroupByItem(ctx *GroupByItemContext) {
 
 // EnterExtendItem tracks computed fields from extend
 func (e *conditionExtractor) EnterExtendItem(ctx *ExtendItemContext) {
-	if e.inSearch > 0 {
+	if e.inSearch > 0 || e.inSubquery > 0 || !e.ownsDataflow(ctx) {
 		return
 	}
 	// Track field assignments in extend with source field extraction
 	if ctx.Identifier() != nil {
-		field := e.typed.sourceOf(ctx.Identifier())
+		field := e.authoredIdentifier(ctx.Identifier())
 		sourceField := ""
 		expression := ""
 
@@ -5670,8 +6503,8 @@ func (e *conditionExtractor) EnterExtendItem(ctx *ExtendItemContext) {
 			}
 		}
 
-		e.computedFields[strings.ToLower(field)] = sourceField
-		e.computedExpressions[strings.ToLower(field)] = expression
+		e.computedFields[field] = sourceField
+		e.computedExpressions[field] = expression
 	}
 }
 
@@ -5775,7 +6608,7 @@ func isIdentStart(c byte) bool {
 
 // EnterProjectItem tracks renamed fields from project
 func (e *conditionExtractor) EnterProjectItem(ctx *ProjectItemContext) {
-	if e.inSearch > 0 {
+	if e.inSearch > 0 || !e.ownsDataflow(ctx) {
 		return
 	}
 	if e.inSubquery > 0 {
@@ -5783,7 +6616,7 @@ func (e *conditionExtractor) EnterProjectItem(ctx *ProjectItemContext) {
 	}
 	if ctx.Identifier() != nil && (ctx.ASSIGN() != nil || ctx.AS() != nil) {
 		// Aliased project item: project NewName = expr or project expr AS NewName
-		field := e.typed.sourceOf(ctx.Identifier())
+		field := e.authoredIdentifier(ctx.Identifier())
 		sourceField, expression := "", ""
 		if ctx.Expression() != nil {
 			expression = ctx.Expression().GetText()
@@ -5797,8 +6630,8 @@ func (e *conditionExtractor) EnterProjectItem(ctx *ProjectItemContext) {
 				sourceField = ""
 			}
 		}
-		e.computedFields[strings.ToLower(field)] = sourceField
-		e.computedExpressions[strings.ToLower(field)] = expression
+		e.computedFields[field] = sourceField
+		e.computedExpressions[field] = expression
 		e.projectedFields = append(e.projectedFields, field)
 	} else if ctx.Expression() != nil {
 		// Simple project item: project FieldName
@@ -5807,8 +6640,8 @@ func (e *conditionExtractor) EnterProjectItem(ctx *ProjectItemContext) {
 			return // The expression has no representable column identity.
 		}
 		text := ctx.Expression().GetText()
-		if isValidFieldName(text) {
-			e.projectedFields = append(e.projectedFields, text)
+		if isValidFieldName(text) || decodeKQLIdentifier(text, e.budget) != text {
+			e.projectedFields = append(e.projectedFields, e.authoredIdentifier(ctx.Expression()))
 		}
 	}
 }
@@ -5816,7 +6649,7 @@ func (e *conditionExtractor) EnterProjectItem(ctx *ProjectItemContext) {
 // EnterRenameItem tracks project-rename columns as computed from the column
 // they rename.
 func (e *conditionExtractor) EnterRenameItem(ctx *RenameItemContext) {
-	if e.inSearch > 0 {
+	if e.inSearch > 0 || !e.ownsDataflow(ctx) {
 		return
 	}
 	if e.inSubquery > 0 {
@@ -5826,14 +6659,14 @@ func (e *conditionExtractor) EnterRenameItem(ctx *RenameItemContext) {
 	if len(identifiers) != 2 {
 		return
 	}
-	field, source := identifiers[0].GetText(), identifiers[1].GetText()
-	e.computedFields[strings.ToLower(field)] = source
-	e.computedExpressions[strings.ToLower(field)] = source
+	field, source := e.authoredIdentifier(identifiers[0]), e.authoredIdentifier(identifiers[1])
+	e.computedFields[field] = source
+	e.computedExpressions[field] = source
 }
 
 // EnterComparisonExpression extracts field comparisons
 func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpressionContext) {
-	if e.inSearch > 0 {
+	if e.inSearch > 0 || !e.ownsDataflow(ctx) {
 		return
 	}
 	if e.inSubquery > 0 || e.inFunctionCall > 0 {
@@ -5884,6 +6717,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 				op = BooleanOr
 			}
 			for index := start; index < len(e.conditions); index++ {
+				e.conditions[index].Field = e.authoredComparisonField(ctx, e.conditions[index].Field)
 				leaf = combineConditionExpressions(op, leaf, &ConditionExpression{Operator: BooleanCondition, ConditionIndex: index}, e.budget)
 			}
 			e.expressionLeaves[ctx] = leaf
@@ -5902,7 +6736,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 		return
 	}
 	if predicate, ok := kqlFilterFunctionPredicate(ctx, e.budget); ok {
-		sourceField, isComputed := e.computedFields[strings.ToLower(predicate.field)]
+		sourceField, isComputed := e.computedFields[predicate.field]
 		e.appendCondition(Condition{
 			Field:       predicate.field,
 			Operator:    predicate.operator,
@@ -5927,10 +6761,10 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 			if first, second := recognizeKQLOperand(expressions[0], e.budget), recognizeKQLOperand(expressions[1], e.budget); first.literal && second.reference {
 				leftTree, rhsTree = expressions[1], expressions[0]
 			}
-			left = e.typed.applyKQLOperand(left, leftTree)
-			right = e.typed.applyKQLOperand(right, rhsTree)
+			left = e.applyAuthoredKQLOperand(left, leftTree)
+			right = e.applyAuthoredKQLOperand(right, rhsTree)
 		}
-		source, computed := e.computedFields[strings.ToLower(left.text)]
+		source, computed := e.computedFields[left.text]
 		condition := Condition{Field: left.text, Operator: normalizeOperator(op), RHS: right.rhs, Negated: e.negated, PipeStage: e.currentStage, Pipeline: e.currentPipeline(), LogicalOp: e.lastLogicalOp, IsComputed: computed, SourceField: source}
 		if right.reference {
 			condition.ValueReference = right.text
@@ -5987,7 +6821,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 	if hasIN || hasNOT_IN || hasIN_CS || hasNOT_IN_CS {
 		addExprs := ctx.AllAdditiveExpression()
 		if len(addExprs) >= 1 && ctx.ExpressionList() != nil {
-			leftText := e.typed.applyKQLOperand(recognizeKQLOperand(addExprs[0], e.budget), addExprs[0]).text
+			leftText := e.applyAuthoredKQLOperand(recognizeKQLOperand(addExprs[0], e.budget), addExprs[0]).text
 			isNegated := (hasNOT_IN || hasNOT_IN_CS) != e.negated
 			operator := "in"
 			if hasIN_CS || hasNOT_IN_CS || strings.Contains(strings.ToLower(ctx.GetText()), "in~") {
@@ -6002,9 +6836,9 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 	if ctx.BETWEEN() != nil || ctx.NOT_BETWEEN() != nil {
 		addExprs := ctx.AllAdditiveExpression()
 		if len(addExprs) >= 3 {
-			leftText := e.typed.applyKQLOperand(recognizeKQLOperand(addExprs[0], e.budget), addExprs[0]).text
-			low := e.typed.applyKQLOperand(recognizeKQLOperand(addExprs[1], e.budget), addExprs[1])
-			high := e.typed.applyKQLOperand(recognizeKQLOperand(addExprs[2], e.budget), addExprs[2])
+			leftText := e.applyAuthoredKQLOperand(recognizeKQLOperand(addExprs[0], e.budget), addExprs[0]).text
+			low := e.applyAuthoredKQLOperand(recognizeKQLOperand(addExprs[1], e.budget), addExprs[1])
+			high := e.applyAuthoredKQLOperand(recognizeKQLOperand(addExprs[2], e.budget), addExprs[2])
 			isNegated := (ctx.NOT_BETWEEN() != nil) != e.negated
 			start := len(e.conditions)
 			e.handleBetweenOperator(leftText, low.text, high.text, isNegated, addExprs[0])
@@ -6027,7 +6861,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 	if ctx.HAS_ANY() != nil || ctx.HAS_ALL() != nil {
 		addExprs := ctx.AllAdditiveExpression()
 		if len(addExprs) >= 1 && ctx.ExpressionList() != nil {
-			leftText := e.typed.applyKQLOperand(recognizeKQLOperand(addExprs[0], e.budget), addExprs[0]).text
+			leftText := e.applyAuthoredKQLOperand(recognizeKQLOperand(addExprs[0], e.budget), addExprs[0]).text
 			opName := "has_any"
 			if ctx.HAS_ALL() != nil {
 				opName = "has_all"
@@ -6053,7 +6887,7 @@ func (e *conditionExtractor) handleComparison(left, op, right string) {
 	}
 
 	// Mark if this is a computed field (created by extend/project)
-	sourceField, isComputed := e.computedFields[fieldLower]
+	sourceField, isComputed := e.computedFields[left]
 
 	// Normalize the operator
 	normalizedOp := normalizeOperator(op)
@@ -6098,7 +6932,7 @@ func (e *conditionExtractor) handleInOperator(field string, exprList IExpression
 	}
 
 	// Mark if this is a computed field (created by extend/project)
-	sourceField, isComputed := e.computedFields[fieldLower]
+	sourceField, isComputed := e.computedFields[field]
 
 	values := extractExpressionListValues(exprList, e.budget)
 	if len(values) == 0 {
@@ -6120,7 +6954,7 @@ func (e *conditionExtractor) handleInOperator(field string, exprList IExpression
 	for _, expression := range exprList.AllExpression() {
 		operand := recognizeKQLOperand(expression, e.budget)
 		if operand.rhs != nil {
-			items = append(items, *e.typed.apply(operand.rhs, expression))
+			items = append(items, *e.applyAuthoredOperand(operand.rhs, expression))
 		}
 	}
 	listSource := "(" + kqlSourceText(exprList, e.budget) + ")"
@@ -6132,7 +6966,7 @@ func (e *conditionExtractor) handleInOperator(field string, exprList IExpression
 		cond.RHS.Source, cond.RHS.Binding = source, binding
 	}
 	if expressions := exprList.AllExpression(); len(expressions) == 1 {
-		if operand := recognizeKQLOperand(expressions[0], e.budget); operand.reference {
+		if operand := e.applyAuthoredKQLOperand(recognizeKQLOperand(expressions[0], e.budget), expressions[0]); operand.reference {
 			cond.ValueReference = operand.text
 		}
 	}
@@ -6181,7 +7015,7 @@ func (e *conditionExtractor) handleBetweenOperator(field, lowValue, highValue st
 	}
 
 	// Mark if this is a computed field (created by extend/project)
-	sourceField, isComputed := e.computedFields[fieldLower]
+	sourceField, isComputed := e.computedFields[field]
 
 	// Add lower bound condition
 	cond1 := Condition{
@@ -6225,7 +7059,7 @@ func (e *conditionExtractor) handleHasAnyAllOperator(field, op string, exprList 
 	}
 
 	// Mark if this is a computed field (created by extend/project)
-	sourceField, isComputed := e.computedFields[fieldLower]
+	sourceField, isComputed := e.computedFields[field]
 
 	values := extractExpressionListValues(exprList, e.budget)
 	logicalConnector := "OR"
@@ -6251,7 +7085,7 @@ func (e *conditionExtractor) handleHasAnyAllOperator(field, op string, exprList 
 			SourceField: sourceField,
 		}
 		if i < len(expressions) {
-			cond.RHS = e.typed.apply(recognizeKQLOperand(expressions[i], e.budget).rhs, expressions[i])
+			cond.RHS = e.applyAuthoredOperand(recognizeKQLOperand(expressions[i], e.budget).rhs, expressions[i])
 		}
 		e.appendCondition(cond)
 	}
@@ -6260,14 +7094,14 @@ func (e *conditionExtractor) handleHasAnyAllOperator(field, op string, exprList 
 
 // EnterNotExpression tracks negation
 func (e *conditionExtractor) EnterNotExpression(ctx *NotExpressionContext) {
-	if ctx.NOT() != nil {
+	if e.ownsDataflow(ctx) && ctx.NOT() != nil {
 		e.negated = !e.negated
 	}
 }
 
 // ExitNotExpression resets negation
 func (e *conditionExtractor) ExitNotExpression(ctx *NotExpressionContext) {
-	if ctx.NOT() != nil {
+	if e.ownsDataflow(ctx) && ctx.NOT() != nil {
 		e.negated = !e.negated
 	}
 }
@@ -6281,7 +7115,7 @@ func (e *conditionExtractor) EnterOrExpression(_ *OrExpressionContext) {}
 func (e *conditionExtractor) ExitAndExpression(ctx *AndExpressionContext) {
 	// Boolean expressions inside scalar/aggregation arguments do not connect
 	// the surrounding row filters.
-	if e.inFunctionCall > 0 || e.inSearch > 0 {
+	if e.inFunctionCall > 0 || e.inSearch > 0 || !e.ownsDataflow(ctx) {
 		return
 	}
 	orCtx, ok := ctx.GetParent().(*OrExpressionContext)
@@ -7922,6 +8756,9 @@ func sameConditionGroup(a, b Condition) bool {
 	// Alternatives encode literal values on one field. References and computed
 	// expressions need their complete predicates, even when names look alike.
 	return a.Field == b.Field &&
+		a.StageID == b.StageID &&
+		a.InputScopeID == b.InputScopeID &&
+		fieldBindingIdentity(a.FieldBinding) == fieldBindingIdentity(b.FieldBinding) &&
 		a.Operator == b.Operator &&
 		!a.Negated &&
 		!b.Negated &&
@@ -7955,6 +8792,7 @@ func deduplicateConditionValues(values []string) []string {
 }
 
 type conditionIdentity struct {
+	stageID, inputScopeID, fieldBinding    string
 	field, operator, value, valueReference string
 	logicalOp, sourceField, alternatives   string
 	negated, isComputed, alternativesNil   bool
@@ -7970,6 +8808,7 @@ func conditionDedupKey(cond Condition) conditionIdentity {
 		alternatives.WriteString(value)
 	}
 	return conditionIdentity{
+		stageID: cond.StageID, inputScopeID: cond.InputScopeID, fieldBinding: fieldBindingIdentity(cond.FieldBinding),
 		field: cond.Field, operator: cond.Operator, value: cond.Value,
 		valueReference: cond.ValueReference, logicalOp: cond.LogicalOp,
 		sourceField: cond.SourceField, alternatives: alternatives.String(),

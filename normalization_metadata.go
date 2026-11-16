@@ -10,6 +10,7 @@ import (
 // marker literals survive subsequent normalization; restore the public marker
 // and record its final rune offsets before ANTLR sees the input.
 type kqlNormalizationMetadata struct {
+	mapped          *kqlMappedSource
 	subqueryMarker  string
 	subqueryOffsets []int
 	searchCount     int
@@ -31,25 +32,34 @@ func newKQLNormalizationMetadata(query string, budgets ...*parseBudget) *kqlNorm
 }
 
 func (m *kqlNormalizationMetadata) restoreSubqueryMarkers(query string, budgets ...*parseBudget) string {
-	budget := suppliedBudget(budgets)
+	return m.restoreSubqueryMarkersWithSource(query, suppliedBudget(budgets), nil)
+}
+
+func (m *kqlNormalizationMetadata) restoreSubqueryMarkersWithSource(query string, budget *parseBudget, recorder *kqlSourceRecorder) string {
 	budget.step()
 
 	marker, replacement := strconv.Quote(m.subqueryMarker), strconv.Quote(SubqueryPlaceholder)
 	var restored strings.Builder
 	runes := 0
+	input := query
+	position := 0
 	for {
 		budget.step()
-		index := strings.Index(query, marker)
+		index := strings.Index(input[position:], marker)
 		if index < 0 {
-			restored.WriteString(query)
-			return restored.String()
+			restored.WriteString(input[position:])
+			return finishKQLRecorded(input, restored.String(), recorder)
 		}
-		restored.WriteString(query[:index])
-		runes += utf8.RuneCountInString(query[:index])
+		index += position
+		restored.WriteString(input[position:index])
+		runes += utf8.RuneCountInString(input[position:index])
 		budget.outputSize(len(m.subqueryOffsets) + 1)
 		m.subqueryOffsets = append(m.subqueryOffsets, runes)
 		restored.WriteString(replacement)
+		if recorder != nil {
+			recorder.Replace(index, index+len(marker), replacement, "")
+		}
 		runes += utf8.RuneCountInString(replacement)
-		query = query[index+len(marker):]
+		position = index + len(marker)
 	}
 }

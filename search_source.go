@@ -111,6 +111,10 @@ func searchRuneBytes(query string, budget *parseBudget) []int {
 }
 
 func protectSearchClauses(query string, budget *parseBudget, selectedStarts ...int) (string, *searchProtection) {
+	return protectSearchClausesWithSource(query, budget, nil, selectedStarts...)
+}
+
+func protectSearchClausesWithSource(query string, budget *parseBudget, recorder *kqlSourceRecorder, selectedStarts ...int) (string, *searchProtection) {
 	budget.step()
 	protection := &searchProtection{}
 	selectedStart := 0
@@ -125,6 +129,7 @@ func protectSearchClauses(query string, budget *parseBudget, selectedStarts ...i
 	positions := searchRuneBytes(query, budget)
 	var out strings.Builder
 	last := 0
+	var sourceEdits []kqlSourceEdit
 	for index, span := range spans {
 		budget.step()
 		start, end := positions[tokens[span.first].GetStart()], len(query)
@@ -137,6 +142,15 @@ func protectSearchClauses(query string, budget *parseBudget, selectedStarts ...i
 			marker += "_"
 		}
 		replacement := "search " + strconv.Quote(marker) + " "
+		if recorder != nil && recorder.Source.Text == query {
+			recorder.Source.Protected[marker] = kqlPiecesInRange(recorder.Source, start, end, budget)
+			owner := kqlOccurrenceAt(recorder.Source, start, budget)
+			origin := originOfEdit(recorder.Source, kqlSourceEdit{Start: start, End: end}, budget)
+			if owner >= 0 {
+				origin = recorder.Source.Occurrences[owner].Span
+			}
+			sourceEdits = append(sourceEdits, kqlSourceEdit{Start: start, End: end, Parts: []kqlSourcePart{{Text: replacement, Origin: origin, OccurrenceID: owner}}})
+		}
 		reserveSearchBytes(out.Len()+start-last+len(replacement)+len(query)-end, budget)
 		budget.reserveOutput(1)
 		protection.clauses = append(protection.clauses, protectedSearchClause{marker: marker, source: query[start:end], selected: start >= selectedStart})
@@ -145,7 +159,14 @@ func protectSearchClauses(query string, budget *parseBudget, selectedStarts ...i
 		last = end
 	}
 	out.WriteString(query[last:])
-	return out.String(), protection
+	result := out.String()
+	if len(sourceEdits) > 0 {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, sourceEdits, budget)
+		if recorder.Source.Text != result {
+			sourceAbort("search protection edit mismatch")
+		}
+	}
+	return result, protection
 }
 
 func reserveSearchBytes(size int, budget *parseBudget) {
@@ -155,7 +176,7 @@ func reserveSearchBytes(size int, budget *parseBudget) {
 	}
 }
 
-func (p *searchProtection) restore(query string, budget *parseBudget) string {
+func (p *searchProtection) restore(query string, budget *parseBudget, recorders ...*kqlSourceRecorder) string {
 	budget.step()
 	if len(p.clauses) == 0 {
 		return query
@@ -166,6 +187,11 @@ func (p *searchProtection) restore(query string, budget *parseBudget) string {
 	used := make(map[string]bool)
 	var out strings.Builder
 	last := 0
+	var recorder *kqlSourceRecorder
+	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
+		recorder = recorders[0]
+	}
+	var sourceEdits []kqlSourceEdit
 	for _, span := range spans {
 		budget.step()
 		start, end := positions[tokens[span.first].GetStart()], len(query)
@@ -190,6 +216,17 @@ func (p *searchProtection) restore(query string, budget *parseBudget) string {
 		reserveSearchBytes(out.Len()+start-last+len(entry.source)+len(query)-end, budget)
 		out.WriteString(query[last:start])
 		out.WriteString(entry.source)
+		if recorder != nil {
+			var parts []kqlSourcePart
+			for _, piece := range recorder.Source.Protected[entry.marker] {
+				budget.step()
+				parts = append(parts, kqlSourcePart{Text: piece.Text, Origin: piece.Origin, OccurrenceID: piece.OccurrenceID})
+			}
+			if len(parts) == 0 {
+				sourceAbort("search marker lost protected source")
+			}
+			sourceEdits = append(sourceEdits, kqlSourceEdit{Start: start, End: end, Parts: parts})
+		}
 		last = end
 	}
 	out.WriteString(query[last:])
@@ -199,5 +236,12 @@ func (p *searchProtection) restore(query string, budget *parseBudget) string {
 			panic(budgetAbort{fmt.Errorf("search source preservation failed")})
 		}
 	}
-	return out.String()
+	result := out.String()
+	if len(sourceEdits) > 0 {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, sourceEdits, budget)
+		if recorder.Source.Text != result {
+			sourceAbort("search restoration edit mismatch")
+		}
+	}
+	return result
 }

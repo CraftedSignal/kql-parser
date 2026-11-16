@@ -37,6 +37,21 @@ names, right-hand field references, stages, and pipelines. Literal equality to
 `"*"` is retained. The dedup helper keeps only the latest stage for each exact
 field and pipeline in source order; use `Expression` for Boolean semantics.
 
+`ExtractConditions` and `AnalyzeQuery` expose an additive `Dataflow` graph.
+Its ordered stages retain authored command/source text, immutable input and
+output scopes, and bindings for supported assignments, projections, renames,
+and summaries. A condition's `StageID`, `InputScopeID`, and `FieldBinding`
+identify the field version it reads; typed field operands carry their own
+`FieldBinding`. A `joins/N` input points to the corresponding child result's
+output scope. Check `Dataflow.Complete` and `Warnings` before using the graph:
+an opaque transform keeps its original stage and an unknown output scope.
+The graph describes provenance; it does not execute KQL predicates.
+
+Parser-produced `ComputedFields` and `ComputedExpressions` use exact-case keys.
+For `extend Fresh=src`, look up `"Fresh"`, not `"fresh"`; a separate raw field
+named `fresh` remains distinct. These legacy maps describe the latest value
+for each exact name. Use `Dataflow.Bindings` to retain successive assignments.
+
 ## Usage
 
 ### Basic Condition Extraction

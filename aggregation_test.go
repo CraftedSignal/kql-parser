@@ -57,7 +57,35 @@ func TestExtractConditions_SummarizeAggregations(t *testing.T) {
 			result := ExtractConditions(tt.query)
 			got := make([]Aggregation, len(result.Aggregations))
 			for i, aggregation := range result.Aggregations {
+				if result.Dataflow == nil {
+					t.Fatal("aggregation has no dataflow graph")
+				}
+				if aggregation.StageID == "" || aggregation.BindingID == "" {
+					t.Fatalf("aggregation has no stage/binding ownership: %+v", aggregation)
+				}
+				var owner *DataflowStage
+				for j := range result.Dataflow.Stages {
+					if result.Dataflow.Stages[j].ID == aggregation.StageID {
+						owner = &result.Dataflow.Stages[j]
+						break
+					}
+				}
+				if owner == nil || owner.PipeStage != aggregation.PipeStage || owner.Pipeline != aggregation.Pipeline || owner.Effect != "aggregate" {
+					t.Fatalf("aggregation stage ownership = %+v, aggregate = %+v", owner, aggregation)
+				}
+				var binding *FieldBinding
+				for j := range result.Dataflow.Bindings {
+					if result.Dataflow.Bindings[j].ID == aggregation.BindingID {
+						binding = &result.Dataflow.Bindings[j]
+						break
+					}
+				}
+				if binding == nil || binding.StageID != owner.ID || binding.Field != aggregation.Column || binding.Kind != "aggregate" {
+					t.Fatalf("aggregation binding ownership = %+v, aggregate = %+v", binding, aggregation)
+				}
 				aggregation.PipeStage = 0
+				aggregation.StageID = ""
+				aggregation.BindingID = ""
 				got[i] = aggregation
 			}
 			if len(got) == 0 {
@@ -114,7 +142,7 @@ func TestExtractConditions_RenamedColumnsAreComputed(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := ExtractConditions(tt.query)
-			if got := result.ComputedExpressions["user"]; got != "UserPrincipalName" {
+			if got := result.ComputedExpressions["User"]; got != "UserPrincipalName" {
 				t.Fatalf("computed expression = %q, want UserPrincipalName", got)
 			}
 			var before, after *Condition

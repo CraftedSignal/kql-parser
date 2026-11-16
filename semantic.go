@@ -6,6 +6,11 @@ import "context"
 // It resolves ANTLR/listener output into stable condition-bearing nodes so
 // callers do not need to understand parse-tree details or condition indexes.
 type SemanticQuery struct {
+	Dataflow            *QueryDataflow      `json:"dataflow,omitempty"`
+	Warnings            []string            `json:"warnings,omitempty"`
+	Aggregations        []Aggregation       `json:"aggregations,omitempty"`
+	Pipelines           []Pipeline          `json:"pipelines,omitempty"`
+	GroupByExpressions  []string            `json:"group_by_expressions,omitempty"`
 	Conditions          []Condition         `json:"conditions,omitempty"`
 	Expression          *SemanticExpression `json:"expression,omitempty"`
 	DataSources         []string            `json:"data_sources,omitempty"`
@@ -75,6 +80,9 @@ func semanticFromExtraction(result *ParseResult, budget *parseBudget) *SemanticQ
 
 	budget.reserveOutput(1 + len(result.LetStatements))
 	semantic := &SemanticQuery{
+		Dataflow:            cloneQueryDataflow(result.Dataflow, budget),
+		Warnings:            cloneSemanticStrings(result.Warnings, budget),
+		GroupByExpressions:  cloneSemanticStrings(result.GroupByExpressions, budget),
 		Conditions:          cloneSemanticConditions(result.Conditions, budget),
 		DataSources:         cloneSemanticStrings(result.DataSources, budget),
 		LetStatements:       append([]LetStatement(nil), result.LetStatements...),
@@ -84,6 +92,14 @@ func semanticFromExtraction(result *ParseResult, budget *parseBudget) *SemanticQ
 		Commands:            cloneSemanticStrings(result.Commands, budget),
 		ProjectedFields:     cloneSemanticStrings(result.ProjectedFields, budget),
 		Errors:              cloneSemanticStrings(result.Errors, budget),
+	}
+	if len(result.Aggregations) != 0 {
+		budget.reserveOutput(len(result.Aggregations))
+		semantic.Aggregations = append([]Aggregation(nil), result.Aggregations...)
+	}
+	if len(result.Pipelines) != 0 {
+		budget.reserveOutput(len(result.Pipelines))
+		semantic.Pipelines = append([]Pipeline(nil), result.Pipelines...)
 	}
 	semantic.Expression = semanticExpressionFromParseExpression(result.Expression, semantic.Conditions, budget)
 	if semantic.Expression == nil {
@@ -227,6 +243,7 @@ func cloneSemanticCondition(condition Condition, budget *parseBudget) *Condition
 	copy := condition
 	copy.Alternatives = cloneSemanticStrings(condition.Alternatives, budget)
 	copy.RHS = cloneOperand(condition.RHS, budget)
+	copy.FieldBinding = cloneFieldBindingRef(condition.FieldBinding, budget)
 	return &copy
 }
 

@@ -84,8 +84,18 @@ var makeGraphEdgeRe = regexp.MustCompile(`(?i)(\bmake-graph\s+[A-Za-z_][A-Za-z0-
 
 // normalizeMakeGraphEdges writes the make-graph edge, "-->" (directed) or
 // "--" (undirected), as the "=>" the grammar expects.
-func normalizeMakeGraphEdges(query string) string {
-	return makeGraphEdgeRe.ReplaceAllString(query, "${1}=>${2}")
+func normalizeMakeGraphEdges(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
+	if recorder != nil {
+		for _, match := range makeGraphEdgeRe.FindAllStringSubmatchIndex(query, -1) {
+			replacement := string(makeGraphEdgeRe.ExpandString(nil, "${1}=>${2}", query, match))
+			recorder.Replace(match[0], match[1], replacement, "normalizeMakeGraphEdges")
+		}
+	}
+	return finishKQLRecorded(query, makeGraphEdgeRe.ReplaceAllString(query, "${1}=>${2}"), recorder)
 }
 
 var bracketedUnionRe = regexp.MustCompile(`(?i)\(\s*union\b`)
@@ -93,7 +103,11 @@ var bracketedUnionRe = regexp.MustCompile(`(?i)\(\s*union\b`)
 // normalizeBracketedUnion gives a union that opens a bracketed tabular
 // expression, (union A, B), the placeholder table the grammar requires before
 // union, as for a query that starts with union.
-func normalizeBracketedUnion(query string) string {
+func normalizeBracketedUnion(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	var b strings.Builder
 	last := 0
 	for i := 0; i < len(query); {
@@ -113,6 +127,7 @@ func normalizeBracketedUnion(query string) string {
 			if loc := bracketedUnionRe.FindStringIndex(query[i:]); loc != nil && loc[0] == 0 {
 				b.WriteString(query[last : i+1])
 				b.WriteString("DummyTable | ")
+				recordKQLInsertion(recorder, i+1, "DummyTable | ", "normalizeBracketedUnion")
 				last = i + 1
 			}
 			i++
@@ -124,7 +139,7 @@ func normalizeBracketedUnion(query string) string {
 		return query
 	}
 	b.WriteString(query[last:])
-	return b.String()
+	return finishKQLRecorded(query, b.String(), recorder)
 }
 
 var datetimeLiteralRe = regexp.MustCompile(`(?i)^datetime\s*\([^)]*\)`)
@@ -138,7 +153,11 @@ var graphMatchStageRe = regexp.MustCompile(`(?i)\|\s*graph-match\b`)
 // stripGraphMatchStages removes graph-match stages, whose patterns, such as
 // (a)-[e*1..3]->(b), the grammar does not support. Their syntax is not
 // validated.
-func stripGraphMatchStages(query string) string {
+func stripGraphMatchStages(query string, recorders ...*kqlSourceRecorder) string {
+	var recorder *kqlSourceRecorder
+	if len(recorders) != 0 {
+		recorder = recorders[0]
+	}
 	for {
 		loc := graphMatchStageRe.FindStringIndex(query)
 		if loc == nil {
@@ -166,7 +185,14 @@ func stripGraphMatchStages(query string) string {
 			}
 			end++
 		}
-		query = query[:loc[0]] + query[end:]
+		original := query
+		if recorder != nil {
+			recorder.Replace(loc[0], end, "", "stripGraphMatchStages")
+		}
+		query = finishKQLRecorded(original, query[:loc[0]]+query[end:], recorder)
+		if recorder != nil {
+			recorder.Edits = nil
+		}
 	}
 }
 

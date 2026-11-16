@@ -9,6 +9,8 @@ import (
 // SearchPredicate is an opaque, source-preserved tabular search. Consumers must
 // handle the search operator and its scope, or explicitly report it unsupported.
 type SearchPredicate struct {
+	StageID      string   `json:"stage_id,omitempty"`
+	InputScopeID string   `json:"input_scope_id,omitempty"`
 	Text         string   `json:"text"`
 	Kind         string   `json:"kind,omitempty"`
 	Scope        string   `json:"scope"`
@@ -113,7 +115,7 @@ func validateKQLSearches(tree antlr.Tree, budget *parseBudget) (int, string) {
 }
 
 func (e *conditionExtractor) EnterSearchOperator(ctx *SearchOperatorContext) {
-	if e.inSubquery > 0 || e.inSearch > 0 {
+	if e.inSubquery > 0 || e.inSearch > 0 || !e.ownsDataflow(ctx) {
 		e.inSearch++
 		return
 	}
@@ -136,7 +138,7 @@ func (e *conditionExtractor) EnterSearchOperator(ctx *SearchOperatorContext) {
 
 func (e *conditionExtractor) ExitSearchOperator(ctx *SearchOperatorContext) {
 	e.inSearch--
-	if _, leading := ctx.GetParent().(ITabularSourceContext); leading && e.inSearch == 0 && e.inSubquery == 0 {
+	if _, leading := ctx.GetParent().(ITabularSourceContext); leading && e.inSearch == 0 && e.inSubquery == 0 && e.ownsDataflow(ctx) {
 		e.currentStage++
 		if pipeline := e.currentPipeline(); pipeline >= 0 {
 			e.pipelines[pipeline].Operators++
@@ -149,7 +151,7 @@ func equalSearchPredicate(a, b *SearchPredicate, budget *parseBudget) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
-	if a.Text != b.Text || a.Kind != b.Kind || a.Scope != b.Scope || a.PipeStage != b.PipeStage || a.Pipeline != b.Pipeline || len(a.TableSources) != len(b.TableSources) {
+	if a.Text != b.Text || a.Kind != b.Kind || a.Scope != b.Scope || a.PipeStage != b.PipeStage || a.Pipeline != b.Pipeline || a.StageID != b.StageID || a.InputScopeID != b.InputScopeID || len(a.TableSources) != len(b.TableSources) {
 		return false
 	}
 	for i := range a.TableSources {
