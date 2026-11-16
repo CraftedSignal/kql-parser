@@ -13,10 +13,12 @@ import (
 // applies an enclosing boolean NOT; operator-internal !in remains in Text.
 // Consumers must preserve it or explicitly reject unsupported scalar filters.
 type ScalarPredicate struct {
-	Text      string `json:"text"`
-	Negated   bool   `json:"negated,omitempty"`
-	PipeStage int    `json:"pipe_stage"`
-	Pipeline  int    `json:"pipeline"`
+	StageID      string `json:"stage_id,omitempty"`
+	InputScopeID string `json:"input_scope_id,omitempty"`
+	Text         string `json:"text"`
+	Negated      bool   `json:"negated,omitempty"`
+	PipeStage    int    `json:"pipe_stage"`
+	Pipeline     int    `json:"pipeline"`
 }
 
 type kqlOperand struct {

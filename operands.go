@@ -22,12 +22,13 @@ const (
 // Operand retains syntax and value separately. Typed constructor values are
 // unevaluated; Items contains structurally recognized arguments or list items.
 type Operand struct {
-	Kind    OperandKind `json:"kind"`
-	Source  string      `json:"source,omitempty"`
-	Value   string      `json:"value,omitempty"`
-	Type    string      `json:"type,omitempty"`
-	Items   []Operand   `json:"items,omitempty"`
-	Binding string      `json:"binding,omitempty"`
+	FieldBinding *FieldBindingRef `json:"field_binding,omitempty"`
+	Kind         OperandKind      `json:"kind"`
+	Source       string           `json:"source,omitempty"`
+	Value        string           `json:"value,omitempty"`
+	Type         string           `json:"type,omitempty"`
+	Items        []Operand        `json:"items,omitempty"`
+	Binding      string           `json:"binding,omitempty"`
 }
 
 func literalKQLOperand(token int, source string) *Operand {
@@ -142,6 +143,7 @@ func cloneOperand(value *Operand, budget *parseBudget) *Operand {
 	}
 	budget.reserveOutput(1 + len(value.Source) + len(value.Value) + len(value.Type) + len(value.Binding) + len(value.Items))
 	copy := *value
+	copy.FieldBinding = cloneFieldBindingRef(value.FieldBinding, budget)
 	if len(value.Items) != 0 {
 		copy.Items = make([]Operand, len(value.Items))
 		for i := range value.Items {
@@ -158,6 +160,9 @@ func operandOutputCost(value *Operand, budget *parseBudget) int {
 		return 0
 	}
 	cost := 1 + len(value.Source) + len(value.Value) + len(value.Type) + len(value.Binding) + len(value.Items)
+	if value.FieldBinding != nil {
+		cost += 1 + len(value.FieldBinding.ScopeID) + len(value.FieldBinding.Kind) + len(value.FieldBinding.BindingID)
+	}
 	for i := range value.Items {
 		cost += operandOutputCost(&value.Items[i], budget)
 	}
@@ -185,6 +190,14 @@ func operandIdentity(value *Operand, budgets ...*parseBudget) string {
 		field(node.Value)
 		field(node.Type)
 		field(node.Binding)
+		if node.FieldBinding == nil {
+			out.WriteByte('0')
+		} else {
+			out.WriteByte('1')
+			field(node.FieldBinding.ScopeID)
+			field(node.FieldBinding.Kind)
+			field(node.FieldBinding.BindingID)
+		}
 		out.WriteString(strconv.Itoa(len(node.Items)))
 		out.WriteByte(':')
 		for i := range node.Items {

@@ -21,12 +21,12 @@ type letConstant struct {
 // "x has_all (name)" lists the array's elements. Only operands of comparison
 // and list operators are replaced; lets that bind anything else, such as a
 // tabular expression, stay names.
-func inlineLetConstants(query string, lets []LetStatement, budget *parseBudget, protections ...*typedProtection) string {
+func inlineLetConstants(query string, lets []LetStatement, budget *parseBudget) string {
+	return inlineLetConstantsWithSource(query, lets, budget, nil, nil)
+}
+
+func inlineLetConstantsWithSource(query string, lets []LetStatement, budget *parseBudget, protection *typedProtection, recorder *kqlSourceRecorder) string {
 	budget.step()
-	var protection *typedProtection
-	if len(protections) > 0 {
-		protection = protections[0]
-	}
 	// Only substitute in a later top-level statement, after proving that
 	// bindings are unique and no function scope or column assignment shadows
 	// them. Ambiguous queries keep their bindings and scalar predicates.
@@ -91,6 +91,7 @@ func inlineLetConstants(query string, lets []LetStatement, budget *parseBudget, 
 	for _, statement := range statements {
 		normalizedBytes += len(statement)
 	}
+	statementStart := 0
 	for index, statement := range statements {
 		budget.step()
 		name, expression, isLet := parseLetAssignment(strings.TrimSpace(trimLeadingLineComments(statement)))
@@ -98,20 +99,28 @@ func inlineLetConstants(query string, lets []LetStatement, budget *parseBudget, 
 			if constant, ok := parseLetConstant(expression); ok {
 				constants[name] = constant
 			}
+			statementStart += len(statement) + 1
 			continue
 		}
 		// Account for every other statement before growing this one, so
 		// splitting the query never resets the normalized-input byte cap.
 		otherBytes := normalizedBytes - len(statement)
-		statements[index] = inlineLetConstantOperands(statement, constants, budget, otherBytes, protection)
+		statements[index] = inlineLetConstantOperands(statement, constants, budget, otherBytes, protection, recorder, statementStart)
 		normalizedBytes = otherBytes + len(statements[index])
+		statementStart += len(statement) + 1
 	}
 	result := strings.Join(statements, ";")
+	if recorder != nil && len(recorder.Edits) > 0 {
+		*recorder.Source = *applyKQLSourceEdits(recorder.Source, recorder.Edits, budget)
+		if recorder.Source.Text != result {
+			sourceAbort("let substitution edit text mismatch")
+		}
+	}
 	budget.input(result)
 	return result
 }
 
-func inlineLetConstantOperands(query string, constants map[string]letConstant, budget *parseBudget, otherBytes int, protection *typedProtection) string {
+func inlineLetConstantOperands(query string, constants map[string]letConstant, budget *parseBudget, otherBytes int, protection *typedProtection, recorder *kqlSourceRecorder, base int) string {
 	if len(constants) == 0 {
 		return query
 	}
@@ -158,6 +167,9 @@ func inlineLetConstantOperands(query string, constants map[string]letConstant, b
 					}
 					write(query[last:i])
 					write(literal)
+					if recorder != nil {
+						recorder.replace(base+i, base+end, literal, "")
+					}
 					last = end
 				}
 			}

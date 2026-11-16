@@ -1,5 +1,29 @@
 # Scalar filter predicates
 
+## Ordered field provenance
+
+`ParseResult.Dataflow` and `SemanticQuery.Dataflow` add ordered stages, immutable
+field scopes, and per-stage bindings. Read `Condition.StageID` and
+`Condition.InputScopeID` before interpreting a filter; its `FieldBinding`
+resolves to `input`, a particular binding ID, `absent`, or `unknown`. Typed
+field operands and their list items have independent binding references.
+Stage and assignment expression source is taken from the authored query, even
+when normalization changes the parser input. A `joins/N` input resolves to
+`Joins[N]` in the result containing that reference. Local nested union inputs
+have an empty `QueryPath` and their own pipeline scopes.
+
+`Dataflow.Complete=false` and `Warnings` mean that a transform or field read
+cannot be represented faithfully; the following opaque scope does not imply
+the field is raw input. A nil graph accompanies syntax or resource failures.
+This metadata does not implement query execution. Consumers should preserve
+the expression tree and reject predicates or stage effects they cannot run.
+
+`ComputedFields` and `ComputedExpressions` now index parser-produced names by
+their exact spelling. A query assigning `Fresh` does not also define `fresh`.
+These compatibility maps still expose only the latest exact-name value, while
+`Dataflow.Bindings` retains every ordered assignment. Default summarize outputs
+such as `count_` are computed bindings in the graph.
+
 `ConditionExpression` and `SemanticExpression` now have a `BooleanScalar`
 (`"scalar"`) leaf with a `Scalar *ScalarPredicate` payload. A scalar predicate
 preserves a complete, unevaluated filter, including constant-only filters and
