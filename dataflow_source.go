@@ -233,7 +233,7 @@ func (owners *kqlSourceOwners) childSource(ctx antlr.ParserRuleContext, budget *
 	}
 	child := &kqlMappedSource{Original: owners.source.Original[originalSpan.Start:originalSpan.End], Text: owners.source.Text[normalizedSpan.Start:normalizedSpan.End], SelectedOwnerID: 0, Protected: make(map[string][]kqlSourcePiece)}
 	indices := map[int]int{id: 0}
-	budget.reserveOutput(1 + len("query"))
+	budget.reserveMetadataStrings(1, "query")
 	child.Occurrences = append(child.Occurrences, kqlSourceOccurrence{ID: 0, OwnerID: 0, ParentID: -1, Kind: "query", Span: kqlByteSpan{0, len(child.Original)}})
 	for _, occurrence := range owners.source.Occurrences {
 		budget.step()
@@ -245,7 +245,7 @@ func (owners *kqlSourceOwners) childSource(ctx antlr.ParserRuleContext, budget *
 		copy.ID = len(child.Occurrences)
 		copy.Span.Start -= originalSpan.Start
 		copy.Span.End -= originalSpan.Start
-		budget.reserveOutput(1 + len(copy.Kind) + len(copy.Command) + len(copy.Rewrite))
+		budget.reserveMetadataStrings(1, copy.Kind, copy.Command, copy.Rewrite)
 		child.Occurrences = append(child.Occurrences, copy)
 	}
 	for i := 1; i < len(child.Occurrences); i++ {
@@ -383,7 +383,7 @@ func newKQLMappedSource(query string, budget *parseBudget) *kqlMappedSource {
 	selected := mainQuerySpan(query)
 	checkedKQLSpan(selected, query)
 	src := &kqlMappedSource{Original: query, Text: query, SelectedOwnerID: 0, Protected: make(map[string][]kqlSourcePiece)}
-	budget.reserveOutput(1 + len("query"))
+	budget.reserveMetadataStrings(1, "query")
 	src.Occurrences = append(src.Occurrences, kqlSourceOccurrence{ID: 0, OwnerID: 0, ParentID: -1, Kind: "query", Span: selected})
 	// This is a bounded delimiter inventory, not another grammar parse. It
 	// records lexical operator/RHS spans before normalizers can remove them.
@@ -574,7 +574,7 @@ func appendKQLStageInventory(src *kqlMappedSource, query string, lo, hi, ordinal
 		commandEnd++
 	}
 	stageID := len(src.Occurrences)
-	budget.reserveOutput(1 + len("stage") + len(query[commandStart:commandEnd]))
+	budget.reserveMetadataStrings(1, "stage", query[commandStart:commandEnd])
 	src.Occurrences = append(src.Occurrences, kqlSourceOccurrence{ID: stageID, OwnerID: ownerID, ParentID: ownerID, Kind: "stage", Span: stageSpan, Command: query[commandStart:commandEnd], Ordinal: ordinal})
 	appendNestedKQLInventory(src, query, stageSpan, stageID, budget)
 	command := strings.ToLower(query[commandStart:commandEnd])
@@ -658,7 +658,7 @@ func appendKQLStageInventory(src *kqlMappedSource, query string, lo, hi, ordinal
 			}
 			if rhs.Start < rhs.End {
 				id := len(src.Occurrences)
-				budget.reserveOutput(1 + len("rhs"))
+				budget.reserveMetadataStrings(1, "rhs")
 				src.Occurrences = append(src.Occurrences, kqlSourceOccurrence{ID: id, OwnerID: ownerID, ParentID: stageID, Kind: "rhs", Span: rhs, Ordinal: rhsOrdinal})
 			}
 			rhsOrdinal++
@@ -754,7 +754,7 @@ func appendNestedKQLInventory(src *kqlMappedSource, query string, span kqlByteSp
 				continue
 			}
 			queryID := len(src.Occurrences)
-			budget.reserveOutput(1 + len("query"))
+			budget.reserveMetadataStrings(1, "query")
 			src.Occurrences = append(src.Occurrences, kqlSourceOccurrence{ID: queryID, OwnerID: queryID, ParentID: parentStage, Kind: "query", Span: body})
 			stageStart, ordinal, level := body.Start, 0, 0
 			for i := body.Start; i <= body.End; i++ {
@@ -871,6 +871,9 @@ func applyKQLSourceEdits(src *kqlMappedSource, edits []kqlSourceEdit, budget *pa
 			for i := range out.Occurrences {
 				budget.step()
 				if out.Occurrences[i].Kind == "stage" && (spansOverlap(out.Occurrences[i].Span, originOfEdit(src, edit, budget)) || isKQLAncestor(src.Occurrences, rewriteOwner, i)) {
+					if out.Occurrences[i].Rewrite != edit.Rewrite {
+						budget.reserveMetadataStrings(0, edit.Rewrite)
+					}
 					out.Occurrences[i].Rewrite = edit.Rewrite
 				}
 			}

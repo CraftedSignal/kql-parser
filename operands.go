@@ -161,7 +161,7 @@ func operandOutputCost(value *Operand, budget *parseBudget) int {
 	}
 	cost := 1 + len(value.Source) + len(value.Value) + len(value.Type) + len(value.Binding) + len(value.Items)
 	if value.FieldBinding != nil {
-		cost += 1 + len(value.FieldBinding.ScopeID) + len(value.FieldBinding.Kind) + len(value.FieldBinding.BindingID)
+		budget.reserveMetadataStrings(1, value.FieldBinding.ScopeID, value.FieldBinding.Kind, value.FieldBinding.BindingID)
 	}
 	for i := range value.Items {
 		cost += operandOutputCost(&value.Items[i], budget)
@@ -170,8 +170,15 @@ func operandOutputCost(value *Operand, budget *parseBudget) int {
 }
 
 func operandIdentity(value *Operand, budgets ...*parseBudget) string {
-	budget := suppliedBudget(budgets)
+	identity, _ := operandIdentityParts(value, suppliedBudget(budgets))
+	return identity
+}
+
+// Return the added reference tags/IDs separately so retained identity keys
+// keep exactly their pre-wave2 legacy cost.
+func operandIdentityParts(value *Operand, budget *parseBudget) (string, int) {
 	var out strings.Builder
+	metadataBytes := 0
 	var visit func(*Operand)
 	field := func(s string) {
 		out.WriteString(strconv.Itoa(len(s)))
@@ -190,6 +197,7 @@ func operandIdentity(value *Operand, budgets ...*parseBudget) string {
 		field(node.Value)
 		field(node.Type)
 		field(node.Binding)
+		metadataStart := out.Len()
 		if node.FieldBinding == nil {
 			out.WriteByte('0')
 		} else {
@@ -198,6 +206,7 @@ func operandIdentity(value *Operand, budgets ...*parseBudget) string {
 			field(node.FieldBinding.Kind)
 			field(node.FieldBinding.BindingID)
 		}
+		metadataBytes += out.Len() - metadataStart
 		out.WriteString(strconv.Itoa(len(node.Items)))
 		out.WriteByte(':')
 		for i := range node.Items {
@@ -205,7 +214,7 @@ func operandIdentity(value *Operand, budgets ...*parseBudget) string {
 		}
 	}
 	visit(value)
-	return out.String()
+	return out.String(), metadataBytes
 }
 
 func conditionOperandItems(condition Condition) []Operand {

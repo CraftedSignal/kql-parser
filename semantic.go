@@ -81,8 +81,8 @@ func semanticFromExtraction(result *ParseResult, budget *parseBudget) *SemanticQ
 	budget.reserveOutput(1 + len(result.LetStatements))
 	semantic := &SemanticQuery{
 		Dataflow:            cloneQueryDataflow(result.Dataflow, budget),
-		Warnings:            cloneSemanticStrings(result.Warnings, budget),
-		GroupByExpressions:  cloneSemanticStrings(result.GroupByExpressions, budget),
+		Warnings:            cloneDataflowStrings(result.Warnings, budget),
+		GroupByExpressions:  cloneDataflowStrings(result.GroupByExpressions, budget),
 		Conditions:          cloneSemanticConditions(result.Conditions, budget),
 		DataSources:         cloneSemanticStrings(result.DataSources, budget),
 		LetStatements:       append([]LetStatement(nil), result.LetStatements...),
@@ -94,11 +94,19 @@ func semanticFromExtraction(result *ParseResult, budget *parseBudget) *SemanticQ
 		Errors:              cloneSemanticStrings(result.Errors, budget),
 	}
 	if len(result.Aggregations) != 0 {
-		budget.reserveOutput(len(result.Aggregations))
+		budget.reserveMetadata(len(result.Aggregations), 0)
+		for _, aggregation := range result.Aggregations {
+			budget.step()
+			budget.reserveMetadataStrings(0, aggregation.StageID, aggregation.BindingID, aggregation.Function, aggregation.Field, aggregation.Column)
+		}
 		semantic.Aggregations = append([]Aggregation(nil), result.Aggregations...)
 	}
 	if len(result.Pipelines) != 0 {
-		budget.reserveOutput(len(result.Pipelines))
+		budget.reserveMetadata(len(result.Pipelines), 0)
+		for _, pipeline := range result.Pipelines {
+			budget.step()
+			budget.reserveMetadataStrings(0, pipeline.Operator, pipeline.Source)
+		}
 		semantic.Pipelines = append([]Pipeline(nil), result.Pipelines...)
 	}
 	semantic.Expression = semanticExpressionFromParseExpression(result.Expression, semantic.Conditions, budget)
@@ -240,6 +248,7 @@ func cloneSemanticConditions(conditions []Condition, budget *parseBudget) []Cond
 func cloneSemanticCondition(condition Condition, budget *parseBudget) *Condition {
 	budget.step()
 	budget.reserveOutput(1)
+	budget.reserveMetadataStrings(0, condition.StageID, condition.InputScopeID)
 	copy := condition
 	copy.Alternatives = cloneSemanticStrings(condition.Alternatives, budget)
 	copy.RHS = cloneOperand(condition.RHS, budget)

@@ -180,6 +180,7 @@ func cloneScalarPredicate(scalar *ScalarPredicate, budgets ...*parseBudget) *Sca
 		return nil
 	}
 	budget.reserveOutput(1)
+	budget.reserveMetadataStrings(0, scalar.StageID, scalar.InputScopeID)
 	copy := *scalar
 	return &copy
 }

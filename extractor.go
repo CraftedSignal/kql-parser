@@ -5913,8 +5913,8 @@ func extractConditionsSource(source kqlExtractionSource, budget *parseBudget) (r
 		dataflow = buildKQLDataflow(tree, owners, extractor, budget)
 		for _, diagnostic := range dataflow.Diagnostics {
 			budget.step()
+			budget.reserveMetadataStrings(1, "dataflow:", diagnostic.Code, ": ", diagnostic.Message)
 			warning := fmt.Sprintf("dataflow:%s: %s", diagnostic.Code, diagnostic.Message)
-			budget.reserveOutput(1 + len(warning))
 			dataflowWarnings = append(dataflowWarnings, warning)
 		}
 	}
@@ -8632,11 +8632,12 @@ func groupORConditionsByExpression(conditions []Condition, expression *Condition
 		}
 		for i, item := range items {
 			budget.step()
-			key := operandIdentity(&item, budget)
+			key, metadataBytes := operandIdentityParts(&item, budget)
 			if g.seen[key] {
 				continue
 			}
-			budget.reserveOutput(len(key))
+			budget.reserveOutput(len(key) - metadataBytes)
+			budget.reserveMetadata(0, metadataBytes)
 			g.seen[key] = true
 			g.items = append(g.items, item)
 			if i < len(values) {

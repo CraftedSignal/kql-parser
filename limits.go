@@ -12,21 +12,24 @@ import (
 // They bound accepted input and cooperative work, not ANTLR's peak memory or
 // wall-clock time between token-stream callbacks.
 type parseLimits struct {
-	maxInputBytes   int
-	maxNestingDepth int
-	maxTokens       int
-	maxWork         int
-	maxOutputItems  int
+	maxInputBytes    int
+	maxNestingDepth  int
+	maxTokens        int
+	maxWork          int
+	maxOutputItems   int
+	maxMetadataItems int
+	maxMetadataBytes int
 }
 
 func defaultParseLimits() parseLimits {
-	return parseLimits{128 << 10, 16, 4096, 1000000, 4096}
+	return parseLimits{128 << 10, 16, 4096, 1000000, 4096, 4096, 1 << 20}
 }
 
 type parseBudget struct {
-	ctx                  context.Context
-	limits               parseLimits
-	work, tokens, output int
+	ctx                          context.Context
+	limits                       parseLimits
+	work, tokens, output         int
+	metadataItems, metadataBytes int
 }
 
 type budgetAbort struct{ err error }
@@ -89,6 +92,41 @@ func (b *parseBudget) reserveOutput(items int) {
 		b.reject("output items")
 	}
 	b.output += items
+}
+
+// Additive provenance has one request-shared allowance, independent of the
+// legacy operand/condition output units. Both dimensions are reserved before
+// growth, including every owned recursive and semantic copy.
+func (b *parseBudget) reserveMetadata(items, textBytes int) {
+	if b == nil {
+		return
+	}
+	b.check()
+	if items < 0 || items > b.limits.maxMetadataItems-b.metadataItems {
+		b.reject("metadata items")
+	}
+	if textBytes < 0 || textBytes > b.limits.maxMetadataBytes-b.metadataBytes {
+		b.reject("metadata bytes")
+	}
+	b.metadataItems += items
+	b.metadataBytes += textBytes
+}
+
+// Sum string lengths using bounded subtraction so even a collection of large
+// strings cannot wrap before the atomic two-dimensional reservation.
+func (b *parseBudget) reserveMetadataStrings(items int, values ...string) {
+	if b == nil {
+		return
+	}
+	b.check()
+	textBytes := 0
+	for _, value := range values {
+		if len(value) > b.limits.maxMetadataBytes-textBytes {
+			b.reject("metadata bytes")
+		}
+		textBytes += len(value)
+	}
+	b.reserveMetadata(items, textBytes)
 }
 
 func (b *parseBudget) outputSize(items int) {
