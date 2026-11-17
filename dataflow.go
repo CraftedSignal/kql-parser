@@ -94,7 +94,7 @@ type kqlDataflowBuilder struct {
 }
 
 func buildKQLDataflow(tree antlr.Tree, owners *kqlSourceOwners, extractor *conditionExtractor, budget *parseBudget) *QueryDataflow {
-	budget.reserveOutput(1)
+	budget.reserveMetadata(1, 0)
 	b := &kqlDataflowBuilder{flow: &QueryDataflow{Complete: true}, extractor: extractor, owners: owners, budget: budget, current: make(map[int]string), stageByPosition: make(map[dataflowOperatorInfo]int), stageBySearch: make(map[ISearchOperatorContext]int), stageByOwner: make(map[int]int), tombstones: make(map[int]bool), ownerPipeline: make(map[int]int), lastPipeStage: make(map[int]int)}
 	b.ownerPipeline[owners.source.SelectedOwnerID] = extractor.queryPipeline
 	var walk func(antlr.Tree)
@@ -167,11 +167,11 @@ func buildKQLDataflow(tree antlr.Tree, owners *kqlSourceOwners, extractor *condi
 		}
 	}
 	if selected, ok := b.current[extractor.queryPipeline]; ok {
-		budget.reserveOutput(len(selected))
+		budget.reserveMetadataStrings(0, selected)
 		b.flow.OutputScopeID = selected
 	} else if extractor.queryPipeline >= 0 {
 		selected := b.inputScope(extractor.queryPipeline)
-		budget.reserveOutput(len(selected))
+		budget.reserveMetadataStrings(0, selected)
 		b.flow.OutputScopeID = selected
 	}
 	b.annotate(extractor.conditions)
@@ -200,7 +200,7 @@ func (b *kqlDataflowBuilder) leadingSearch(ctx *SearchOperatorContext) {
 	input := b.inputScope(info.Pipeline)
 	id := fmt.Sprintf("t%d", len(b.flow.Stages))
 	b.budget.input(source)
-	b.budget.reserveOutput(1 + len(id) + len(occurrence.Command) + len(source) + len("filter") + 1 + len(input))
+	b.budget.reserveMetadataStrings(2, id, occurrence.Command, source, "filter", input)
 	stage := DataflowStage{ID: id, Pipeline: info.Pipeline, PipeStage: info.PipeStage, Command: occurrence.Command, Source: source, Effect: "filter", Inputs: []ScopeReference{{ScopeID: input}}}
 	if occurrence.Rewrite != "" {
 		stage.Effect = "opaque"
@@ -211,7 +211,7 @@ func (b *kqlDataflowBuilder) leadingSearch(ctx *SearchOperatorContext) {
 		mode = "opaque"
 	}
 	output := b.scope(info.Pipeline, mode, input, "", nil, nil)
-	b.budget.reserveOutput(len(output))
+	b.budget.reserveMetadataStrings(0, output)
 	stage.OutputScopeID = output
 	b.current[info.Pipeline] = stage.OutputScopeID
 	b.stageByPosition[info] = len(b.flow.Stages)
@@ -234,7 +234,7 @@ func (b *kqlDataflowBuilder) attachLocalUnionInputs() {
 				continue
 			}
 			scope := b.inputScope(pipeline)
-			b.budget.reserveOutput(1 + len(scope))
+			b.budget.reserveMetadataStrings(1, scope)
 			stage.Inputs = append(stage.Inputs, ScopeReference{ScopeID: scope})
 		}
 	}
@@ -264,12 +264,12 @@ func (b *kqlDataflowBuilder) scope(pipeline int, mode, parent, source string, bi
 	b.budget.step()
 	b.budget.input(source)
 	id := fmt.Sprintf("s%d", len(b.flow.Scopes))
-	b.budget.reserveOutput(1 + len(id) + len(mode) + len(parent) + len(source) + len(bindingIDs) + len(removed))
+	b.budget.reserveMetadataStrings(1+len(bindingIDs)+len(removed), id, mode, parent, source)
 	for _, value := range bindingIDs {
-		b.budget.reserveOutput(len(value))
+		b.budget.reserveMetadataStrings(0, value)
 	}
 	for _, value := range removed {
-		b.budget.reserveOutput(len(value))
+		b.budget.reserveMetadataStrings(0, value)
 	}
 	b.flow.Scopes = append(b.flow.Scopes, FieldScope{ID: id, Pipeline: pipeline, Mode: mode, ParentID: parent, Source: source, BindingIDs: append([]string(nil), bindingIDs...), RemovedFields: append([]string(nil), removed...)})
 	return id
@@ -280,7 +280,7 @@ func (b *kqlDataflowBuilder) addBinding(stage *DataflowStage, field, kind, expre
 	b.budget.input(expression)
 	id := fmt.Sprintf("b%d", len(b.flow.Bindings))
 	binding := FieldBinding{ID: id, StageID: stage.ID, Ordinal: len(stage.BindingIDs), Field: field, Kind: kind, Expression: expression, InputScopeID: readScope}
-	b.budget.reserveOutput(1 + len(id) + len(stage.ID) + len(field) + len(kind) + len(expression) + len(readScope) + 1 + len(id))
+	b.budget.reserveMetadataStrings(2, id, stage.ID, field, kind, expression, readScope, id)
 	b.flow.Bindings = append(b.flow.Bindings, binding)
 	stage.BindingIDs = append(stage.BindingIDs, id)
 	return id
@@ -292,7 +292,7 @@ func (b *kqlDataflowBuilder) authoredIdentifier(ctx antlr.ParserRuleContext) str
 
 func (b *kqlDataflowBuilder) diagnostic(stage *DataflowStage, code, message string) {
 	b.budget.step()
-	b.budget.reserveOutput(1 + len(code) + len(stage.ID) + len(message))
+	b.budget.reserveMetadataStrings(1, code, stage.ID, message)
 	b.flow.Complete = false
 	b.flow.Diagnostics = append(b.flow.Diagnostics, DataflowDiagnostic{Code: code, StageID: stage.ID, Message: message})
 }
@@ -314,7 +314,7 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 	b.ownerPipeline[occurrence.OwnerID] = info.Pipeline
 	b.emitPriorTombstones(occurrence.OwnerID, occurrence.Span.Start)
 	input := b.inputScope(info.Pipeline)
-	b.budget.reserveOutput(1 + len(input))
+	b.budget.reserveMetadataStrings(1, input)
 	stage := DataflowStage{ID: fmt.Sprintf("t%d", len(b.flow.Stages)), Pipeline: info.Pipeline, PipeStage: info.PipeStage, Command: occurrence.Command, Source: source, Inputs: []ScopeReference{{ScopeID: input}}}
 	if ctx.JoinOperator() != nil && ctx.JoinOperator().TabularExpression() != nil {
 		for i := range b.extractor.joins {
@@ -326,7 +326,7 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 				sourceAbort("join child has no output scope")
 			}
 			path := "joins/" + strconv.Itoa(i)
-			b.budget.reserveOutput(1 + len(path) + len(join.Subsearch.Dataflow.OutputScopeID))
+			b.budget.reserveMetadataStrings(1, path, join.Subsearch.Dataflow.OutputScopeID)
 			stage.Inputs = append(stage.Inputs, ScopeReference{QueryPath: path, ScopeID: join.Subsearch.Dataflow.OutputScopeID})
 			break
 		}
@@ -369,7 +369,7 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 	default:
 		stage.Effect = "opaque"
 	}
-	b.budget.reserveOutput(1 + len(stage.ID) + len(stage.Command) + len(stage.Source) + len(stage.Effect))
+	b.budget.reserveMetadataStrings(1, stage.ID, stage.Command, stage.Source, stage.Effect)
 	stageIndex := len(b.flow.Stages)
 	firstBinding := len(b.flow.Bindings)
 	// Keep the record address stable while collecting its bindings.
@@ -496,6 +496,7 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 				if candidate.PipeStage != info.PipeStage || candidate.Pipeline != info.Pipeline || candidate.Column != agg.Column || candidate.BindingID != "" {
 					sourceAbort("aggregate occurrence owner is invalid")
 				}
+				b.budget.reserveMetadataStrings(0, stage.ID, bindingID)
 				candidate.StageID, candidate.BindingID = stage.ID, bindingID
 				paired = true
 				break
@@ -546,7 +547,7 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 		mode = "closed"
 	}
 	output := b.scope(info.Pipeline, mode, input, "", stage.BindingIDs, removed)
-	b.budget.reserveOutput(len(output))
+	b.budget.reserveMetadataStrings(0, output)
 	stage.OutputScopeID = output
 	b.current[info.Pipeline] = output
 	b.flow.Stages[stageIndex] = stage
@@ -569,10 +570,10 @@ func (b *kqlDataflowBuilder) emitPriorTombstones(ownerID, before int) {
 		b.budget.input(b.owners.source.Original[occurrence.Span.Start:occurrence.Span.End])
 		id := fmt.Sprintf("t%d", len(b.flow.Stages))
 		text := b.owners.source.Original[occurrence.Span.Start:occurrence.Span.End]
-		b.budget.reserveOutput(1 + len(id) + len(occurrence.Command) + len(text) + len("opaque") + 1 + len(input))
+		b.budget.reserveMetadataStrings(2, id, occurrence.Command, text, "opaque", input)
 		stage := DataflowStage{ID: id, Pipeline: pipeline, PipeStage: b.lastPipeStage[pipeline], Command: occurrence.Command, Source: text, Effect: "opaque", Inputs: []ScopeReference{{ScopeID: input}}}
 		output := b.scope(pipeline, "opaque", input, "", nil, nil)
-		b.budget.reserveOutput(len(output))
+		b.budget.reserveMetadataStrings(0, output)
 		stage.OutputScopeID = output
 		b.flow.Stages = append(b.flow.Stages, stage)
 		b.stageByOwner[occurrence.ID] = len(b.flow.Stages) - 1
@@ -639,7 +640,7 @@ func (b *kqlDataflowBuilder) lookupValue(scopeID, field string) FieldBindingRef 
 
 func (b *kqlDataflowBuilder) lookup(scopeID, field string) *FieldBindingRef {
 	ref := b.lookupValue(scopeID, field)
-	b.budget.reserveOutput(1 + len(ref.ScopeID) + len(ref.Kind) + len(ref.BindingID))
+	b.budget.reserveMetadataStrings(1, ref.ScopeID, ref.Kind, ref.BindingID)
 	return &ref
 }
 
@@ -655,6 +656,7 @@ func (b *kqlDataflowBuilder) annotate(conditions []Condition) {
 		if len(stage.Inputs) == 0 {
 			continue
 		}
+		b.budget.reserveMetadataStrings(0, stage.ID, stage.Inputs[0].ScopeID)
 		condition.StageID, condition.InputScopeID = stage.ID, stage.Inputs[0].ScopeID
 		condition.FieldBinding = b.lookup(condition.InputScopeID, condition.Field)
 		b.annotateOperand(condition.RHS, condition.InputScopeID, &stage)
@@ -753,6 +755,7 @@ func (b *kqlDataflowBuilder) annotateLeaves() {
 		if !ok || len(stage.Inputs) == 0 {
 			continue
 		}
+		b.budget.reserveMetadataStrings(0, stage.ID, stage.Inputs[0].ScopeID)
 		leaf.Scalar.StageID, leaf.Scalar.InputScopeID = stage.ID, stage.Inputs[0].ScopeID
 	}
 	for ctx, leaf := range b.extractor.searchLeaves {
@@ -769,6 +772,7 @@ func (b *kqlDataflowBuilder) annotateLeaves() {
 		if !ok || len(stage.Inputs) == 0 {
 			continue
 		}
+		b.budget.reserveMetadataStrings(0, stage.ID, stage.Inputs[0].ScopeID)
 		leaf.Search.StageID, leaf.Search.InputScopeID = stage.ID, stage.Inputs[0].ScopeID
 	}
 }
@@ -786,7 +790,7 @@ func cloneFieldBindingRef(ref *FieldBindingRef, budget *parseBudget) *FieldBindi
 	if ref == nil {
 		return nil
 	}
-	budget.reserveOutput(1 + len(ref.ScopeID) + len(ref.Kind) + len(ref.BindingID))
+	budget.reserveMetadataStrings(1, ref.ScopeID, ref.Kind, ref.BindingID)
 	copy := *ref
 	return &copy
 }
@@ -796,53 +800,53 @@ func cloneQueryDataflow(flow *QueryDataflow, budget *parseBudget) *QueryDataflow
 	if flow == nil {
 		return nil
 	}
-	budget.reserveOutput(1 + len(flow.OutputScopeID))
+	budget.reserveMetadataStrings(1, flow.OutputScopeID)
 	copy := &QueryDataflow{Complete: flow.Complete, OutputScopeID: flow.OutputScopeID}
 	if len(flow.Scopes) > 0 {
-		budget.reserveOutput(len(flow.Scopes))
+		budget.reserveMetadata(len(flow.Scopes), 0)
 		copy.Scopes = make([]FieldScope, len(flow.Scopes))
 		for i, scope := range flow.Scopes {
 			budget.step()
 			budget.input(scope.Source)
-			budget.reserveOutput(len(scope.ID) + len(scope.ParentID) + len(scope.Mode) + len(scope.Source))
+			budget.reserveMetadataStrings(0, scope.ID, scope.ParentID, scope.Mode, scope.Source)
 			copy.Scopes[i] = scope
 			copy.Scopes[i].BindingIDs = cloneDataflowStrings(scope.BindingIDs, budget)
 			copy.Scopes[i].RemovedFields = cloneDataflowStrings(scope.RemovedFields, budget)
 		}
 	}
 	if len(flow.Stages) > 0 {
-		budget.reserveOutput(len(flow.Stages))
+		budget.reserveMetadata(len(flow.Stages), 0)
 		copy.Stages = make([]DataflowStage, len(flow.Stages))
 		for i, stage := range flow.Stages {
 			budget.step()
 			budget.input(stage.Source)
-			budget.reserveOutput(len(stage.ID) + len(stage.Command) + len(stage.Source) + len(stage.Effect) + len(stage.OutputScopeID))
+			budget.reserveMetadataStrings(0, stage.ID, stage.Command, stage.Source, stage.Effect, stage.OutputScopeID)
 			copy.Stages[i] = stage
 			copy.Stages[i].BindingIDs = cloneDataflowStrings(stage.BindingIDs, budget)
 			if len(stage.Inputs) > 0 {
-				budget.reserveOutput(len(stage.Inputs))
+				budget.reserveMetadata(len(stage.Inputs), 0)
 				for _, input := range stage.Inputs {
 					budget.step()
-					budget.reserveOutput(len(input.QueryPath) + len(input.ScopeID))
+					budget.reserveMetadataStrings(0, input.QueryPath, input.ScopeID)
 				}
 				copy.Stages[i].Inputs = append([]ScopeReference(nil), stage.Inputs...)
 			}
 		}
 	}
 	if len(flow.Bindings) > 0 {
-		budget.reserveOutput(len(flow.Bindings))
+		budget.reserveMetadata(len(flow.Bindings), 0)
 		for _, binding := range flow.Bindings {
 			budget.step()
 			budget.input(binding.Expression)
-			budget.reserveOutput(len(binding.ID) + len(binding.StageID) + len(binding.Field) + len(binding.Kind) + len(binding.Expression) + len(binding.InputScopeID))
+			budget.reserveMetadataStrings(0, binding.ID, binding.StageID, binding.Field, binding.Kind, binding.Expression, binding.InputScopeID)
 		}
 		copy.Bindings = append([]FieldBinding(nil), flow.Bindings...)
 	}
 	if len(flow.Diagnostics) > 0 {
-		budget.reserveOutput(len(flow.Diagnostics))
+		budget.reserveMetadata(len(flow.Diagnostics), 0)
 		for _, diagnostic := range flow.Diagnostics {
 			budget.step()
-			budget.reserveOutput(len(diagnostic.Code) + len(diagnostic.StageID) + len(diagnostic.Message))
+			budget.reserveMetadataStrings(0, diagnostic.Code, diagnostic.StageID, diagnostic.Message)
 		}
 		copy.Diagnostics = append([]DataflowDiagnostic(nil), flow.Diagnostics...)
 	}
@@ -854,10 +858,10 @@ func cloneDataflowStrings(values []string, budget *parseBudget) []string {
 	if len(values) == 0 {
 		return nil
 	}
-	budget.reserveOutput(len(values))
+	budget.reserveMetadata(len(values), 0)
 	for _, value := range values {
 		budget.step()
-		budget.reserveOutput(len(value))
+		budget.reserveMetadataStrings(0, value)
 	}
 	return append([]string(nil), values...)
 }

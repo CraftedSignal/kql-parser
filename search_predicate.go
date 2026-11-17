@@ -25,6 +25,7 @@ func cloneSearchPredicate(search *SearchPredicate, budget *parseBudget) *SearchP
 		return nil
 	}
 	budget.reserveOutput(1)
+	budget.reserveMetadataStrings(0, search.StageID, search.InputScopeID)
 	copy := *search
 	copy.TableSources = cloneSemanticStrings(search.TableSources, budget)
 	return &copy

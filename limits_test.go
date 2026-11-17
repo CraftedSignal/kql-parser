@@ -114,19 +114,19 @@ func TestAnalyzeContextRejectsCanceledRequest(t *testing.T) {
 
 func TestAnalyzeSharesBudgetWithSemanticConversion(t *testing.T) {
 	limits := defaultParseLimits()
-	// The old tiny cap still fails without exposing a partial graph or filter.
-	limits.maxOutputItems = 9
+	// The graph-specific fixture now uses its own fixed metadata byte cap.
+	limits.maxMetadataBytes = 9
 	query := "T | where x == 1"
-	if result := extractConditionsContext(context.Background(), query, limits); len(result.Conditions) != 0 || result.Dataflow != nil || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "output items") {
+	if result := extractConditionsContext(context.Background(), query, limits); len(result.Conditions) != 0 || result.Dataflow != nil || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "metadata bytes") {
 		t.Fatalf("tiny extraction budget exposed partial output: %+v", result)
 	}
-	if result := analyzeQueryContext(context.Background(), query, limits); len(result.Conditions) != 0 || result.Dataflow != nil || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "output items") {
+	if result := analyzeQueryContext(context.Background(), query, limits); len(result.Conditions) != 0 || result.Dataflow != nil || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "metadata bytes") {
 		t.Fatalf("tiny analysis budget exposed partial output: %+v", result)
 	}
 
-	// The graph-aware cap admits either operation alone but not their combined
-	// output on the shared request budget.
-	limits.maxOutputItems = 100
+	// Either operation fits alone; their owned metadata copies cumulatively
+	// exceed the same fixed byte allowance on one shared request.
+	limits.maxMetadataBytes = 100
 	parsed := extractConditionsContext(context.Background(), query, limits)
 	if len(parsed.Errors) != 0 || len(parsed.Conditions) != 1 || parsed.Dataflow == nil {
 		t.Fatalf("extraction must fit shared-budget fixture: %+v", parsed)
@@ -137,7 +137,7 @@ func TestAnalyzeSharesBudgetWithSemanticConversion(t *testing.T) {
 		t.Fatalf("fresh semantic conversion must fit fixture: %+v", standalone)
 	}
 	result := analyzeQueryContext(context.Background(), query, limits)
-	if len(result.Conditions) != 0 || result.Expression != nil || result.Dataflow != nil || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "output items") {
+	if len(result.Conditions) != 0 || result.Expression != nil || result.Dataflow != nil || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "metadata bytes") {
 		t.Fatalf("semantic conversion must share the exhausted budget without partial output: %+v", result)
 	}
 }

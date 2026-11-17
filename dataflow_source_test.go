@@ -3,6 +3,7 @@ package kql
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/antlr4-go/antlr/v4"
@@ -255,7 +256,7 @@ func TestKQLTinyBudgetStopsInventoryAndRecursiveGraphClone(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			limits := defaultParseLimits()
-			limits.maxOutputItems = tc.cap
+			limits.maxMetadataItems = tc.cap
 			budget, cancel := newParseBudget(context.Background(), limits)
 			defer cancel()
 			defer func() {
@@ -272,7 +273,7 @@ func TestKQLFixedBudgetReachesRecursiveSemanticGraphClone(t *testing.T) {
 	child := &ParseResult{Dataflow: &QueryDataflow{Complete: true, OutputScopeID: "s1", Scopes: []FieldScope{{ID: "s0", Mode: "input", Source: "U"}, {ID: "s1", Mode: "inherit", ParentID: "s0"}}, Stages: []DataflowStage{{ID: "t0", Command: "where", Effect: "filter", Source: "where x==1", Inputs: []ScopeReference{{ScopeID: "s0"}}, OutputScopeID: "s1"}}}}
 	root := &ParseResult{Dataflow: &QueryDataflow{Complete: true, OutputScopeID: "s1", Scopes: []FieldScope{{ID: "s0", Mode: "input", Source: "T"}, {ID: "s1", Mode: "inherit", ParentID: "s0"}}, Stages: []DataflowStage{{ID: "t0", Command: "join", Effect: "retain", Source: "join (U)", Inputs: []ScopeReference{{ScopeID: "s0"}, {QueryPath: "joins/0", ScopeID: "s1"}}, OutputScopeID: "s1"}}}, Joins: []JoinInfo{{Subsearch: child}}}
 	limits := defaultParseLimits()
-	limits.maxOutputItems = 80
+	limits.maxMetadataBytes = 80
 	rootOnly := *root
 	rootOnly.Joins = nil
 	first, cancelFirst := newParseBudget(context.Background(), limits)
@@ -284,11 +285,10 @@ func TestKQLFixedBudgetReachesRecursiveSemanticGraphClone(t *testing.T) {
 	defer cancelSecond()
 	defer func() {
 		got, ok := recover().(budgetAbort)
-		t.Logf("fixed cap=%d root-only=%d recursive-at-failure=%d", limits.maxOutputItems, first.output, second.output)
-		// At 76, the recursive clone has charged its graph header, scope
-		// array, and first child scope; the next child scope exceeds cap 80.
-		if !ok || got.err == nil || second.output < 76 {
-			t.Fatalf("budget did not fail inside recursive child graph clone: error=%v root=%d recursive=%d", got, first.output, second.output)
+		t.Logf("fixed cap=%d root-only=%d recursive-at-failure=%d", limits.maxMetadataBytes, first.metadataBytes, second.metadataBytes)
+		// The root fits; recursive owned graph text consumes the remainder.
+		if !ok || got.err == nil || !strings.Contains(got.err.Error(), "metadata bytes") || second.metadataBytes <= first.metadataBytes {
+			t.Fatalf("budget did not fail inside recursive child graph clone: error=%v root=%d recursive=%d", got, first.metadataBytes, second.metadataBytes)
 		}
 	}()
 	semanticFromExtraction(root, second)
