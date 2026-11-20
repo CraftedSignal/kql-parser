@@ -104,7 +104,7 @@ type JoinInfo struct {
 	RightTable    string       `json:"right_table,omitempty"`    // Table name if right side is a simple table reference
 	Subsearch     *ParseResult `json:"subsearch,omitempty"`      // Recursively parsed right-side expression (if subquery)
 	PipeStage     int          `json:"pipe_stage"`               // Pipeline stage where join appears
-	ExposedFields []string     `json:"exposed_fields,omitempty"` // Fields the right side makes available
+	ExposedFields []string     `json:"exposed_fields,omitempty"` // Fields the right side makes available, sorted
 }
 
 // LetStatement captures a KQL let variable definition.
@@ -6189,6 +6189,8 @@ func deriveExposedFields(subResult *ParseResult, joinFields []string) []string {
 	for f := range fieldSet {
 		result = append(result, f)
 	}
+	// Map iteration order varies between calls.
+	sort.Strings(result)
 	return result
 }
 
