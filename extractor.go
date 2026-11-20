@@ -5932,8 +5932,10 @@ func extractConditionsSource(source kqlExtractionSource, budget *parseBudget) (r
 	if !containsScalarExpression(expression, budget) && !hasPortableFieldConditions(conditions) {
 		var note string
 		var extracted []Condition
-		allowGenericKeyword := len(lexerErrors.errors) != 0 || len(parserErrors.errors) != 0 ||
-			(!hasStructuredKQLQuery(tree, budget) && len(letStatements) == 0)
+		// A join child (source.Mapped set) parsed as a tabular expression in
+		// its parent, so a lone name there is a table, not a bare term.
+		allowGenericKeyword := source.Mapped == nil && (len(lexerErrors.errors) != 0 || len(parserErrors.errors) != 0 ||
+			(!hasStructuredKQLQuery(tree, budget) && len(letStatements) == 0))
 		extracted, note = extractPortableConditions(query, normalizedQuery, allowGenericKeyword)
 		portableStart := len(conditions)
 		for _, condition := range extracted {
