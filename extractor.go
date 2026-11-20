@@ -3,6 +3,7 @@ package kql
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -7311,7 +7312,7 @@ func extractLetNames(query string) map[string]bool {
 }
 
 func extractDataSourcesFromQuery(query string, letNames map[string]bool) []string {
-	query = normalizeNewlines(query)
+	query = stripLineComments(normalizeNewlines(query))
 	var sources []string
 	for _, line := range strings.Split(query, "\n") {
 		_, rhs, ok := parseLetAssignment(strings.TrimSpace(line))
@@ -7392,7 +7393,6 @@ func splitStatements(query string) []string {
 }
 
 func extractDataSourcesFromStatement(statement string, letNames map[string]bool, allowLeadingSource bool) []string {
-	statement = strings.TrimSpace(trimLineComment(statement))
 	statement = strings.TrimLeft(statement, " \t\r\n(),")
 	statement = stripOuterParens(statement)
 	if statement == "" {
@@ -7445,14 +7445,11 @@ func extractParenthesizedSources(statement, keyword string, letNames map[string]
 }
 
 func extractUnionSources(statement string, letNames map[string]bool) []string {
-	rest := strings.TrimSpace(statement[len("union "):])
+	rest := skipOperatorParameters(strings.TrimSpace(statement[len("union "):]))
 	var sources []string
 	for _, part := range splitCommaList(rest) {
 		part = strings.TrimSpace(part)
 		fields := strings.Fields(part)
-		for len(fields) > 0 && strings.Contains(fields[0], "=") {
-			fields = fields[1:]
-		}
 		if len(fields) == 0 {
 			continue
 		}
@@ -7463,15 +7460,24 @@ func extractUnionSources(statement string, letNames map[string]bool) []string {
 	return sources
 }
 
-func extractJoinSources(statement string, letNames map[string]bool) []string {
-	rest := strings.TrimSpace(statement[len("join "):])
+// operatorParameter matches one leading Name=Value parameter of a join or
+// union, such as kind=inner or withsource = SourceTable.
+var operatorParameter = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.]*\s*=\s*[^\s(),]+\s*`)
+
+// skipOperatorParameters drops the leading parameters, so that a parameter
+// name written with spaces around "=" is never read as a table.
+func skipOperatorParameters(text string) string {
 	for {
-		fields := strings.Fields(rest)
-		if len(fields) == 0 || !strings.Contains(fields[0], "=") {
-			break
+		loc := operatorParameter.FindStringIndex(text)
+		if loc == nil {
+			return text
 		}
-		rest = strings.TrimSpace(strings.TrimPrefix(rest, fields[0]))
+		text = text[loc[1]:]
 	}
+}
+
+func extractJoinSources(statement string, letNames map[string]bool) []string {
+	rest := skipOperatorParameters(strings.TrimSpace(statement[len("join "):]))
 	if strings.HasPrefix(rest, "(") {
 		close := findMatchingParen(rest, 0)
 		if close > 0 {
@@ -7493,6 +7499,8 @@ func leadingDataSource(statement string, letNames map[string]bool) string {
 			"take", "top", "count", "render", "evaluate", "mv-expand", "mv-apply",
 			"parse", "distinct", "lookup", "print", "range", "datatable",
 			"externaldata", "dynamic", "pack_array", "pack", "bag_pack",
+			"limit", "serialize", "sample", "getschema", "as", "invoke", "consume",
+			"facet", "reduce", "fork", "scan", "partition", "filter", "mvexpand",
 		} {
 			if fields[0] == command || strings.HasPrefix(fields[0], command+"(") {
 				return ""
@@ -8482,6 +8490,32 @@ func indexOutsideQuotesAndParens(s, token string) int {
 		}
 	}
 	return -1
+}
+
+// stripLineComments removes // comments outside string literals and keeps
+// their line breaks, so commented-out text never names a data source.
+func stripLineComments(query string) string {
+	var b strings.Builder
+	last := 0
+	for i := 0; i < len(query); i++ {
+		if isStringLiteralStart(query, i) {
+			end := stringLiteralEnd(query, i)
+			if end < 0 {
+				break
+			}
+			i = end - 1
+			continue
+		}
+		if strings.HasPrefix(query[i:], "//") {
+			b.WriteString(query[last:i])
+			for i < len(query) && query[i] != '\n' {
+				i++
+			}
+			last = i
+		}
+	}
+	b.WriteString(query[last:])
+	return b.String()
 }
 
 func trimLineComment(line string) string {
