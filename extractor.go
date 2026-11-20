@@ -159,6 +159,7 @@ type conditionExtractor struct {
 	joins               []JoinInfo
 	currentStage        int
 	inSubquery          int // depth of subquery nesting
+	inLookup            int // depth of lookup operators, whose right side filters dimension rows
 	inFunctionCall      int // depth of function call nesting (countif, sumif, etc.)
 	negated             bool
 	lastLogicalOp       string
@@ -6126,6 +6127,17 @@ func (e *conditionExtractor) ExitJoinOperator(ctx *JoinOperatorContext) {
 	}
 }
 
+// EnterLookupOperator marks a lookup's right side: a dimension table whose
+// filters select its own rows, not rows of the enclosing pipeline.
+func (e *conditionExtractor) EnterLookupOperator(*LookupOperatorContext) {
+	e.inLookup++
+}
+
+// ExitLookupOperator leaves a lookup.
+func (e *conditionExtractor) ExitLookupOperator(*LookupOperatorContext) {
+	e.inLookup--
+}
+
 // extractTabularExpressionText extracts the original query text for a tabular expression
 func (e *conditionExtractor) extractTabularExpressionText(ctx ITabularExpressionContext) string {
 	text, _ := e.extractTabularExpressionWithOrigins(ctx)
@@ -6669,7 +6681,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 	if e.inSearch > 0 || !e.ownsDataflow(ctx) {
 		return
 	}
-	if e.inSubquery > 0 || e.inFunctionCall > 0 {
+	if e.inSubquery > 0 || e.inLookup > 0 || e.inFunctionCall > 0 {
 		return
 	}
 	if !isKQLFilterContext(ctx, e.budget) {
@@ -7113,9 +7125,9 @@ func (e *conditionExtractor) EnterOrExpression(_ *OrExpressionContext) {}
 // follows this one. After the last branch the operator around the whole OR
 // expression applies: in (a or b) and c, c is ANDed.
 func (e *conditionExtractor) ExitAndExpression(ctx *AndExpressionContext) {
-	// Boolean expressions inside scalar/aggregation arguments do not connect
-	// the surrounding row filters.
-	if e.inFunctionCall > 0 || e.inSearch > 0 || !e.ownsDataflow(ctx) {
+	// Boolean expressions inside scalar/aggregation arguments or a lookup's
+	// right side do not connect the surrounding row filters.
+	if e.inFunctionCall > 0 || e.inLookup > 0 || e.inSearch > 0 || !e.ownsDataflow(ctx) {
 		return
 	}
 	orCtx, ok := ctx.GetParent().(*OrExpressionContext)
@@ -7413,6 +7425,9 @@ func extractDataSourcesFromStatement(statement string, letNames map[string]bool,
 		return extractUnionSources(statement, letNames)
 	case strings.HasPrefix(lower, "join "):
 		return extractJoinSources(statement, letNames)
+	case strings.HasPrefix(lower, "lookup "):
+		// A lookup's right side has the form of a join's.
+		return extractJoinSources("join "+statement[len("lookup "):], letNames)
 	}
 
 	if !allowLeadingSource {
