@@ -334,7 +334,7 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 	b.budget.input(source)
 	if occurrence.Rewrite != "" {
 		stage.Effect = "opaque"
-		if occurrence.Rewrite == "normalizeSummarizeBy" || occurrence.Rewrite == "normalizeTopNested" {
+		if occurrence.Rewrite == "normalizeSummarizeBy" || occurrence.Rewrite == "normalizeTopNested" || occurrence.Rewrite == "normalizePartitionOperator" {
 			kept := b.extractor.aggregations[:0]
 			keptContexts := b.extractor.aggregationContexts[:0]
 			for i, aggregation := range b.extractor.aggregations {
