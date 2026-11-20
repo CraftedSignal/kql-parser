@@ -62,8 +62,11 @@ interpret unresolved scalar text.
 Null/empty checks with constant or computed arguments, and list operators
 with computed or reference operands, now remain complete scalar predicates.
 Literal list elements remain condition values; quoted literals never become
-references. Representable range bounds use `ValueReference` for columns and
-`Value` for literals.
+references. An inline `dynamic([...])` array of literals in such a list is
+flattened into its elements, as Kusto does and as a `let`-bound array already
+was; any other `dynamic` list operand remains a scalar predicate.
+Representable range bounds use `ValueReference` for columns and `Value` for
+literals.
 
 Inline tabular membership such as `Account in ((SigninLogs | project Account))`
 is now a `BooleanScalar` leaf with that complete source as `Text`. It does not
