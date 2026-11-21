@@ -1426,11 +1426,12 @@ func convertTupleUnpacking(query string, recorders ...*kqlSourceRecorder) string
 	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
 		recorder = recorders[0]
 	}
+	code := kqlSyntaxView(query, recorders...)
 	i := 0
 
 	for i < len(query) {
 		// Look for pattern: whitespace or beginning + ( + identifiers with commas + ) + whitespace + =
-		if query[i] == '(' {
+		if code[i] == '(' {
 			// Check if this looks like tuple unpacking
 			// Find the closing paren
 			end := i + 1
@@ -1827,7 +1828,7 @@ func handleUnicodeEscape(hex string, result *strings.Builder) {
 // normalizeSummarizeBy adds a dummy aggregation when summarize has only BY clause
 // KQL allows "summarize by x" but grammar requires aggregation before BY
 func normalizeSummarizeBy(query string, recorders ...*kqlSourceRecorder) string {
-	lowerQuery := strings.ToLower(query)
+	lowerQuery := kqlSyntaxView(query, recorders...)
 	var b strings.Builder
 	b.Grow(len(query) + 32)
 	lastCopied := 0
@@ -1880,7 +1881,7 @@ func normalizeSummarizeBy(query string, recorders ...*kqlSourceRecorder) string 
 // stripReturnTypeAnnotations removes return type annotations from evaluate statements
 // evaluate func(x) : (col:type, ...) -> evaluate func(x)
 func stripReturnTypeAnnotations(query string, recorders ...*kqlSourceRecorder) string {
-	lowerQuery := strings.ToLower(query)
+	lowerQuery := kqlSyntaxView(query, recorders...)
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
@@ -2022,7 +2023,7 @@ func stripReturnTypeAnnotations(query string, recorders ...*kqlSourceRecorder) s
 // lookup (union T1, T2) -> lookup (LookupTable)
 // The grammar only supports simple table references inside lookup
 func normalizeLookupSubquery(query string, recorders ...*kqlSourceRecorder) string {
-	lowerQuery := strings.ToLower(query)
+	lowerQuery := kqlSyntaxView(query, recorders...)
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
@@ -2121,7 +2122,7 @@ func normalizeLookupSubquery(query string, recorders ...*kqlSourceRecorder) stri
 // | mv-apply x = col on (subquery) -> (removed entirely)
 // The mv-apply with subquery isn't needed for condition extraction
 func stripMvApplySubquery(query string, recorders ...*kqlSourceRecorder) string {
-	lowerQuery := strings.ToLower(query)
+	lowerQuery := kqlSyntaxView(query, recorders...)
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
@@ -2233,7 +2234,7 @@ func stripMvApplySubquery(query string, recorders ...*kqlSourceRecorder) string 
 // parse field with 'pattern' var1 'pattern2' var2 -> (entire statement removed)
 // The parse operator extracts substrings but isn't needed for condition extraction
 func stripParseStatements(query string, recorders ...*kqlSourceRecorder) string {
-	lowerQuery := strings.ToLower(query)
+	lowerQuery := kqlSyntaxView(query, recorders...)
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
@@ -2413,10 +2414,11 @@ func normalizeNotEqualOperator(query string, recorders ...*kqlSourceRecorder) st
 		recorder = recorders[0]
 	}
 
+	code := kqlSyntaxView(query, recorders...)
 	i := 0
 	for i < len(query) {
 		// Check for <> pattern
-		if i+1 < len(query) && query[i] == '<' && query[i+1] == '>' {
+		if i+1 < len(query) && code[i] == '<' && code[i+1] == '>' {
 			result.WriteString("!=")
 			if recorder != nil {
 				recorder.replace(i, i+2, "!=", "")
@@ -2446,7 +2448,7 @@ func normalizeDistinctColumns(query string, recorders ...*kqlSourceRecorder) str
 		recorder = recorders[0]
 	}
 	// Find each distinct clause
-	lowerQuery := strings.ToLower(query)
+	lowerQuery := kqlSyntaxView(query, recorders...)
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
@@ -2774,7 +2776,7 @@ func stripRenderParameters(query string, recorders ...*kqlSourceRecorder) string
 		recorder = recorders[0]
 	}
 	// Find render operator
-	lowerQuery := strings.ToLower(query)
+	lowerQuery := kqlSyntaxView(query, recorders...)
 	idx := strings.Index(lowerQuery, "| render ")
 	if idx == -1 {
 		idx = strings.Index(lowerQuery, "|render ")
@@ -3444,7 +3446,7 @@ func hasOperatorTokenAt(query string, idx int, token string) bool {
 // removeUnionParam removes all occurrences of a case-insensitive parameter (e.g., "isfuzzy")
 // along with its =value and any trailing comma/whitespace, using a single-pass Builder.
 func removeUnionParam(input string, paramLower string, paramLen int, recorder *kqlSourceRecorder) string {
-	lowerInput := strings.ToLower(input)
+	lowerInput := kqlSyntaxView(input, recorder)
 	var b strings.Builder
 	b.Grow(len(input))
 	lastCopied := 0
@@ -3559,7 +3561,7 @@ func normalizeUnionParameters(query string, recorders ...*kqlSourceRecorder) str
 
 	// Also handle kind= parameter in union
 	{
-		lowerResult := strings.ToLower(result)
+		lowerResult := kqlSyntaxView(result, recorder)
 		var b strings.Builder
 		b.Grow(len(result))
 		lastCopied := 0
@@ -3629,7 +3631,7 @@ func normalizeJoinUnion(query string, recorders ...*kqlSourceRecorder) string {
 	if len(recorders) != 0 {
 		recorder = recorders[0]
 	}
-	lowerQuery := strings.ToLower(query)
+	lowerQuery := kqlSyntaxView(query, recorders...)
 	var b strings.Builder
 	b.Grow(len(query) + 64)
 	lastCopied := 0
@@ -3735,7 +3737,7 @@ func stripJoinHints(query string, recorders ...*kqlSourceRecorder) string {
 	if len(recorders) != 0 {
 		recorder = recorders[0]
 	}
-	lowerQuery := strings.ToLower(query)
+	lowerQuery := kqlSyntaxView(query, recorders...)
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
@@ -3823,9 +3825,10 @@ func replaceUnionWildcard(query string, recorders ...*kqlSourceRecorder) string 
 	b.Grow(len(query) + 64)
 	lastCopied := 0
 	changed := false
+	code := kqlSyntaxView(query, recorders...)
 
 	for i := 0; i < len(query); i++ {
-		if query[i] == '*' {
+		if code[i] == '*' {
 			// Check if this is a standalone * (not part of *= or ** or inside a string)
 			// It should be preceded by whitespace/comma and followed by whitespace/|/comment/end
 			prevOk := i == 0 || query[i-1] == ' ' || query[i-1] == '\t' || query[i-1] == '\n' || query[i-1] == ','
@@ -3921,9 +3924,10 @@ func stripTableWildcards(query string, recorders ...*kqlSourceRecorder) string {
 	b.Grow(len(query))
 	lastCopied := 0
 	changed := false
+	code := kqlSyntaxView(query, recorders...)
 
 	for i := 0; i < len(query); i++ {
-		if query[i] == '*' {
+		if code[i] == '*' {
 			shouldRemove := false
 
 			// Case 1: Suffix wildcard (Device*)
@@ -4081,7 +4085,7 @@ func normalizeMakeSeries(query string, recorders ...*kqlSourceRecorder) string {
 	if len(recorders) != 0 {
 		recorder = recorders[0]
 	}
-	lowerQuery := strings.ToLower(query)
+	lowerQuery := kqlSyntaxView(query, recorders...)
 	var b strings.Builder
 	b.Grow(len(query) + 64)
 	lastCopied := 0
@@ -4425,7 +4429,7 @@ func replaceASIMFunctions(query string, recorders ...*kqlSourceRecorder) string 
 	if len(recorders) != 0 {
 		recorder = recorders[0]
 	}
-	lowerQuery := strings.ToLower(query)
+	lowerQuery := kqlSyntaxView(query, recorders...)
 	qLen := len(query)
 
 	var b strings.Builder
@@ -4537,7 +4541,7 @@ func replaceDatatableWithData(query string, recorders ...*kqlSourceRecorder) str
 	if len(recorders) != 0 {
 		recorder = recorders[0]
 	}
-	lowerQuery := strings.ToLower(query)
+	lowerQuery := kqlSyntaxView(query, recorders...)
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
@@ -4640,7 +4644,7 @@ func replaceArgFunction(query string, recorders ...*kqlSourceRecorder) string {
 	if len(recorders) != 0 {
 		recorder = recorders[0]
 	}
-	lowerQuery := strings.ToLower(query)
+	lowerQuery := kqlSyntaxView(query, recorders...)
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
@@ -5038,7 +5042,7 @@ func hasKQLStarterPrefix(lowerLine string) bool {
 // stripDeclareStatements removes declare query_parameters(...) statements
 // These define query parameters but aren't part of the actual query
 func stripDeclareStatements(query string, recorders ...*kqlSourceRecorder) string {
-	lowerQuery := strings.ToLower(query)
+	lowerQuery := kqlSyntaxView(query, recorders...)
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0
@@ -5585,7 +5589,7 @@ func normalizeTopNested(query string, recorders ...*kqlSourceRecorder) string {
 
 	// Keep processing until no more top-nested clauses with "of"
 	for {
-		lowerResult := strings.ToLower(result)
+		lowerResult := kqlSyntaxView(result, recorders...)
 		idx := strings.Index(lowerResult, "top-nested")
 		if idx == -1 {
 			break
@@ -5703,7 +5707,7 @@ func normalizePartitionOperator(query string, recorders ...*kqlSourceRecorder) s
 	if len(recorders) != 0 {
 		recorder = recorders[0]
 	}
-	lowerQuery := strings.ToLower(query)
+	lowerQuery := kqlSyntaxView(query, recorders...)
 	var b strings.Builder
 	b.Grow(len(query))
 	lastCopied := 0

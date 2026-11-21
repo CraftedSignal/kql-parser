@@ -80,6 +80,28 @@ func protectedKQLBytes(query string, budget *parseBudget) []bool {
 	return protected
 }
 
+// kqlSyntaxView returns query with ASCII letters in lower case and every byte
+// of a string literal or comment set to 0, at unchanged offsets. Normalization
+// passes search it for operator syntax, so they never rewrite the text of a
+// literal or comment. Like the lower-case copy it replaces, the linear scan
+// costs one work step per pass.
+func kqlSyntaxView(query string, recorders ...*kqlSourceRecorder) string {
+	if len(recorders) > 0 && recorders[0] != nil {
+		recorders[0].Budget.step()
+	}
+	protected := protectedKQLBytes(query, nil)
+	view := []byte(query)
+	for i, c := range view {
+		switch {
+		case protected[i]:
+			view[i] = 0
+		case 'A' <= c && c <= 'Z':
+			view[i] = c + 'a' - 'A'
+		}
+	}
+	return string(view)
+}
+
 func markedRegexLiterals(query string, pattern *regexp.Regexp, replacement string, p *typedProtection, budget *parseBudget, recorders ...*kqlSourceRecorder) string {
 	protected := protectedKQLBytes(query, budget)
 	var rewrites []literalRewrite
