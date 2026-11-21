@@ -104,6 +104,18 @@ func (s *BaseKQLParserListener) EnterTableName(ctx *TableNameContext) {}
 // ExitTableName is called when production tableName is exited.
 func (s *BaseKQLParserListener) ExitTableName(ctx *TableNameContext) {}
 
+// EnterQualifiedTableName is called when production qualifiedTableName is entered.
+func (s *BaseKQLParserListener) EnterQualifiedTableName(ctx *QualifiedTableNameContext) {}
+
+// ExitQualifiedTableName is called when production qualifiedTableName is exited.
+func (s *BaseKQLParserListener) ExitQualifiedTableName(ctx *QualifiedTableNameContext) {}
+
+// EnterTableScope is called when production tableScope is entered.
+func (s *BaseKQLParserListener) EnterTableScope(ctx *TableScopeContext) {}
+
+// ExitTableScope is called when production tableScope is exited.
+func (s *BaseKQLParserListener) ExitTableScope(ctx *TableScopeContext) {}
+
 // EnterDatabaseTableName is called when production databaseTableName is entered.
 func (s *BaseKQLParserListener) EnterDatabaseTableName(ctx *DatabaseTableNameContext) {}
 

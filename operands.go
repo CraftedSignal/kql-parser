@@ -55,11 +55,21 @@ func literalKQLOperand(token int, source string) *Operand {
 	return nil
 }
 
+// trimObfuscationPrefix removes the h or H that marks a standard or verbatim
+// string literal as obfuscated; the literal keeps its value.
+func trimObfuscationPrefix(s string) string {
+	if len(s) > 2 && (s[0] == 'h' || s[0] == 'H') && (s[1] == '"' || s[1] == '\'' || s[1] == '@' && (s[2] == '"' || s[2] == '\'')) {
+		return s[1:]
+	}
+	return s
+}
+
 func decodeKQLString(source string) string {
 	s := source
 	if strings.HasPrefix(s, "```") && strings.HasSuffix(s, "```") && len(s) >= 6 {
 		return s[3 : len(s)-3]
 	}
+	s = trimObfuscationPrefix(s)
 	verbatim := strings.HasPrefix(s, "@")
 	if verbatim {
 		s = s[1:]

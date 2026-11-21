@@ -92,9 +92,20 @@ tabularSource
     ;
 
 tableName
-    : databaseTableName
+    : qualifiedTableName
+    | databaseTableName
     | identifier
     | QUOTED_IDENTIFIER
+    ;
+
+// A table in another scope: workspace("w").T, app("a").T, database("d").T,
+// cluster("c").database("d").T
+qualifiedTableName
+    : tableScope (DOT tableScope)* DOT (identifier | QUOTED_IDENTIFIER)
+    ;
+
+tableScope
+    : identifier LPAREN (STRING_LITERAL | VERBATIM_STRING) RPAREN
     ;
 
 databaseTableName

@@ -7208,7 +7208,7 @@ func normalizeOperator(op string) string {
 
 // extractValue extracts the value, removing quotes if present
 func extractValue(s string) string {
-	s = strings.TrimSpace(s)
+	s = trimObfuscationPrefix(strings.TrimSpace(s))
 
 	// Remove double quotes
 	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
@@ -7436,10 +7436,46 @@ func extractDataSourcesFromStatement(statement string, letNames map[string]bool,
 	if !allowLeadingSource {
 		return nil
 	}
+	if source := qualifiedDataSource(statement, letNames); source != "" {
+		return []string{source}
+	}
 	if source := leadingDataSource(statement, letNames); source != "" {
 		return []string{source}
 	}
 	return nil
+}
+
+// qualifiedDataSource returns the table a statement starts with when it is
+// written in another scope, such as workspace("w").T, app("a").T or
+// cluster("c").database("d").T, or named by table("T").
+func qualifiedDataSource(statement string, letNames map[string]bool) string {
+	rest := strings.TrimSpace(statement)
+	scoped := false
+	for {
+		open := strings.IndexByte(rest, '(')
+		if open <= 0 || !isSimpleIdentifier(rest[:open]) {
+			break
+		}
+		close := findMatchingParen(rest, open)
+		if close < 0 {
+			return ""
+		}
+		if !scoped && rest[:open] == "table" {
+			name, tail, ok := parseStringLiteral(rest[open+1 : close])
+			if !ok || strings.TrimSpace(tail) != "" {
+				return ""
+			}
+			return cleanDataSourceToken(name, letNames)
+		}
+		if close+1 >= len(rest) || rest[close+1] != '.' {
+			return ""
+		}
+		rest, scoped = rest[close+2:], true
+	}
+	if !scoped {
+		return ""
+	}
+	return leadingDataSource(rest, letNames)
 }
 
 func extractParenthesizedSources(statement, keyword string, letNames map[string]bool) []string {

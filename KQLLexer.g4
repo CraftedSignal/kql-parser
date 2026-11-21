@@ -355,17 +355,18 @@ TYPE_TIMESPAN   : 'timespan' ;
 // -----------------------------------------------------------------------------
 // STRING LITERALS
 // Supports: "string", 'string', @"verbatim", @'verbatim', multi-line strings
+// An h or H prefix marks a standard or verbatim literal as obfuscated.
 // -----------------------------------------------------------------------------
 
 STRING_LITERAL
-    : '"' (ESC_SEQ | ~["\\\r\n])* '"'
-    | '\'' (ESC_SEQ | ~['\\\r\n])* '\''
+    : [hH]? '"' (ESC_SEQ | ~["\\\r\n])* '"'
+    | [hH]? '\'' (ESC_SEQ | ~['\\\r\n])* '\''
     ;
 
 // Verbatim strings (@ prefix, no escape processing)
 VERBATIM_STRING
-    : '@"' (~["] | '""')* '"'
-    | '@\'' (~['] | '\'\'')* '\''
+    : [hH]? '@"' (~["] | '""')* '"'
+    | [hH]? '@\'' (~['] | '\'\'')* '\''
     ;
 
 // Multi-line string literals
