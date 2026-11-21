@@ -8989,9 +8989,14 @@ func GetEventTypeFromConditions(result *ParseResult) string {
 	for _, cond := range result.Conditions {
 		fieldLower := strings.ToLower(cond.Field)
 
-		// Check for EventID (KQL uses EventID, not EventCode)
-		if fieldLower == "eventid" {
-			eventID = cond.Value
+		// Check for EventID (KQL uses EventID, not EventCode). Only a
+		// condition that requires the ID names the event type; a negated,
+		// not-equal or range condition excludes it.
+		if fieldLower == "eventid" && !cond.Negated {
+			switch cond.Operator {
+			case "==", "=~", "in", "in~":
+				eventID = cond.Value
+			}
 		}
 	}
 
