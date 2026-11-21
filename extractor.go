@@ -5776,7 +5776,17 @@ func normalizePartitionOperator(query string, recorders ...*kqlSourceRecorder) s
 		b.WriteString("| summarize count() by ")
 		b.WriteString(key)
 		if recorder != nil {
-			recorder.Replace(idx, close+1, "| summarize count() by "+key, "normalizePartitionOperator")
+			// The pipe stays; the partition stage after it owns the rewrite,
+			// so the parsed summarize keeps an authored stage.
+			start := idx + len("| ")
+			owner := kqlOccurrenceAt(recorder.Source, start, recorder.Budget)
+			for owner >= 0 && recorder.Source.Occurrences[owner].Kind != "stage" {
+				owner = recorder.Source.Occurrences[owner].ParentID
+			}
+			if owner < 0 {
+				sourceAbort("partition rewrite lacks stage owner")
+			}
+			recorder.ReplaceOwned(start, close+1, "summarize count() by "+key, "normalizePartitionOperator", owner)
 		}
 		lastCopied = close + 1
 		searchFrom = close + 1
