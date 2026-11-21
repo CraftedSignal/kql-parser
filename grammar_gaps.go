@@ -89,13 +89,22 @@ func normalizeMakeGraphEdges(query string, recorders ...*kqlSourceRecorder) stri
 	if len(recorders) != 0 {
 		recorder = recorders[0]
 	}
-	if recorder != nil {
-		for _, match := range makeGraphEdgeRe.FindAllStringSubmatchIndex(query, -1) {
-			replacement := string(makeGraphEdgeRe.ExpandString(nil, "${1}=>${2}", query, match))
+	var b strings.Builder
+	last := 0
+	for _, match := range makeGraphEdgeRe.FindAllStringSubmatchIndex(kqlSyntaxView(query, recorder), -1) {
+		replacement := string(makeGraphEdgeRe.ExpandString(nil, "${1}=>${2}", query, match))
+		if recorder != nil {
 			recorder.Replace(match[0], match[1], replacement, "normalizeMakeGraphEdges")
 		}
+		b.WriteString(query[last:match[0]])
+		b.WriteString(replacement)
+		last = match[1]
 	}
-	return finishKQLRecorded(query, makeGraphEdgeRe.ReplaceAllString(query, "${1}=>${2}"), recorder)
+	if last == 0 {
+		return query
+	}
+	b.WriteString(query[last:])
+	return finishKQLRecorded(query, b.String(), recorder)
 }
 
 var bracketedUnionRe = regexp.MustCompile(`(?i)\(\s*union\b`)
@@ -159,7 +168,7 @@ func stripGraphMatchStages(query string, recorders ...*kqlSourceRecorder) string
 		recorder = recorders[0]
 	}
 	for {
-		loc := graphMatchStageRe.FindStringIndex(query)
+		loc := graphMatchStageRe.FindStringIndex(kqlSyntaxView(query, recorder))
 		if loc == nil {
 			return query
 		}
