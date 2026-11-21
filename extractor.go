@@ -6841,9 +6841,11 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 		if list := ctx.ExpressionList(); list != nil {
 			// Alternatives have no per-value reference metadata. Only proven
 			// literals can be lowered; computed or tabular/list expressions
-			// must remain one unevaluated scalar predicate.
+			// must remain one unevaluated scalar predicate. A dynamic value
+			// lowers only as an array of literals, which Kusto flattens.
 			for _, expression := range list.AllExpression() {
-				if !recognizeKQLOperand(expression, e.budget).literal {
+				operand := recognizeKQLOperand(expression, e.budget)
+				if items, dynamic := dynamicArrayItems(operand.rhs, e.budget); !operand.literal || dynamic && items == nil {
 					scalar()
 					return
 				}
@@ -7002,7 +7004,7 @@ func (e *conditionExtractor) handleInOperator(field string, exprList IExpression
 	if len(contexts) > 0 {
 		listSource = e.originalListSource(contexts[0], exprList, items)
 	}
-	cond.RHS = &Operand{Kind: OperandList, Source: listSource, Items: items}
+	cond.RHS = &Operand{Kind: OperandList, Source: listSource, Items: flattenDynamicArrays(items, e.budget)}
 	if source, binding := e.typed.listOrigin(items); binding != "" {
 		cond.RHS.Source, cond.RHS.Binding = source, binding
 	}
@@ -7108,7 +7110,18 @@ func (e *conditionExtractor) handleHasAnyAllOperator(field, op string, exprList 
 		logicalConnector = "AND"
 	}
 
-	expressions := exprList.AllExpression()
+	// One right operand per value, aligned with the flattened values.
+	var operands []*Operand
+	for _, expression := range exprList.AllExpression() {
+		operand := e.applyAuthoredOperand(recognizeKQLOperand(expression, e.budget).rhs, expression)
+		if elements, _ := dynamicArrayItems(operand, e.budget); elements != nil {
+			for i := range elements {
+				operands = append(operands, &elements[i])
+			}
+			continue
+		}
+		operands = append(operands, operand)
+	}
 	for i, value := range values {
 		logOp := e.lastLogicalOp
 		if i > 0 {
@@ -7125,8 +7138,8 @@ func (e *conditionExtractor) handleHasAnyAllOperator(field, op string, exprList 
 			IsComputed:  isComputed,
 			SourceField: sourceField,
 		}
-		if i < len(expressions) {
-			cond.RHS = e.applyAuthoredOperand(recognizeKQLOperand(expressions[i], e.budget).rhs, expressions[i])
+		if i < len(operands) {
+			cond.RHS = operands[i]
 		}
 		e.appendCondition(cond)
 	}
@@ -8672,11 +8685,54 @@ func extractExpressionListValues(ctx IExpressionListContext, budgets ...*parseBu
 	for _, expr := range ctx.AllExpression() {
 		text := expr.GetText()
 		if operand := recognizeKQLOperand(expr, budget); operand.literal {
+			if items, _ := dynamicArrayItems(operand.rhs, budget); items != nil {
+				for _, item := range items {
+					values = append(values, extractValue(item.Source))
+				}
+				continue
+			}
 			text = operand.text
 		}
 		values = append(values, extractValue(text))
 	}
 	return values
+}
+
+// dynamicArrayItems reports whether operand is a dynamic value and, when it
+// is an array of literals, returns its elements. Kusto flattens an array
+// operand of in, has_any and has_all into the list of values.
+func dynamicArrayItems(operand *Operand, budget *parseBudget) ([]Operand, bool) {
+	if operand == nil || operand.Kind != OperandTyped || operand.Type != "dynamic" {
+		return nil, false
+	}
+	constant, ok := parseLetConstant(operand.Source)
+	if !ok || !constant.list {
+		return nil, true
+	}
+	items := make([]Operand, 0, len(constant.items))
+	for _, source := range constant.items {
+		budget.step()
+		item := portableTypedOperand(source)
+		if item == nil {
+			return nil, true
+		}
+		items = append(items, *item)
+	}
+	return items, true
+}
+
+// flattenDynamicArrays replaces each dynamic array of literals in items with
+// its elements, so the items align with extractExpressionListValues.
+func flattenDynamicArrays(items []Operand, budget *parseBudget) []Operand {
+	flat := make([]Operand, 0, len(items))
+	for i := range items {
+		if elements, _ := dynamicArrayItems(&items[i], budget); elements != nil {
+			flat = append(flat, elements...)
+			continue
+		}
+		flat = append(flat, items[i])
+	}
+	return flat
 }
 
 // groupORConditionsByExpression merges same-field conditions that are
