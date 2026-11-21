@@ -62,15 +62,21 @@ func (b *parseBudget) check() {
 	}
 }
 
-func (b *parseBudget) step() {
+func (b *parseBudget) step() { b.reserveWork(1) }
+
+// Reserve cooperative work before the operation. Temporary backing owners charge
+// the full new capacity, including replacements, without refunds. This bounds
+// cumulative guarded slot allocation and copying using the existing shared work
+// allowance; retained output and metadata remain charged by their own owners.
+func (b *parseBudget) reserveWork(units int) {
 	if b == nil {
 		return
 	}
 	b.check()
-	if b.work >= b.limits.maxWork {
+	if units < 0 || units > b.limits.maxWork-b.work {
 		b.reject("work budget")
 	}
-	b.work++
+	b.work += units
 }
 
 func (b *parseBudget) input(query string) {
@@ -92,6 +98,30 @@ func (b *parseBudget) reserveOutput(items int) {
 		b.reject("output items")
 	}
 	b.output += items
+}
+
+// Reserve the entire new backing array before allocation, including spare
+// capacity. Fall back to exact capacity when geometric growth would not fit.
+func appendTemporary[T any](values []T, budget *parseBudget, additions ...T) []T {
+	if len(additions) > cap(values)-len(values) {
+		maxInt := int(^uint(0) >> 1)
+		if len(additions) > maxInt-len(values) {
+			budget.reject("work budget")
+		}
+		required := len(values) + len(additions)
+		capacity := required
+		if cap(values) <= maxInt/2 {
+			capacity = max(required, 2*cap(values))
+		}
+		if budget != nil && capacity > budget.limits.maxWork-budget.work {
+			capacity = required
+		}
+		budget.reserveWork(capacity)
+		grown := make([]T, len(values), capacity)
+		copy(grown, values)
+		values = grown
+	}
+	return append(values, additions...)
 }
 
 // Additive provenance has one request-shared allowance, independent of the

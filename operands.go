@@ -147,18 +147,25 @@ func decodeKQLString(source string) string {
 }
 
 func cloneOperand(value *Operand, budget *parseBudget) *Operand {
+	return cloneOperandReserved(value, budget, false)
+}
+
+func cloneOperandReserved(value *Operand, budget *parseBudget, reserved bool) *Operand {
 	budget.step()
 	if value == nil {
 		return nil
 	}
-	budget.reserveOutput(1)
+	if !reserved {
+		budget.reserveOutput(1)
+	}
+	budget.reserveOutput(len(value.Items))
 	budget.reserveMetadataStrings(0, value.Source, value.Value, value.Type, value.Binding)
 	copy := *value
 	copy.FieldBinding = cloneFieldBindingRef(value.FieldBinding, budget)
 	if len(value.Items) != 0 {
 		copy.Items = make([]Operand, len(value.Items))
 		for i := range value.Items {
-			child := cloneOperand(&value.Items[i], budget)
+			child := cloneOperandReserved(&value.Items[i], budget, true)
 			copy.Items[i] = *child
 		}
 	}

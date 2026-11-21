@@ -237,17 +237,24 @@ func cloneSemanticConditions(conditions []Condition, budget *parseBudget) []Cond
 	if len(conditions) == 0 {
 		return nil
 	}
+	budget.reserveOutput(len(conditions))
 	out := make([]Condition, len(conditions))
 	for i, condition := range conditions {
 		budget.step()
-		out[i] = *cloneSemanticCondition(condition, budget)
+		out[i] = *cloneSemanticConditionReserved(condition, budget, true)
 	}
 	return out
 }
 
 func cloneSemanticCondition(condition Condition, budget *parseBudget) *Condition {
+	return cloneSemanticConditionReserved(condition, budget, false)
+}
+
+func cloneSemanticConditionReserved(condition Condition, budget *parseBudget, reserved bool) *Condition {
 	budget.step()
-	budget.reserveOutput(1)
+	if !reserved {
+		budget.reserveOutput(1)
+	}
 	budget.reserveMetadataStrings(0, condition.StageID, condition.InputScopeID)
 	copy := condition
 	copy.Alternatives = cloneSemanticStrings(condition.Alternatives, budget)
