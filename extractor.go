@@ -5848,12 +5848,8 @@ func extractConditionsContext(ctx context.Context, query string, limits parseLim
 	return extractConditionsInternal(query, budget)
 }
 
-func extractConditionsInternal(query string, budget *parseBudget, inherited ...map[string]letOrigin) (result *ParseResult) {
-	source := kqlExtractionSource{Authored: query}
-	if len(inherited) > 0 {
-		source.Inherited = inherited[0]
-	}
-	return extractConditionsSource(source, budget)
+func extractConditionsInternal(query string, budget *parseBudget) (result *ParseResult) {
+	return extractConditionsSource(kqlExtractionSource{Authored: query}, budget)
 }
 
 func extractConditionsSource(source kqlExtractionSource, budget *parseBudget) (result *ParseResult) {
@@ -7123,11 +7119,11 @@ func (e *conditionExtractor) handleHasAnyAllOperator(field, op string, exprList 
 		operand := e.applyAuthoredOperand(recognizeKQLOperand(expression, e.budget).rhs, expression)
 		if elements, _ := dynamicArrayItems(operand, e.budget); elements != nil {
 			for i := range elements {
-				operands = append(operands, &elements[i])
+				operands = appendTemporary(operands, e.budget, &elements[i])
 			}
 			continue
 		}
-		operands = append(operands, operand)
+		operands = appendTemporary(operands, e.budget, operand)
 	}
 	for i, value := range values {
 		logOp := e.lastLogicalOp
@@ -8694,13 +8690,13 @@ func extractExpressionListValues(ctx IExpressionListContext, budgets ...*parseBu
 		if operand := recognizeKQLOperand(expr, budget); operand.literal {
 			if items, _ := dynamicArrayItems(operand.rhs, budget); items != nil {
 				for _, item := range items {
-					values = append(values, extractValue(item.Source))
+					values = appendTemporary(values, budget, extractValue(item.Source))
 				}
 				continue
 			}
 			text = operand.text
 		}
-		values = append(values, extractValue(text))
+		values = appendTemporary(values, budget, extractValue(text))
 	}
 	return values
 }
@@ -8712,18 +8708,25 @@ func dynamicArrayItems(operand *Operand, budget *parseBudget) ([]Operand, bool) 
 	if operand == nil || operand.Kind != OperandTyped || operand.Type != "dynamic" {
 		return nil, false
 	}
-	constant, ok := parseLetConstant(operand.Source)
-	if !ok || !constant.list {
+	body, ok := dynamicArrayBody(operand.Source)
+	if !ok {
 		return nil, true
 	}
-	items := make([]Operand, 0, len(constant.items))
-	for _, source := range constant.items {
-		budget.step()
+	count := 0
+	if !visitListItems(body, budget, func(source string) bool { count++; return isScalarLiteral(source) }) || count == 0 {
+		return nil, true
+	}
+	budget.reserveWork(count)
+	items := make([]Operand, 0, count)
+	if !visitListItems(body, budget, func(source string) bool {
 		item := portableTypedOperand(source)
 		if item == nil {
-			return nil, true
+			return false
 		}
 		items = append(items, *item)
+		return true
+	}) {
+		return nil, true
 	}
 	return items, true
 }
@@ -8731,13 +8734,14 @@ func dynamicArrayItems(operand *Operand, budget *parseBudget) ([]Operand, bool) 
 // flattenDynamicArrays replaces each dynamic array of literals in items with
 // its elements, so the items align with extractExpressionListValues.
 func flattenDynamicArrays(items []Operand, budget *parseBudget) []Operand {
+	budget.reserveWork(len(items))
 	flat := make([]Operand, 0, len(items))
 	for i := range items {
 		if elements, _ := dynamicArrayItems(&items[i], budget); elements != nil {
-			flat = append(flat, elements...)
+			flat = appendTemporary(flat, budget, elements...)
 			continue
 		}
-		flat = append(flat, items[i])
+		flat = appendTemporary(flat, budget, items[i])
 	}
 	return flat
 }

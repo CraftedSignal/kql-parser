@@ -41,7 +41,7 @@ func inlineLetConstantsWithSource(query string, lets []LetStatement, budget *par
 			return query
 		}
 		names[binding.Name] = true
-		if constant, ok := parseLetConstant(binding.Expression); ok {
+		if constant, ok := parseLetConstant(binding.Expression, budget); ok {
 			candidates[binding.Name] = constant
 		}
 	}
@@ -96,7 +96,7 @@ func inlineLetConstantsWithSource(query string, lets []LetStatement, budget *par
 		budget.step()
 		name, expression, isLet := parseLetAssignment(strings.TrimSpace(trimLeadingLineComments(statement)))
 		if isLet {
-			if constant, ok := parseLetConstant(expression); ok {
+			if constant, ok := parseLetConstant(expression, budget); ok {
 				constants[name] = constant
 			}
 			statementStart += len(statement) + 1
@@ -158,6 +158,7 @@ func inlineLetConstantOperands(query string, constants map[string]letConstant, b
 						if constant.list {
 							// Every item's origin shares the list source; charge it once.
 							budget.reserveMetadataStrings(0, constant.source)
+							budget.reserveWork(len(constant.items))
 							parts := make([]string, 0, len(constant.items))
 							for _, item := range constant.items {
 								parts = append(parts, protection.mark(letOrigin{source: item, binding: query[i:end], listSource: constant.source, normalized: item}, budget)+item)
@@ -257,33 +258,43 @@ func trailingOperator(s string) (string, string) {
 
 // parseLetConstant reads the literal a let binds: a string, number or
 // boolean, or dynamic([...]) of those.
-func parseLetConstant(expression string) (letConstant, bool) {
+func parseLetConstant(expression string, budgets ...*parseBudget) (letConstant, bool) {
+	budget := suppliedBudget(budgets)
 	expression = strings.TrimSpace(expression)
 	if isScalarLiteral(expression) {
+		budget.reserveWork(1)
 		return letConstant{items: []string{expression}, source: expression}, true
 	}
-	if !strings.HasPrefix(strings.ToLower(expression), "dynamic") {
+	body, ok := dynamicArrayBody(expression)
+	if !ok {
 		return letConstant{}, false
 	}
-	body := strings.TrimSpace(expression[len("dynamic"):])
-	if !strings.HasPrefix(body, "(") || !strings.HasSuffix(body, ")") {
-		return letConstant{}, false
-	}
-	body = strings.TrimSpace(body[1 : len(body)-1])
-	if !strings.HasPrefix(body, "[") || !strings.HasSuffix(body, "]") {
-		return letConstant{}, false
-	}
-	var items []string
-	for _, item := range splitListItems(body[1 : len(body)-1]) {
+	items := splitListItems(body, budget)
+	for _, item := range items {
 		if !isScalarLiteral(item) {
 			return letConstant{}, false
 		}
-		items = append(items, item)
 	}
 	if len(items) == 0 {
 		return letConstant{}, false
 	}
 	return letConstant{items: items, list: true, source: expression}, true
+}
+
+func dynamicArrayBody(expression string) (string, bool) {
+	expression = strings.TrimSpace(expression)
+	if !strings.HasPrefix(strings.ToLower(expression), "dynamic") {
+		return "", false
+	}
+	body := strings.TrimSpace(expression[len("dynamic"):])
+	if !strings.HasPrefix(body, "(") || !strings.HasSuffix(body, ")") {
+		return "", false
+	}
+	body = strings.TrimSpace(body[1 : len(body)-1])
+	if !strings.HasPrefix(body, "[") || !strings.HasSuffix(body, "]") {
+		return "", false
+	}
+	return body[1 : len(body)-1], true
 }
 
 // isScalarLiteral reports whether s is exactly one string, number or boolean
@@ -304,28 +315,42 @@ func isScalarLiteral(s string) bool {
 
 // splitListItems splits the comma-separated elements of an array literal,
 // ignoring commas inside strings.
-func splitListItems(s string) []string {
-	var items []string
+func splitListItems(s string, budgets ...*parseBudget) []string {
+	budget := suppliedBudget(budgets)
+	count := 0
+	visitListItems(s, budget, func(string) bool { count++; return true })
+	budget.reserveWork(count)
+	items := make([]string, 0, count)
+	visitListItems(s, budget, func(item string) bool { items = append(items, item); return true })
+	return items
+}
+
+// Scan without materializing a split slice. Callers first count/validate, then
+// reserve exact backing capacity before a second pass materializes the items.
+func visitListItems(s string, budget *parseBudget, visit func(string) bool) bool {
 	start := 0
 	for i := 0; i < len(s); {
+		budget.step()
 		switch {
 		case isStringLiteralStart(s, i):
 			i = stringLiteralEnd(s, i)
 			if i < 0 {
-				return append(items, strings.TrimSpace(s[start:]))
+				return visit(strings.TrimSpace(s[start:]))
 			}
 		case s[i] == ',':
-			items = append(items, strings.TrimSpace(s[start:i]))
+			if !visit(strings.TrimSpace(s[start:i])) {
+				return false
+			}
 			i++
 			start = i
 		default:
 			i++
 		}
 	}
-	if rest := strings.TrimSpace(s[start:]); rest != "" || len(items) > 0 {
-		items = append(items, rest)
+	if rest := strings.TrimSpace(s[start:]); rest != "" || start > 0 {
+		return visit(rest)
 	}
-	return items
+	return true
 }
 
 // isStringLiteralStart reports whether a string literal, regular or verbatim
