@@ -5848,12 +5848,8 @@ func extractConditionsContext(ctx context.Context, query string, limits parseLim
 	return extractConditionsInternal(query, budget)
 }
 
-func extractConditionsInternal(query string, budget *parseBudget, inherited ...map[string]letOrigin) (result *ParseResult) {
-	source := kqlExtractionSource{Authored: query}
-	if len(inherited) > 0 {
-		source.Inherited = inherited[0]
-	}
-	return extractConditionsSource(source, budget)
+func extractConditionsInternal(query string, budget *parseBudget) (result *ParseResult) {
+	return extractConditionsSource(kqlExtractionSource{Authored: query}, budget)
 }
 
 func extractConditionsSource(source kqlExtractionSource, budget *parseBudget) (result *ParseResult) {
