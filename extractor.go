@@ -5971,14 +5971,17 @@ func extractConditionsSource(source kqlExtractionSource, budget *parseBudget) (r
 		for _, condition := range extracted {
 			// The tree walker already captured conditions on computed
 			// columns, marked as computed; the text fallback cannot tell
-			// them from raw columns.
+			// them from raw columns. Default summarize outputs such as
+			// count_ and unaliased group keys have no computedFields entry,
+			// so a computed native condition on the same column counts too.
 			if _, computed := extractor.computedFields[condition.Field]; computed {
 				continue
 			}
 			covered := false
 			for _, native := range conditions {
 				budget.step()
-				if native.Operator == condition.Operator && native.Value == condition.Value && normalization.typed.normalizesField(native.Field, condition.Field) {
+				if native.IsComputed && native.Field == condition.Field ||
+					native.Operator == condition.Operator && native.Value == condition.Value && normalization.typed.normalizesField(native.Field, condition.Field) {
 					covered = true
 					break
 				}
