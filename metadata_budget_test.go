@@ -140,11 +140,18 @@ func TestMetadataPublicExhaustionReturnsOnlyErrors(t *testing.T) {
 	}
 }
 
-func TestMetadataAccountingRetainsLegacyOperandLimit(t *testing.T) {
+// Operand text is charged to the metadata text allowance, not to output items:
+// a long literal extracts by default and still fails a small text allowance.
+func TestMetadataAccountingBoundsOperandText(t *testing.T) {
 	query := `T | where x == "` + strings.Repeat("a", 1500) + `"`
-	got := ExtractConditions(query)
-	if len(got.Errors) != 1 || !strings.Contains(got.Errors[0], "output items") || len(got.Conditions) != 0 || got.Dataflow != nil {
-		t.Fatalf("legacy operand-heavy admission relaxed: %+v", got)
+	if got := ExtractConditions(query); len(got.Errors) != 0 || len(got.Conditions) != 1 || got.Dataflow == nil {
+		t.Fatalf("long literal must extract within the default allowance: %+v", got)
+	}
+	limits := defaultParseLimits()
+	limits.maxMetadataBytes = 1500
+	got := extractConditionsContext(context.Background(), query, limits)
+	if len(got.Errors) != 1 || !strings.Contains(got.Errors[0], "metadata bytes") || len(got.Conditions) != 0 || got.Dataflow != nil {
+		t.Fatalf("operand text escaped the metadata byte allowance: %+v", got)
 	}
 }
 
@@ -176,12 +183,13 @@ func TestMetadataIdentityKeepsLegacyKeyBytes(t *testing.T) {
 			}
 		})
 	}
-	// The independent pre-wave2 diagnostic measured this exact extraction at
-	// 2677 legacy units. Reference tags must not silently raise or lower it.
+	// Output items count structure only: one per condition, alternative,
+	// operand node, identity key and marker. Text is metadata. This exact
+	// extraction costs 181 units; reference tags must not raise or lower it.
 	b, cancel := newParseBudget(context.Background(), defaultParseLimits())
 	defer cancel()
 	got := extractConditionsInternal(boundedMetadataID44, b)
-	if len(got.Errors) != 0 || b.output != 2677 {
+	if len(got.Errors) != 0 || b.output != 181 {
 		t.Fatalf("legacy key/operand accounting shifted: output=%d errors=%v", b.output, got.Errors)
 	}
 }

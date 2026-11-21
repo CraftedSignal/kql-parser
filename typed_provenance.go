@@ -454,7 +454,8 @@ func (p *typedProtection) shieldNative(query string, budget *parseBudget, record
 		}
 		marker := p.prefix + "shield_" + strconv.Itoa(p.next) + "__"
 		p.next++
-		budget.reserveOutput(1 + len(marker) + end - start)
+		budget.reserveOutput(1)
+		budget.reserveMetadataStrings(0, marker, query[start:end])
 		p.shields[marker] = query[start:end]
 		if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
 			recorder := recorders[0]
@@ -550,7 +551,8 @@ func (p *typedProtection) mark(origin letOrigin, budget *parseBudget) string {
 	budget.step()
 	marker := "/*" + p.prefix + strconv.Itoa(p.next) + "__*/"
 	p.next++
-	budget.reserveOutput(1 + len(marker) + len(origin.source) + len(origin.binding) + len(origin.listSource))
+	budget.reserveOutput(1)
+	budget.reserveMetadataStrings(0, marker, origin.source, origin.binding)
 	p.markers[marker] = origin
 	// A separator prevents two adjacent block markers from forming */*/*,
 	// whose middle // is misread as a line comment by legacy normalizers.

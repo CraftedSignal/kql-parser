@@ -141,7 +141,8 @@ func cloneOperand(value *Operand, budget *parseBudget) *Operand {
 	if value == nil {
 		return nil
 	}
-	budget.reserveOutput(1 + len(value.Source) + len(value.Value) + len(value.Type) + len(value.Binding) + len(value.Items))
+	budget.reserveOutput(1)
+	budget.reserveMetadataStrings(0, value.Source, value.Value, value.Type, value.Binding)
 	copy := *value
 	copy.FieldBinding = cloneFieldBindingRef(value.FieldBinding, budget)
 	if len(value.Items) != 0 {
@@ -159,7 +160,8 @@ func operandOutputCost(value *Operand, budget *parseBudget) int {
 	if value == nil {
 		return 0
 	}
-	cost := 1 + len(value.Source) + len(value.Value) + len(value.Type) + len(value.Binding) + len(value.Items)
+	cost := 1
+	budget.reserveMetadataStrings(0, value.Source, value.Value, value.Type, value.Binding)
 	if value.FieldBinding != nil {
 		budget.reserveMetadataStrings(1, value.FieldBinding.ScopeID, value.FieldBinding.Kind, value.FieldBinding.BindingID)
 	}
