@@ -7189,7 +7189,7 @@ func normalizeOperator(op string) string {
 
 // extractValue extracts the value, removing quotes if present
 func extractValue(s string) string {
-	s = strings.TrimSpace(s)
+	s = trimObfuscationPrefix(strings.TrimSpace(s))
 
 	// Remove double quotes
 	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
