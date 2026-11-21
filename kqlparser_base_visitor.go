@@ -63,6 +63,14 @@ func (v *BaseKQLParserVisitor) VisitTableName(ctx *TableNameContext) interface{}
 	return v.VisitChildren(ctx)
 }
 
+func (v *BaseKQLParserVisitor) VisitQualifiedTableName(ctx *QualifiedTableNameContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BaseKQLParserVisitor) VisitTableScope(ctx *TableScopeContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
 func (v *BaseKQLParserVisitor) VisitDatabaseTableName(ctx *DatabaseTableNameContext) interface{} {
 	return v.VisitChildren(ctx)
 }

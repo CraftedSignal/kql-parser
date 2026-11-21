@@ -49,6 +49,12 @@ type KQLParserListener interface {
 	// EnterTableName is called when entering the tableName production.
 	EnterTableName(c *TableNameContext)
 
+	// EnterQualifiedTableName is called when entering the qualifiedTableName production.
+	EnterQualifiedTableName(c *QualifiedTableNameContext)
+
+	// EnterTableScope is called when entering the tableScope production.
+	EnterTableScope(c *TableScopeContext)
+
 	// EnterDatabaseTableName is called when entering the databaseTableName production.
 	EnterDatabaseTableName(c *DatabaseTableNameContext)
 
@@ -588,6 +594,12 @@ type KQLParserListener interface {
 
 	// ExitTableName is called when exiting the tableName production.
 	ExitTableName(c *TableNameContext)
+
+	// ExitQualifiedTableName is called when exiting the qualifiedTableName production.
+	ExitQualifiedTableName(c *QualifiedTableNameContext)
+
+	// ExitTableScope is called when exiting the tableScope production.
+	ExitTableScope(c *TableScopeContext)
 
 	// ExitDatabaseTableName is called when exiting the databaseTableName production.
 	ExitDatabaseTableName(c *DatabaseTableNameContext)

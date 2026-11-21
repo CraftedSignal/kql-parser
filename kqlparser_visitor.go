@@ -49,6 +49,12 @@ type KQLParserVisitor interface {
 	// Visit a parse tree produced by KQLParser#tableName.
 	VisitTableName(ctx *TableNameContext) interface{}
 
+	// Visit a parse tree produced by KQLParser#qualifiedTableName.
+	VisitQualifiedTableName(ctx *QualifiedTableNameContext) interface{}
+
+	// Visit a parse tree produced by KQLParser#tableScope.
+	VisitTableScope(ctx *TableScopeContext) interface{}
+
 	// Visit a parse tree produced by KQLParser#databaseTableName.
 	VisitDatabaseTableName(ctx *DatabaseTableNameContext) interface{}
 
