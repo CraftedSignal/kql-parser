@@ -979,7 +979,8 @@ func newKQLRuneByteIndex(text string, budget *parseBudget) []int {
 		budget.step()
 		runes++
 	}
-	budget.outputSize(runes + 1)
+	// One offset per rune: the input limit bounds the index, as in searchRuneBytes.
+	budget.input(text)
 	index := make([]int, 0, runes+1)
 	for at := range text {
 		budget.step()
