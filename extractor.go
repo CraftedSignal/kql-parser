@@ -4892,6 +4892,20 @@ func stripDocumentationPreamble(query string, recorders ...*kqlSourceRecorder) s
 			}
 		}
 
+		// A table name followed by a pipe, on this line or the next, starts the
+		// query whatever its casing, word count or the operators after the pipe.
+		nameEnd := 0
+		for nameEnd < len(lineTrimmed) && isIdentChar(lineTrimmed[nameEnd]) {
+			nameEnd++
+		}
+		if nameEnd > 0 && !isDigit(lineTrimmed[0]) {
+			afterName := lineStarts[i] + strings.Index(line, lineTrimmed) + nameEnd
+			if strings.HasPrefix(strings.TrimLeft(query[afterName:], " \t\r\n"), "|") {
+				span := kqlByteSpan{lineStarts[i], len(query)}
+				return recordKQLSelectedSource(query, query[span.Start:span.End], []kqlByteSpan{span}, recorder)
+			}
+		}
+
 		// Check if this line looks like natural language (multiple words that form a sentence)
 		// Natural language sentences typically have many words and don't look like KQL
 		isNaturalLanguage := false
