@@ -8808,12 +8808,12 @@ func groupORConditionsByExpression(conditions []Condition, expression *Condition
 		}
 		for i, item := range items {
 			budget.step()
-			key, metadataBytes := operandIdentityParts(&item, budget)
+			key := operandIdentity(&item, budget)
 			if g.seen[key] {
 				continue
 			}
-			budget.reserveOutput(len(key) - metadataBytes)
-			budget.reserveMetadata(0, metadataBytes)
+			budget.reserveOutput(1)
+			budget.reserveMetadata(0, len(key))
 			g.seen[key] = true
 			g.items = append(g.items, item)
 			if i < len(values) {

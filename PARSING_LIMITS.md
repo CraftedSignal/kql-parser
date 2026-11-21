@@ -11,8 +11,12 @@ normalized query text, 16 nested syntax delimiters, and 4,096 tokens. Real lexer
 tokens distinguish syntax delimiters from delimiters inside literals and
 comments. The complete bounded token list is checked before parsing begins.
 Cooperative work is limited to 1,000,000 checks, and guarded condition/semantic
-output growth is limited to 4,096 charged items. Intermediate semantic clones
-also consume that output budget. Unevaluated scalar leaves and their clones
+output growth is limited to 4,096 charged items. Each condition, alternative,
+operand node, identity key and provenance marker is one item. Their text, such
+as operand sources and values, shares a separate allowance with the provenance
+metadata: 4,096 entries and 1 MiB of text per call. A let-bound list's source
+is charged once per use. Intermediate semantic clones also consume both
+allowances. Unevaluated scalar leaves and their clones
 consume it too; typed operand recognition, scalar expression scans, let shadowing
 checks, and generated subquery-marker provenance use the same work budget.
 Syntax diagnostics are capped at 32 per listener, with each message truncated to 1,024 bytes.

@@ -156,6 +156,8 @@ func inlineLetConstantOperands(query string, constants map[string]letConstant, b
 				if literal, ok := letConstantOperand(query, i, end, constant); ok {
 					if protection != nil {
 						if constant.list {
+							// Every item's origin shares the list source; charge it once.
+							budget.reserveMetadataStrings(0, constant.source)
 							parts := make([]string, 0, len(constant.items))
 							for _, item := range constant.items {
 								parts = append(parts, protection.mark(letOrigin{source: item, binding: query[i:end], listSource: constant.source, normalized: item}, budget)+item)
