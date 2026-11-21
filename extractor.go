@@ -6829,7 +6829,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 		}
 	}
 
-	// Handle IN operator: field in (values) - including case-sensitive variants (in~, !in~)
+	// Handle IN operator: field in (values) - including case-insensitive variants (in~, !in~)
 	// Note: IN_CS (in~) and NOT_IN_CS (!in~) tokens exist but generated parser doesn't have methods
 	// So we check using GetToken directly for both regular and case-sensitive IN operators
 	hasIN := ctx.IN() != nil
@@ -6843,7 +6843,7 @@ func (e *conditionExtractor) EnterComparisonExpression(ctx *ComparisonExpression
 			leftText := e.applyAuthoredKQLOperand(recognizeKQLOperand(addExprs[0], e.budget), addExprs[0]).text
 			isNegated := (hasNOT_IN || hasNOT_IN_CS) != e.negated
 			operator := "in"
-			if hasIN_CS || hasNOT_IN_CS || strings.Contains(strings.ToLower(ctx.GetText()), "in~") {
+			if hasIN_CS || hasNOT_IN_CS {
 				operator = "in~"
 			}
 			e.handleInOperator(leftText, ctx.ExpressionList(), operator, isNegated, ctx)
