@@ -51,6 +51,9 @@ func resultAggregate(item IAggregationItemContext, budget *parseBudget) bool {
 		return true
 	}
 	function := aggregateCallName(item, budget)
+	if function == "arg_min" || function == "arg_max" {
+		return true
+	}
 	if function == "take_any" {
 		call := item.AggregationFunction().FunctionCall()
 		if call.ArgumentList() == nil {
@@ -72,9 +75,9 @@ func resultAggregate(item IAggregationItemContext, budget *parseBudget) bool {
 	return ok
 }
 
-// This walk is deliberately take_any-only; positional rank/scalar policies
+// This walk is limited to take_any and modern arg_min/arg_max; rank/scalar policies
 // stay in aggregateArguments. Cardinality is independent of name inference.
-func takeAnyResultArguments(item IAggregationItemContext, owners *kqlSourceOwners, budget *parseBudget) ([]IArgumentContext, bool) {
+func explicitResultArguments(item IAggregationItemContext, owners *kqlSourceOwners, budget *parseBudget) ([]IArgumentContext, bool) {
 	if item.AggregationFunction() == nil || item.AggregationFunction().FunctionCall() == nil {
 		return nil, false
 	}
@@ -129,7 +132,7 @@ func takeAnyResultArguments(item IAggregationItemContext, owners *kqlSourceOwner
 }
 
 func planTakeAnyMembers(item IAggregationItemContext, e *conditionExtractor, budget *parseBudget) ([]string, []bool, bool) {
-	args, valid := takeAnyResultArguments(item, e.sourceOwners, budget)
+	args, valid := explicitResultArguments(item, e.sourceOwners, budget)
 	if !valid || item.AS() != nil && len(args) > 1 {
 		return nil, nil, false
 	}
@@ -186,6 +189,93 @@ func planTakeAnyMembers(item IAggregationItemContext, e *conditionExtractor, bud
 			budget.reserveWork(width)
 			budget.reserveWork(len("any_arg") + width)
 			names[i] = "any_arg" + strconv.Itoa(i)
+		default:
+			return nil, nil, false
+		}
+	}
+	return names, declared, true
+}
+
+// Names are planned independently of output allocation. In particular, fallback
+// members depend on the original selector name, never its outer declaration.
+func planArgMinMaxMembers(item IAggregationItemContext, e *conditionExtractor, budget *parseBudget) ([]string, []bool, bool) {
+	args, valid := explicitResultArguments(item, e.sourceOwners, budget)
+	if !valid || item.AS() != nil && len(args) > 1 {
+		return nil, nil, false
+	}
+	aliases := aggregateDeclarations(item, e, budget)
+	if len(aliases) > len(args) {
+		return nil, nil, false
+	}
+	budget.reserveWork(len(args))
+	budget.reserveWork(len(args))
+	names := make([]string, len(args))
+	declared := make([]bool, len(args))
+	originalName := func(argument IArgumentContext) (string, aggregateResultNameKind) {
+		if argument.ASSIGN() != nil {
+			authored, found := namedArgumentSource(argument, e.sourceOwners, budget)
+			if !found {
+				sourceAbort("arg_min/max declaration source ownership unavailable")
+			}
+			if strings.HasPrefix(authored, "[") {
+				name, ok := decodedColumnName(authored, budget)
+				if !ok || name == "" {
+					return "", aggregateNameUnknown
+				}
+				return name, aggregateNameKnown
+			}
+			if authored == "" {
+				return "", aggregateNameUnknown
+			}
+			return authored, aggregateNameKnown
+		}
+		return e.aggregateExpressionResultName(argument.Expression(), budget)
+	}
+	prefix := "max_"
+	if aggregateCallName(item, budget) == "arg_min" {
+		prefix = "min_"
+	}
+	primary := ""
+	primaryReady := false
+	for i, arg := range args {
+		budget.step()
+		if i < len(aliases) {
+			if aliases[i] == "" {
+				return nil, nil, false
+			}
+			names[i] = aliases[i]
+			declared[i] = true
+			continue
+		}
+		name, kind := originalName(arg)
+		switch kind {
+		case aggregateNameKnown:
+			if name == "" {
+				return nil, nil, false
+			}
+			names[i] = name
+		case aggregateNameUnnamed:
+			if i == 0 {
+				budget.reserveWork(len(prefix))
+				names[i] = prefix
+				continue
+			}
+			if !primaryReady {
+				var kind aggregateResultNameKind
+				primary, kind = originalName(args[0])
+				if kind == aggregateNameUnknown {
+					return nil, nil, false
+				}
+				primaryReady = true
+			}
+			width := 1
+			for n := i; n >= 10; n /= 10 {
+				budget.step()
+				width++
+			}
+			budget.reserveWork(width)
+			budget.reserveWork(len(prefix) + len(primary) + len("_arg") + width)
+			names[i] = prefix + primary + "_arg" + strconv.Itoa(i)
 		default:
 			return nil, nil, false
 		}
@@ -268,6 +358,9 @@ func aggregateDeclarations(item IAggregationItemContext, e *conditionExtractor, 
 // Returns complete member bases and declaration flags without mutating summaries.
 func planAggregateMembers(item IAggregationItemContext, e *conditionExtractor, budget *parseBudget) (names []string, declared []bool, known bool) {
 	function := aggregateCallName(item, budget)
+	if function == "arg_min" || function == "arg_max" {
+		return planArgMinMaxMembers(item, e, budget)
+	}
 	if function == "take_any" {
 		return planTakeAnyMembers(item, e, budget)
 	}
@@ -398,8 +491,8 @@ func validateAggregateTuples(tree antlr.Tree, source *kqlMappedSource, owners *k
 			function := aggregateCallName(item, budget)
 			args, valid := aggregateArguments(item, budget)
 			arity := 0
-			if function == "take_any" {
-				arguments, proven := takeAnyResultArguments(item, owners, budget)
+			if function == "take_any" || function == "arg_min" || function == "arg_max" {
+				arguments, proven := explicitResultArguments(item, owners, budget)
 				if proven {
 					arity = len(arguments)
 				}
