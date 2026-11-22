@@ -236,4 +236,12 @@ rank-dependent/default names are not represented by the legacy summary.
 Explicitly aliased scalar and array-returning forms (including the documented
 dynamic percentile-array argument) keep their existing graph behavior; multiple
 arguments alone do not imply multiple outputs. This narrow boundary preserves
-legacy names and does not validate signatures or add weighted scalar/array rules.
+legacy names and does not validate signatures.
+
+Unaliased three-argument `percentilew` and `percentilesw_array` with at least
+three positional arguments also leave the whole stage opaque: their default
+output names are not faithfully represented by the legacy summary. The weighted
+array remains one output, including its dynamic percentile-list form; opacity
+does not assert multiple outputs or choose a disputed default name. Explicit
+aliases retain their existing graph behavior. This rule does not extend to named
+arguments, other functions or unsupported arities.
