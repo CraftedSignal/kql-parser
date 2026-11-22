@@ -480,7 +480,7 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 			if item.Identifier() != nil {
 				alias = b.authoredIdentifier(item.Identifier())
 			}
-			agg := newAggregation(item.AggregationFunction(), alias, info.PipeStage)
+			agg := newAggregation(item.AggregationFunction(), alias, info.PipeStage, b.budget, b.extractor)
 			expression, ok := b.owners.authoredContext(item.AggregationFunction(), b.budget)
 			if !ok {
 				sourceAbort("aggregate expression lacks authored span")
