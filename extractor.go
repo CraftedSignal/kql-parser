@@ -3930,6 +3930,11 @@ func stripTableWildcards(query string, recorders ...*kqlSourceRecorder) string {
 
 	for i := 0; i < len(query); i++ {
 		if code[i] == '*' {
+			// Reorder selectors are native wildcard syntax, not union table
+			// patterns. Preserve their authored occurrence for typed validation.
+			if recorder != nil && recorder.Source.Text == query && projectReorderOwnsOffset(recorder.Source, i, recorder.Budget) {
+				continue
+			}
 			shouldRemove := false
 
 			// Case 1: Suffix wildcard (Device*)
@@ -5898,6 +5903,12 @@ func extractConditionsSource(source kqlExtractionSource, budget *parseBudget) (r
 
 	// Walk the tree to extract conditions
 	owners := associateKQLSource(tree, mappedSource, budget)
+	if diagnostic := validateKQLProjectReorders(tree, mappedSource, owners, stream.GetAllTokens(), len(lexerErrors.errors)+len(parserErrors.errors) > 0, budget); diagnostic != "" {
+		budget.reserveOutput(1)
+		errors := appendTemporary([]string(nil), budget, lexerErrors.errors...)
+		errors = appendTemporary(errors, budget, parserErrors.errors...)
+		return &ParseResult{Conditions: []Condition{}, Errors: appendTemporary(errors, budget, diagnostic)}
+	}
 	extractor := &conditionExtractor{
 		budget:              budget,
 		sourceOwners:        owners,

@@ -118,6 +118,12 @@ type KQLParserListener interface {
 	// EnterProjectReorderOperator is called when entering the projectReorderOperator production.
 	EnterProjectReorderOperator(c *ProjectReorderOperatorContext)
 
+	// EnterProjectReorderItem is called when entering the projectReorderItem production.
+	EnterProjectReorderItem(c *ProjectReorderItemContext)
+
+	// EnterProjectReorderDirection is called when entering the projectReorderDirection production.
+	EnterProjectReorderDirection(c *ProjectReorderDirectionContext)
+
 	// EnterProjectItemList is called when entering the projectItemList production.
 	EnterProjectItemList(c *ProjectItemListContext)
 
@@ -663,6 +669,12 @@ type KQLParserListener interface {
 
 	// ExitProjectReorderOperator is called when exiting the projectReorderOperator production.
 	ExitProjectReorderOperator(c *ProjectReorderOperatorContext)
+
+	// ExitProjectReorderItem is called when exiting the projectReorderItem production.
+	ExitProjectReorderItem(c *ProjectReorderItemContext)
+
+	// ExitProjectReorderDirection is called when exiting the projectReorderDirection production.
+	ExitProjectReorderDirection(c *ProjectReorderDirectionContext)
 
 	// ExitProjectItemList is called when exiting the projectItemList production.
 	ExitProjectItemList(c *ProjectItemListContext)

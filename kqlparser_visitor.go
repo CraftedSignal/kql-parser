@@ -118,6 +118,12 @@ type KQLParserVisitor interface {
 	// Visit a parse tree produced by KQLParser#projectReorderOperator.
 	VisitProjectReorderOperator(ctx *ProjectReorderOperatorContext) interface{}
 
+	// Visit a parse tree produced by KQLParser#projectReorderItem.
+	VisitProjectReorderItem(ctx *ProjectReorderItemContext) interface{}
+
+	// Visit a parse tree produced by KQLParser#projectReorderDirection.
+	VisitProjectReorderDirection(ctx *ProjectReorderDirectionContext) interface{}
+
 	// Visit a parse tree produced by KQLParser#projectItemList.
 	VisitProjectItemList(ctx *ProjectItemListContext) interface{}
 

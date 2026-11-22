@@ -33,7 +33,7 @@ func validateContext(ctx context.Context, query string, limits parseLimits) (err
 	if strings.TrimSpace(query) == "" {
 		return []string{"query is empty"}
 	}
-	normalization := &kqlNormalizationMetadata{}
+	normalization := &kqlNormalizationMetadata{mapped: newKQLMappedSource(query, budget)}
 	normalized := normalizeBudgetedMetadata(query, true, budget, normalization)
 	listener := &errorListener{budget: budget}
 	stream := preflight(normalized, budget, true, listener)
@@ -54,6 +54,10 @@ func validateContext(ctx context.Context, query string, limits parseLimits) (err
 		if count != normalization.searchCount {
 			return []string{"malformed or unsupported search syntax"}
 		}
+	}
+	if diagnostic := validateKQLProjectReorders(tree, normalization.mapped, nil, stream.GetAllTokens(), len(listener.errors) > 0, budget); diagnostic != "" {
+		budget.reserveOutput(1)
+		return appendTemporary(listener.errors, budget, diagnostic)
 	}
 	budget.check()
 	for i, msg := range listener.errors {

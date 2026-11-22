@@ -155,6 +155,14 @@ func (v *BaseKQLParserVisitor) VisitProjectReorderOperator(ctx *ProjectReorderOp
 	return v.VisitChildren(ctx)
 }
 
+func (v *BaseKQLParserVisitor) VisitProjectReorderItem(ctx *ProjectReorderItemContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
+func (v *BaseKQLParserVisitor) VisitProjectReorderDirection(ctx *ProjectReorderDirectionContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
 func (v *BaseKQLParserVisitor) VisitProjectItemList(ctx *ProjectItemListContext) interface{} {
 	return v.VisitChildren(ctx)
 }

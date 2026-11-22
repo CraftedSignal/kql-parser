@@ -371,6 +371,10 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 		stage.Effect = "rename"
 	case ctx.ProjectAwayOperator() != nil:
 		stage.Effect = "project"
+	case ctx.ProjectReorderOperator() != nil:
+		// Validated typed reorder preserves the field environment only.
+		// Source retains its selectors/order; no wildcard expansion is claimed.
+		stage.Effect = "retain"
 	case ctx.SummarizeOperator() != nil:
 		stage.Effect = "aggregate"
 	case isKQLRetainCommand(stage.Command):
