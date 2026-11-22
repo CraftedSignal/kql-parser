@@ -94,6 +94,10 @@ func compoundStringAt(query string, start int, budget *parseBudget) (compoundStr
 		}
 		switch query[i] {
 		case 'b', 't', 'n', 'f', 'r', '"', '\'', '\\', '0':
+		case 'U':
+			end, valid := unicodeScalarEscape(query, i, budget)
+			t.valid = t.valid && valid
+			i = end - 1
 		case 'x', 'u':
 			n := 2
 			if query[i] == 'u' {

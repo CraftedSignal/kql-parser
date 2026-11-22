@@ -39,6 +39,9 @@ func TestTypedOperandUnicodeEscapeBoundaries(t *testing.T) {
 		{"surrogate_pair_max", `"\uDBFF\uDFFFtail"`, "\U0010FFFFtail"},
 		{"raw_supplementary", `"😀tail"`, "😀tail"},
 		{"raw_scalar_max", "\"\U0010FFFFtail\"", "\U0010FFFFtail"},
+		{"eight_digit_min", `"\U00010000tail"`, "\U00010000tail"},
+		{"eight_digit_supplementary", `"\U0001F600tail"`, "😀tail"},
+		{"eight_digit_max", `"\U0010FFFFtail"`, "\U0010FFFFtail"},
 	} {
 		t.Run(fixture.name, func(t *testing.T) {
 			condition := requireTypedReviewCondition(t, `T | where x == `+fixture.literal)
@@ -49,19 +52,24 @@ func TestTypedOperandUnicodeEscapeBoundaries(t *testing.T) {
 	}
 }
 
-func TestTypedOperandEightDigitUnicodeEscapesRemainDiagnosed(t *testing.T) {
-	// The current grammar rejects uppercase-U escapes before decoding them,
-	// including valid scalars. Keep this boundary while bounding the decoder.
+func TestTypedOperandInvalidEightDigitUnicodeEscapesRemainDiagnosed(t *testing.T) {
+	// Invalid eight-digit scalars remain diagnosed before decoding/publication.
 	for _, literal := range []string{
-		`"\U00010000tail"`, `"\U0001F600tail"`, `"\U0010FFFFtail"`,
 		`"\U00110000tail"`, `"\U7FFFFFFFtail"`, `"\U80000000tail"`, `"\UFFFFFFFFtail"`,
 	} {
 		t.Run(literal, func(t *testing.T) {
 			query := `T | where x == ` + literal
 			parsed, semantic := ExtractConditions(query), AnalyzeQuery(query)
-			if len(parsed.Errors) == 0 || len(semantic.Errors) == 0 || len(parsed.Conditions) != 0 || len(semantic.Conditions) != 0 {
-				t.Fatalf("unsupported escape %q: parse=%#v semantic=%#v", literal, parsed, semantic)
-			}
+			requireRejectedUnicodeModels(t, parsed, semantic)
 		})
+	}
+}
+
+// Preserve the existing diagnosed/no-typed-condition contract. Syntax recovery
+// may retain a legacy ScalarPredicate independently of those diagnostics.
+func requireRejectedUnicodeModels(t *testing.T, p *ParseResult, s *SemanticQuery) {
+	t.Helper()
+	if len(p.Errors) == 0 || len(s.Errors) == 0 || len(p.Conditions) != 0 || len(s.Conditions) != 0 || p.Dataflow != nil || s.Dataflow != nil || len(p.DataSources) != 0 || len(s.DataSources) != 0 {
+		t.Fatalf("invalid Unicode escape exposed a model: %+v / %+v", p, s)
 	}
 }

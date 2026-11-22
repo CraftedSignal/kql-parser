@@ -379,6 +379,16 @@ fragment ESC_SEQ
     : '\\' [btnfr"'\\]
     | '\\x' HEX_DIGIT HEX_DIGIT
     | '\\u' HEX_DIGIT HEX_DIGIT HEX_DIGIT HEX_DIGIT
+    | '\\U' UNICODE_SCALAR_8
+    ;
+
+// Exactly eight hex digits, excluding surrogate values and values > 10FFFF.
+fragment UNICODE_SCALAR_8
+    : '0000' ([0-9a-cA-C] HEX_DIGIT HEX_DIGIT HEX_DIGIT
+             | [dD] [0-7] HEX_DIGIT HEX_DIGIT
+             | [e-fE-F] HEX_DIGIT HEX_DIGIT HEX_DIGIT)
+    | '000' [1-9a-fA-F] HEX_DIGIT HEX_DIGIT HEX_DIGIT HEX_DIGIT
+    | '0010' HEX_DIGIT HEX_DIGIT HEX_DIGIT HEX_DIGIT
     ;
 
 // -----------------------------------------------------------------------------
