@@ -215,3 +215,15 @@ AGPL-3.0 - see [LICENSE](LICENSE) for details.
 
 - [spl-parser](https://github.com/craftedsignal/spl-parser) - Splunk SPL parser
 - [CraftedSignal](https://craftedsignal.com) - Detection engineering platform
+
+### Summarize output boundaries
+
+Dataflow leaves a whole `summarize` stage opaque when documented row-returning
+`arg_max`/`arg_min` (including `argmax`/`argmin`) or multi-expression/wildcard
+`take_any`/`any` cannot be represented as one finite aggregate column. An
+unaliased single-expression `take_any` is also opaque because its default output
+name is not represented by the legacy summary. Explicitly aliased single-value
+`take_any`, direct-column `any(Name)`, `take_anyif`, `count()`, and scalar aggregates
+retain their existing graph behavior. Legacy aggregation summaries and authored
+stage text remain available; opaque stages do not publish fabricated bindings.
+This boundary does not validate backend function signatures or execution.
