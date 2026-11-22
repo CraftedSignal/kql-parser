@@ -479,7 +479,7 @@ func isKQLLeadingOperator(query string, lo, hi int) bool {
 
 func skipKQLLexicalRegion(text string, at, end int, budget *parseBudget) (int, bool) {
 	if at+1 < end && text[at] == '/' && text[at+1] == '/' {
-		for at < end && text[at] != '\n' {
+		for at < end && text[at] != '\r' && text[at] != '\n' {
 			budget.step()
 			at++
 		}

@@ -260,6 +260,12 @@ func (s *BaseKQLParserListener) EnterProjectItemList(ctx *ProjectItemListContext
 // ExitProjectItemList is called when production projectItemList is exited.
 func (s *BaseKQLParserListener) ExitProjectItemList(ctx *ProjectItemListContext) {}
 
+// EnterColumnName is called when production columnName is entered.
+func (s *BaseKQLParserListener) EnterColumnName(ctx *ColumnNameContext) {}
+
+// ExitColumnName is called when production columnName is exited.
+func (s *BaseKQLParserListener) ExitColumnName(ctx *ColumnNameContext) {}
+
 // EnterProjectItem is called when production projectItem is entered.
 func (s *BaseKQLParserListener) EnterProjectItem(ctx *ProjectItemContext) {}
 

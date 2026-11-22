@@ -167,6 +167,10 @@ func (v *BaseKQLParserVisitor) VisitProjectItemList(ctx *ProjectItemListContext)
 	return v.VisitChildren(ctx)
 }
 
+func (v *BaseKQLParserVisitor) VisitColumnName(ctx *ColumnNameContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
 func (v *BaseKQLParserVisitor) VisitProjectItem(ctx *ProjectItemContext) interface{} {
 	return v.VisitChildren(ctx)
 }

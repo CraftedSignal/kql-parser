@@ -174,6 +174,7 @@ type conditionExtractor struct {
 	typed               *typedProtection
 	subqueryMarkers     []int // Rune offsets of synthetic unresolved IN-subquery literals
 	unsupportedSubquery bool
+	emptyColumnStages   map[*TabularOperatorContext]bool
 	originalQuery       string // normalized query text for extracting subexpressions
 }
 
@@ -261,6 +262,14 @@ func (e *conditionExtractor) authoredComparisonField(ctx *ComparisonExpressionCo
 
 func (e *conditionExtractor) ownsDataflow(ctx antlr.ParserRuleContext) bool {
 	e.budget.step()
+	if len(e.emptyColumnStages) > 0 {
+		for parent := antlr.Tree(ctx); parent != nil; parent = parent.GetParent() {
+			e.budget.step()
+			if stage, ok := parent.(*TabularOperatorContext); ok && stage != ctx && e.emptyColumnStages[stage] {
+				return false
+			}
+		}
+	}
 	if e.sourceOwners == nil && len(e.dataflowFrames) == 0 {
 		// Direct predicate helpers do not enter the query listener. Their
 		// existing budget and extraction behavior still applies.
@@ -1139,6 +1148,18 @@ func convertBracketAccess(query string, recorders ...*kqlSourceRecorder) string 
 		if c == '[' && i+1 < len(query) {
 			// Check if preceded by an identifier (property access) or standalone (column reference)
 			precededByIdent := i > 0 && (isIdentChar(query[i-1]) || query[i-1] == ')')
+
+			if !precededByIdent {
+				budget := suppliedBudget(nil)
+				if recorder != nil {
+					budget = recorder.Budget
+				}
+				if end, _, valid := columnNameSpan(query, i, budget); valid {
+					result.WriteString(query[i:end])
+					i = end
+					continue
+				}
+			}
 
 			// Case 1: ['...'] or ["..."] - quoted property access or column alias
 			if query[i+1] == '\'' || query[i+1] == '"' {
@@ -5860,7 +5881,7 @@ func extractConditionsInternal(query string, budget *parseBudget) (result *Parse
 func extractConditionsSource(source kqlExtractionSource, budget *parseBudget) (result *ParseResult) {
 	query := source.Authored
 	budget.input(query)
-	preflight(query, budget, false, nil)
+	rawStream := preflight(query, budget, false, nil)
 	mappedSource := source.Mapped
 	if mappedSource == nil {
 		mappedSource = newKQLMappedSource(query, budget)
@@ -5909,8 +5930,19 @@ func extractConditionsSource(source kqlExtractionSource, budget *parseBudget) (r
 		errors = appendTemporary(errors, budget, parserErrors.errors...)
 		return &ParseResult{Conditions: []Condition{}, Errors: appendTemporary(errors, budget, diagnostic)}
 	}
+	var emptyColumns map[*TabularOperatorContext]bool
+	if !columnNamesAbsent(rawStream, stream, query, normalizedQuery, budget) {
+		var diagnostic string
+		emptyColumns, diagnostic = validateKQLColumnNames(tree, mappedSource, owners, budget)
+		if diagnostic != "" {
+			budget.reserveOutput(1)
+			return &ParseResult{Conditions: []Condition{}, Errors: appendTemporary([]string(nil), budget, diagnostic)}
+		}
+	}
+
 	extractor := &conditionExtractor{
 		budget:              budget,
+		emptyColumnStages:   emptyColumns,
 		sourceOwners:        owners,
 		conditions:          make([]Condition, 0),
 		computedFields:      make(map[string]string), // computed field -> source field
@@ -6432,8 +6464,8 @@ func (e *conditionExtractor) EnterAggregationItem(ctx *AggregationItemContext) {
 	//   identifier ASSIGN aggregationFunction   (e.g., EventCount = count())
 	//   aggregationFunction AS identifier        (e.g., count() as EventCount)
 	alias := ""
-	if ctx.Identifier() != nil && (ctx.ASSIGN() != nil || ctx.AS() != nil) {
-		alias = e.authoredIdentifier(ctx.Identifier())
+	if ctx.ColumnName() != nil && (ctx.ASSIGN() != nil || ctx.AS() != nil) {
+		alias = e.authoredIdentifier(ctx.ColumnName())
 		sourceField := ""
 		if ctx.AggregationFunction() != nil {
 			sourceField = aggregationFunctionText(ctx.AggregationFunction())
@@ -6814,9 +6846,9 @@ func (e *conditionExtractor) EnterGroupByItem(ctx *GroupByItemContext) {
 	// groupByItem: expression (AS identifier)? | identifier ASSIGN expression
 	// Extract the field name — for simple identifiers, take the expression text;
 	// for aliased items, take the alias (identifier) name.
-	if ctx.Identifier() != nil && (ctx.ASSIGN() != nil || ctx.AS() != nil) {
+	if ctx.ColumnName() != nil && (ctx.ASSIGN() != nil || ctx.AS() != nil) {
 		// Aliased: "Count = count()" or "count() AS Count" — the alias is the group-by result name
-		alias := e.authoredIdentifier(ctx.Identifier())
+		alias := e.authoredIdentifier(ctx.ColumnName())
 		e.groupByFields = append(e.groupByFields, alias)
 		e.computedFields[alias] = ""
 	} else if ctx.Expression() != nil {
@@ -6839,8 +6871,8 @@ func (e *conditionExtractor) EnterExtendItem(ctx *ExtendItemContext) {
 		return
 	}
 	// Track field assignments in extend with source field extraction
-	if ctx.Identifier() != nil {
-		field := e.authoredIdentifier(ctx.Identifier())
+	if ctx.ColumnName() != nil {
+		field := e.authoredIdentifier(ctx.ColumnName())
 		sourceField := ""
 		expression := ""
 
@@ -6969,9 +7001,9 @@ func (e *conditionExtractor) EnterProjectItem(ctx *ProjectItemContext) {
 	if e.inSubquery > 0 {
 		return
 	}
-	if ctx.Identifier() != nil && (ctx.ASSIGN() != nil || ctx.AS() != nil) {
+	if ctx.ColumnName() != nil && (ctx.ASSIGN() != nil || ctx.AS() != nil) {
 		// Aliased project item: project NewName = expr or project expr AS NewName
-		field := e.authoredIdentifier(ctx.Identifier())
+		field := e.authoredIdentifier(ctx.ColumnName())
 		sourceField, expression := "", ""
 		if ctx.Expression() != nil {
 			expression = ctx.Expression().GetText()
@@ -7010,7 +7042,7 @@ func (e *conditionExtractor) EnterRenameItem(ctx *RenameItemContext) {
 	if e.inSubquery > 0 {
 		return
 	}
-	identifiers := ctx.AllIdentifier()
+	identifiers := ctx.AllColumnName()
 	if len(identifiers) != 2 {
 		return
 	}

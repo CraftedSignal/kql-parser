@@ -127,6 +127,9 @@ type KQLParserListener interface {
 	// EnterProjectItemList is called when entering the projectItemList production.
 	EnterProjectItemList(c *ProjectItemListContext)
 
+	// EnterColumnName is called when entering the columnName production.
+	EnterColumnName(c *ColumnNameContext)
+
 	// EnterProjectItem is called when entering the projectItem production.
 	EnterProjectItem(c *ProjectItemContext)
 
@@ -678,6 +681,9 @@ type KQLParserListener interface {
 
 	// ExitProjectItemList is called when exiting the projectItemList production.
 	ExitProjectItemList(c *ProjectItemListContext)
+
+	// ExitColumnName is called when exiting the columnName production.
+	ExitColumnName(c *ColumnNameContext)
 
 	// ExitProjectItem is called when exiting the projectItem production.
 	ExitProjectItem(c *ProjectItemContext)

@@ -437,9 +437,12 @@ IDENTIFIER
 
 // Quoted identifier (for special characters in names)
 QUOTED_IDENTIFIER
-    : '[' ~[\]\r\n]+ ']'
+    : '[' COLUMN_NAME_TRIVIA* (STRING_LITERAL | VERBATIM_STRING | MULTILINE_STRING) (COLUMN_NAME_TRIVIA* (STRING_LITERAL | VERBATIM_STRING | MULTILINE_STRING))* COLUMN_NAME_TRIVIA* ']'
+    | '[' ~[\]\r\n]+ ']'
     | '[\'' ~['\r\n]+ '\']'
     ;
+
+fragment COLUMN_NAME_TRIVIA : [ \t\r\n\f] | '//' ~[\r\n]* ;
 
 // Client parameter (for parameterized queries)
 CLIENT_PARAMETER
