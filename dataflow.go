@@ -582,7 +582,8 @@ func (b *kqlDataflowBuilder) unrepresentedSummarizeOutputs(list IAggregationList
 		name := token.GetText()
 		switch name {
 		case "arg_max", "argmax", "arg_min", "argmin", "take_any", "any",
-			"percentiles", "percentilesw", "percentile", "percentiles_array":
+			"percentiles", "percentilesw", "percentile", "percentiles_array",
+			"percentilew", "percentilesw_array":
 		default:
 			continue
 		}
@@ -631,6 +632,14 @@ func (b *kqlDataflowBuilder) unrepresentedSummarizeOutputs(list IAggregationList
 			}
 		case "percentiles_array":
 			if count >= 2 && item.Identifier() == nil {
+				return true
+			}
+		case "percentilew":
+			if count == 3 && item.Identifier() == nil {
+				return true
+			}
+		case "percentilesw_array":
+			if count >= 3 && item.Identifier() == nil {
 				return true
 			}
 		}
