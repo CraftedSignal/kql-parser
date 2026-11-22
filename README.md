@@ -304,3 +304,15 @@ result and its outputs. Ordinary scalar calls retain a nil result. Adding the
 optional struct field affects external unkeyed `Aggregation` literals; keyed
 literals and field readers remain source-compatible. This metadata describes
 provenance, not percentile execution or a consumer execution catalog.
+
+Non-STAR multi-expression `take_any` also uses ordered result members, one per
+original argument. Direct fields keep their names, inner declarations provide
+names, and proven unnamed expressions use `any_arg<i>` with the original
+zero-based argument index. Outer aliases override successive members; partial
+aliases require proven remaining names. Unknown defaults, empty/malformed
+labels, STAR and multi-output AS retain whole-stage opacity. Ordinary
+single-expression calls keep `Result=nil` and existing scalar compatibility,
+including explicitly named unknown expressions and AS suffix allocation.
+Every member remains an aggregate from the same sampled-row call, with the
+same exact whole-call expression; members are not independent sampling calls
+or passthroughs. This adds provenance, not execution or deterministic sampling.

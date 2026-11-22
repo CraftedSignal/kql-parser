@@ -60,7 +60,7 @@ func TestQuotedArgumentBoundaries(t *testing.T) {
 			t.Fatalf("malformed declaration promoted: %+v / %+v", p, s)
 		}
 	}
-	for _, call := range []string{`take_any(['']=State)`, `Result=take_any(['']=State)`, `take_any(['X']=State, Other)`, `Result=take_any(['X']=State, Other)`, `take_any(['X']=*)`} {
+	for _, call := range []string{`take_any(['']=State)`, `Result=take_any(['']=State)`, `take_any(['X']=*)`} {
 		query := `T | summarize N=count(), ` + call
 		if errs := Validate(query); len(errs) != 0 {
 			t.Fatalf("boundary syntax: %s: %v", query, errs)
