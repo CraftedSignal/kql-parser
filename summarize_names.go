@@ -91,7 +91,23 @@ const (
 	summarizeInvalidDeclaration
 )
 
+func (a *summarizeNameAllocator) declareReplacing(name string) (string, bool, bool) {
+	a.nameWork(name)
+	if a.declared[name] {
+		return "", false, false
+	}
+	if _, occupied := a.used[name]; occupied {
+		a.nameWork(name)
+		a.declared[name] = true
+		return name, true, true
+	}
+	allocated, valid := a.declare(name)
+	return allocated, valid, false
+}
+
 type summarizeMetricName struct {
+	member             int
+	replace            bool
 	index              int
 	column, expression string
 	declaration        bool
@@ -101,6 +117,7 @@ type summarizeNamePlan struct {
 	status  summarizePlanStatus
 	metrics []summarizeMetricName
 	groups  []summarizeGroupName
+	visible []int
 }
 
 func (b *kqlDataflowBuilder) indexAggregationOwners() {
@@ -192,19 +209,28 @@ func (b *kqlDataflowBuilder) planSummarizeNames(summary ISummarizeOperatorContex
 		if item.AggregationFunction() == nil {
 			return plan
 		}
-		// An unnamed scalar without a base name needs contextual ColumnN
-		// allocation. Leave the whole plan unknown before allocating suffixes;
-		// explicitly named scalars still have their existing known aliases.
-		if candidate.Column == "" && item.ColumnName() == nil {
-			return plan
-		}
 		expression, ok := b.owners.authoredContext(item.AggregationFunction(), b.budget)
 		if !ok {
 			sourceAbort("aggregate expression lacks authored span")
 		}
-		plan.metrics = append(plan.metrics, summarizeMetricName{index, candidate.Column, expression, item.ColumnName() != nil})
+		if candidate.Result != nil {
+			names, declared, known := planAggregateMembers(item, b.extractor, b.budget)
+			if !known {
+				return plan
+			}
+			for ordinal, name := range names {
+				b.budget.step()
+				plan.metrics = appendTemporary(plan.metrics, b.budget, summarizeMetricName{index: index, column: name, expression: expression, declaration: declared[ordinal], member: ordinal, replace: ordinal == 0 && item.ASSIGN() != nil && item.ColumnName() != nil})
+			}
+		} else {
+			if candidate.Column == "" && item.ColumnName() == nil {
+				return plan
+			}
+			plan.metrics = appendTemporary(plan.metrics, b.budget, summarizeMetricName{index: index, column: candidate.Column, expression: expression, declaration: item.ColumnName() != nil})
+		}
 	}
-	allocator := newSummarizeNameAllocator(metricCount+groupCount, b.budget)
+
+	allocator := newSummarizeNameAllocator(len(plan.metrics)+groupCount, b.budget)
 	for i := range plan.groups {
 		b.budget.step()
 		allocated, valid := allocator.declare(plan.groups[i].column)
@@ -216,17 +242,42 @@ func (b *kqlDataflowBuilder) planSummarizeNames(summary ISummarizeOperatorContex
 	}
 	for i := range plan.metrics {
 		b.budget.step()
-		if plan.metrics[i].declaration {
-			allocated, valid := allocator.declare(plan.metrics[i].column)
+		metric := &plan.metrics[i]
+		replaced := false
+		if metric.declaration {
+			var allocated string
+			var valid bool
+			if metric.replace {
+				allocated, valid, replaced = allocator.declareReplacing(metric.column)
+			} else {
+				allocated, valid = allocator.declare(metric.column)
+			}
 			if !valid {
 				plan.status = summarizeInvalidDeclaration
 				return plan
 			}
-			plan.metrics[i].column = allocated
+			metric.column = allocated
 		} else {
-			plan.metrics[i].column = allocator.add(plan.metrics[i].column)
+			metric.column = allocator.add(metric.column)
+		}
+		if replaced {
+			found := false
+			for slot, prior := range plan.visible {
+				b.budget.step()
+				if plan.metrics[prior].column == metric.column {
+					plan.visible[slot] = i
+					found = true
+					break
+				}
+			}
+			if !found {
+				sourceAbort("replacement lacks automatic projection slot")
+			}
+		} else {
+			plan.visible = appendTemporary(plan.visible, b.budget, i)
 		}
 	}
+
 	plan.status = summarizeRepresented
 	return plan
 }

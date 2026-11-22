@@ -392,6 +392,7 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 	stage = b.flow.Stages[stageIndex]
 	mode := "inherit"
 	var removed []string
+	var visibleBindings []string
 	switch stage.Effect {
 	case "assign":
 		items := ctx.ExtendOperator().ExtendItemList()
@@ -500,35 +501,74 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 			stage.Effect = "opaque"
 			break
 		}
-		// Reserve every replacement column before publishing any of the plan.
-		for _, metric := range plan.metrics {
+		// Reserve every descriptor member and replacement name before commit.
+		for flatIndex, metric := range plan.metrics {
 			b.budget.step()
 			candidate := &b.extractor.aggregations[metric.index]
 			b.budget.reserveWork(len(metric.column))
-			if candidate.Column != metric.column {
-				b.budget.reserveMetadataStrings(0, metric.column)
+			b.budget.reserveMetadataStrings(0, metric.column)
+			if candidate.Result != nil && metric.member == 0 {
+				count := 0
+				for j := flatIndex; j < len(plan.metrics) && plan.metrics[j].index == metric.index; j++ {
+					b.budget.step()
+					count++
+				}
+				b.budget.reserveMetadata(count, 0)
+				b.budget.reserveOutput(count)
+				candidate.Result.Outputs = make([]AggregationOutput, count)
 			}
 		}
-		for _, metric := range plan.metrics {
+		b.budget.reserveWork(len(plan.metrics))
+		memberIDs := make([]string, len(plan.metrics))
+		for i, metric := range plan.metrics {
 			b.budget.step()
 			candidate := &b.extractor.aggregations[metric.index]
-			candidate.Column = metric.column
 			bindingID := b.addBinding(&stage, metric.column, "aggregate", metric.expression, input)
+			memberIDs[i] = bindingID
 			b.budget.reserveMetadataStrings(0, stage.ID, bindingID)
-			candidate.StageID, candidate.BindingID = stage.ID, bindingID
+			candidate.StageID = stage.ID
+			if candidate.Result != nil {
+				b.budget.reserveMetadataStrings(0, metric.column, bindingID)
+				candidate.Result.Outputs[metric.member] = AggregationOutput{Ordinal: metric.member, Column: metric.column, BindingID: bindingID}
+				candidate.Result.Complete = true
+				if len(candidate.Result.Outputs) == 1 {
+					candidate.Column = metric.column
+					candidate.BindingID = bindingID
+				} else {
+					candidate.Column = ""
+					candidate.BindingID = ""
+				}
+			} else {
+				candidate.Column = metric.column
+				candidate.BindingID = bindingID
+			}
 		}
+		for _, index := range plan.visible {
+			b.budget.step()
+			visibleBindings = appendTemporary(visibleBindings, b.budget, memberIDs[index])
+		}
+
 		for _, group := range plan.groups {
 			b.budget.step()
-			b.addBinding(&stage, group.column, "group", group.expression, input)
+			id := b.addBinding(&stage, group.column, "group", group.expression, input)
+			visibleBindings = appendTemporary(visibleBindings, b.budget, id)
 		}
 	}
 	if stage.Effect == "opaque" {
 		for i := range b.extractor.aggregations {
-			if b.extractor.aggregations[i].StageID == stage.ID {
-				b.extractor.aggregations[i].StageID = ""
-				b.extractor.aggregations[i].BindingID = ""
+			b.budget.step()
+			candidate := &b.extractor.aggregations[i]
+			owner := b.extractor.aggregationContexts[i]
+			if ctx.SummarizeOperator() != nil && owner.GetParent() == ctx.SummarizeOperator().AggregationList() {
+				candidate.StageID = ""
+				candidate.BindingID = ""
+				if candidate.Result != nil {
+					candidate.Result.Complete = false
+					candidate.Result.Outputs = nil
+				}
 			}
 		}
+
 		mode = "opaque"
 		stage.BindingIDs = nil
 		b.flow.Bindings = b.flow.Bindings[:firstBinding]
@@ -536,7 +576,11 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 	} else if stage.Effect == "project" && mode == "closed" || stage.Effect == "aggregate" {
 		mode = "closed"
 	}
-	output := b.scope(info.Pipeline, mode, input, "", stage.BindingIDs, removed)
+	scopeBindings := stage.BindingIDs
+	if stage.Effect == "aggregate" {
+		scopeBindings = visibleBindings
+	}
+	output := b.scope(info.Pipeline, mode, input, "", scopeBindings, removed)
 	b.budget.reserveMetadataStrings(0, output)
 	stage.OutputScopeID = output
 	b.current[info.Pipeline] = output
@@ -606,6 +650,9 @@ func (b *kqlDataflowBuilder) unrepresentedSummarizeOutputs(list IAggregationList
 		if !ok || item.AggregationFunction() == nil {
 			continue
 		}
+		if resultAggregate(item, b.budget) {
+			continue
+		} // dedicated complete member planning
 		call := item.AggregationFunction().FunctionCall()
 		if call == nil || call.Identifier() == nil || call.Identifier().IDENTIFIER() == nil {
 			continue
@@ -1169,9 +1216,49 @@ func finalizeDataflow(result *ParseResult, budget *parseBudget) {
 			}
 		}
 		checkExpression(current.Expression)
+		budget.reserveWork(len(flow.Bindings))
+		memberOwners := make(map[string]bool, len(flow.Bindings))
+		budget.reserveWork(len(current.Aggregations))
+		callOrdinals := make(map[dataflowOperatorInfo]int)
 		for _, aggregate := range current.Aggregations {
 			budget.step()
-			expectedStage := aggregateStages[dataflowOperatorInfo{PipeStage: aggregate.PipeStage, Pipeline: aggregate.Pipeline}]
+			coordinate := dataflowOperatorInfo{PipeStage: aggregate.PipeStage, Pipeline: aggregate.Pipeline}
+			ordinal := callOrdinals[coordinate]
+			callOrdinals[coordinate] = ordinal + 1
+			expectedStage := aggregateStages[coordinate]
+			if aggregate.Result != nil {
+				result := aggregate.Result
+				if result.CallOrdinal != ordinal {
+					sourceAbort("aggregate result call ordinal is invalid")
+				}
+				if !result.Complete {
+					if len(result.Outputs) != 0 || aggregate.StageID != "" || aggregate.BindingID != "" || expectedStage != "" {
+						sourceAbort("incomplete aggregate result leaked owners")
+					}
+					continue
+				}
+				if expectedStage == "" || aggregate.StageID != expectedStage || len(result.Outputs) == 0 {
+					sourceAbort("complete aggregate result lacks stage")
+				}
+				if len(result.Outputs) == 1 {
+					if aggregate.Column != result.Outputs[0].Column || aggregate.BindingID != result.Outputs[0].BindingID {
+						sourceAbort("single result legacy identity mismatch")
+					}
+				} else if aggregate.Column != "" || aggregate.BindingID != "" {
+					sourceAbort("multiple result has scalar legacy identity")
+				}
+				for i, output := range result.Outputs {
+					budget.step()
+					binding, ok := bindings[output.BindingID]
+					budget.reserveWork(len(output.BindingID))
+					if !ok || memberOwners[output.BindingID] || output.Ordinal != i || binding.Kind != "aggregate" || binding.StageID != expectedStage || binding.Field != output.Column || binding.Expression != result.Expression {
+						sourceAbort("aggregate member owner is invalid")
+					}
+					budget.reserveWork(1)
+					memberOwners[output.BindingID] = true
+				}
+				continue
+			}
 			if aggregate.StageID == "" && aggregate.BindingID == "" {
 				if expectedStage != "" {
 					sourceAbort("represented aggregate lacks binding owner")
@@ -1179,8 +1266,17 @@ func finalizeDataflow(result *ParseResult, budget *parseBudget) {
 				continue
 			}
 			binding, ok := bindings[aggregate.BindingID]
-			if !ok || binding.Kind != "aggregate" || expectedStage != aggregate.StageID || binding.StageID != aggregate.StageID || binding.Field != aggregate.Column {
+			if !ok || memberOwners[aggregate.BindingID] || binding.Kind != "aggregate" || expectedStage != aggregate.StageID || binding.StageID != aggregate.StageID || binding.Field != aggregate.Column {
 				sourceAbort("aggregate binding owner is invalid")
+			}
+			budget.reserveWork(len(aggregate.BindingID) + 1)
+			memberOwners[aggregate.BindingID] = true
+		}
+
+		for _, binding := range flow.Bindings {
+			budget.step()
+			if binding.Kind == "aggregate" && !memberOwners[binding.ID] {
+				sourceAbort("orphan aggregate result binding")
 			}
 		}
 		for _, scope := range flow.Scopes {

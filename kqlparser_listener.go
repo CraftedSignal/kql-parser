@@ -163,6 +163,9 @@ type KQLParserListener interface {
 	// EnterAggregationList is called when entering the aggregationList production.
 	EnterAggregationList(c *AggregationListContext)
 
+	// EnterAggregationNameList is called when entering the aggregationNameList production.
+	EnterAggregationNameList(c *AggregationNameListContext)
+
 	// EnterAggregationItem is called when entering the aggregationItem production.
 	EnterAggregationItem(c *AggregationItemContext)
 
@@ -717,6 +720,9 @@ type KQLParserListener interface {
 
 	// ExitAggregationList is called when exiting the aggregationList production.
 	ExitAggregationList(c *AggregationListContext)
+
+	// ExitAggregationNameList is called when exiting the aggregationNameList production.
+	ExitAggregationNameList(c *AggregationNameListContext)
 
 	// ExitAggregationItem is called when exiting the aggregationItem production.
 	ExitAggregationItem(c *AggregationItemContext)

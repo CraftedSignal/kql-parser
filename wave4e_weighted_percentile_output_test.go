@@ -11,7 +11,7 @@ func TestWave4eWeightedPercentileOutputBoundary(t *testing.T) {
 		call, function, column string
 		opaque                 bool
 	}{
-		{"percentilew(Bytes,Weight,95)", "percentilew", "percentilew_Bytes", true},
+		{"percentilew(Bytes,Weight,95)", "percentilew", "percentile_Bytes_95", false},
 		{"P=percentilew(Bytes,Weight,95)", "percentilew", "P", false},
 		{"percentilew(Bytes,Weight,95) as P", "percentilew", "P", false},
 		{"percentilesw_array(Bytes,Weight,50,95)", "percentilesw_array", "percentilesw_array_Bytes", true},
@@ -37,6 +37,15 @@ func TestWave4eWeightedPercentileOutputBoundary(t *testing.T) {
 			} {
 				if len(api.errors) != 0 || api.flow == nil || len(api.flow.Stages) != 1 || len(api.aggs) != 1 || len(api.groups) != 1 || api.groups[0] != "User" {
 					t.Fatalf("native parse/source: %+v", api)
+				}
+				if columns := tupleFixtureColumns(tc.call); columns != nil {
+					requireAggregateResult(t, &ParseResult{Dataflow: api.flow, Aggregations: api.aggs}, 0, columns)
+					agg := api.aggs[0]
+					expression := strings.TrimSuffix(strings.TrimPrefix(tc.call, "P="), " as P")
+					if !api.flow.Complete || len(api.flow.Bindings) != len(columns)+1 || len(api.warnings) != 0 || agg.Function != tc.function || agg.Field != "Bytes" || agg.Column != tc.column || agg.Result.CallOrdinal != 0 || agg.Result.Expression != expression || api.flow.Stages[0].Source != "summarize "+tc.call+" by User" {
+						t.Fatalf("finite percentile/source: %+v", api)
+					}
+					continue
 				}
 				a, stage := api.aggs[0], api.flow.Stages[0]
 				if a.Function != tc.function || a.Column != tc.column || (tc.function != "count" && a.Field != "Bytes") || stage.Source != "summarize "+tc.call+" by User" {
@@ -126,7 +135,7 @@ func TestWave4eWeightedPercentileSharedBudgets(t *testing.T) {
 
 func TestWave4eWeightedPercentileMixedStageAndClone(t *testing.T) {
 	for _, tc := range []struct{ call, function, column string }{
-		{"percentilew(Bytes,Weight,95)", "percentilew", "percentilew_Bytes"},
+		{"percentilew(Bytes,Weight,95)", "percentilew", "percentile_Bytes_95"},
 		{"percentilesw_array(Bytes,Weight,50,95)", "percentilesw_array", "percentilesw_array_Bytes"},
 		{"percentilesw_array(Bytes,Weight,dynamic([50,95]))", "percentilesw_array", "percentilesw_array_Bytes"},
 	} {
@@ -141,6 +150,13 @@ func TestWave4eWeightedPercentileMixedStageAndClone(t *testing.T) {
 		}{
 			{p.Dataflow, p.Aggregations, p.Conditions, p.Errors}, {s.Dataflow, s.Aggregations, s.Conditions, s.Errors},
 		} {
+			if tc.function == "percentilew" {
+				requireAggregateResult(t, &ParseResult{Dataflow: api.flow, Aggregations: api.aggs}, 1, []string{"percentile_Bytes_95"})
+				if len(api.errors) != 0 || api.flow.Stages[0].Effect != "aggregate" || len(api.flow.Bindings) != 3 || len(api.aggs) != 2 || api.aggs[0].Column != "count_" || len(api.conditions) != 1 || api.conditions[0].FieldBinding == nil || api.conditions[0].FieldBinding.Kind != "absent" {
+					t.Fatalf("finite weighted mixed output: %+v", api)
+				}
+				continue
+			}
 			if len(api.errors) != 0 || api.flow == nil || api.flow.Complete || len(api.flow.Bindings) != 0 || len(api.aggs) != 2 || len(api.conditions) != 1 {
 				t.Fatalf("opaque mixed stage/metadata: %+v", api)
 			}

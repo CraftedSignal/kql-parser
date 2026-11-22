@@ -65,13 +65,14 @@ type ParseResult struct {
 // Aggregation is one summarize aggregation and the column it outputs.
 // Conditions with a higher PipeStage filter the summarized rows.
 type Aggregation struct {
-	StageID   string `json:"stage_id,omitempty"`
-	BindingID string `json:"binding_id,omitempty"`
-	Function  string `json:"function"`        // Lower-case aggregation function, e.g. count, dcount, sum
-	Field     string `json:"field,omitempty"` // Aggregated column when the first argument is a plain column
-	Column    string `json:"column"`          // Output column: the alias, or KQL's default name such as count_ or dcount_Field
-	PipeStage int    `json:"pipe_stage"`      // Pipeline stage of the summarize operator
-	Pipeline  int    `json:"pipeline"`        // Index in ParseResult.Pipelines of the pipeline it aggregates
+	Result    *AggregationResult `json:"result,omitempty"`
+	StageID   string             `json:"stage_id,omitempty"`
+	BindingID string             `json:"binding_id,omitempty"`
+	Function  string             `json:"function"`        // Lower-case aggregation function, e.g. count, dcount, sum
+	Field     string             `json:"field,omitempty"` // Aggregated column when the first argument is a plain column
+	Column    string             `json:"column"`          // Output column: the alias, or KQL's default name such as count_ or dcount_Field
+	PipeStage int                `json:"pipe_stage"`      // Pipeline stage of the summarize operator
+	Pipeline  int                `json:"pipeline"`        // Index in ParseResult.Pipelines of the pipeline it aggregates
 }
 
 // Pipeline is a tabular pipeline: the query, or a pipeline nested in
@@ -141,6 +142,7 @@ type conditionExtractor struct {
 	dataflowOperators   map[*TabularOperatorContext]dataflowOperatorInfo
 	dataflowPipelines   map[*TabularExpressionContext]int
 	dataflowFrames      []dataflowOwnerFrame
+	aggregateLists      map[antlr.Tree]*aggregateListProgress
 	aggregationContexts []*AggregationItemContext // Positional owners parallel to aggregations
 
 	sourceOwners *kqlSourceOwners
@@ -1455,6 +1457,16 @@ func convertTupleUnpacking(query string, recorders ...*kqlSourceRecorder) string
 	for i < len(query) {
 		// Look for pattern: whitespace or beginning + ( + identifiers with commas + ) + whitespace + =
 		if code[i] == '(' {
+			if recorder != nil {
+				id := kqlOccurrenceAt(recorder.Source, i, recorder.Budget)
+				summarize := id >= 0 && id < len(recorder.Source.Occurrences) && recorder.Source.Occurrences[id].Kind == "stage" && recorder.Source.Occurrences[id].Command == "summarize"
+				if summarize {
+					result.WriteByte(query[i])
+					i++
+					continue
+				}
+			}
+
 			// Check if this looks like tuple unpacking
 			// Find the closing paren
 			end := i + 1
@@ -5930,6 +5942,10 @@ func extractConditionsSource(source kqlExtractionSource, budget *parseBudget) (r
 		errors = appendTemporary(errors, budget, parserErrors.errors...)
 		return &ParseResult{Conditions: []Condition{}, Errors: appendTemporary(errors, budget, diagnostic)}
 	}
+	if diagnostic := validateAggregateTuples(tree, mappedSource, owners, len(lexerErrors.errors)+len(parserErrors.errors) > 0, budget); diagnostic != "" {
+		budget.reserveOutput(1)
+		return &ParseResult{Errors: appendTemporary([]string(nil), budget, diagnostic)}
+	}
 	var emptyColumns map[*TabularOperatorContext]bool
 	if !columnNamesAbsent(rawStream, stream, query, normalizedQuery, budget) {
 		var diagnostic string
@@ -6456,10 +6472,47 @@ func (e *conditionExtractor) EnterLetStatement(*LetStatementContext) {}
 // e.g., summarize FailedAttempts=count() registers "failedattempts" as computed.
 // This prevents post-aggregation filters (| where FailedAttempts > 5) from being
 // treated as required raw data fields in test validation.
-func (e *conditionExtractor) EnterAggregationItem(ctx *AggregationItemContext) {
-	if e.inSearch > 0 || e.inSubquery > 0 || !e.ownsDataflow(ctx) {
+type aggregateListProgress struct {
+	next    int
+	results bool
+}
+
+func (e *conditionExtractor) EnterAggregationList(ctx *AggregationListContext) {
+	if e.inSearch > 0 || e.inSubquery > 0 || len(e.dataflowFrames) == 0 || e.dataflowFrames[len(e.dataflowFrames)-1].ExternalChild {
 		return
 	}
+	if e.aggregateLists == nil {
+		e.budget.reserveWork(1)
+		e.aggregateLists = make(map[antlr.Tree]*aggregateListProgress)
+	}
+	state := &aggregateListProgress{}
+	for _, child := range ctx.GetChildren() {
+		e.budget.step()
+		if item, ok := child.(IAggregationItemContext); ok && resultAggregate(item, e.budget) {
+			state.results = true
+		}
+	}
+	e.budget.reserveWork(1)
+	e.aggregateLists[ctx] = state
+}
+
+func (e *conditionExtractor) EnterAggregationItem(ctx *AggregationItemContext) {
+	if e.inSearch > 0 || e.inSubquery > 0 {
+		return
+	}
+	state := e.aggregateLists[ctx.GetParent()]
+	ordinal := 0
+	if state != nil {
+		ordinal = state.next
+		state.next++
+	}
+	owned := e.ownsDataflow(ctx)
+	// Empty-name stages containing the new carriers retain detached call records,
+	// while legacy-only empty stages keep their existing suppression boundary.
+	if !owned && (state == nil || !state.results) {
+		return
+	}
+
 	// Two grammar forms:
 	//   identifier ASSIGN aggregationFunction   (e.g., EventCount = count())
 	//   aggregationFunction AS identifier        (e.g., count() as EventCount)
@@ -6470,7 +6523,9 @@ func (e *conditionExtractor) EnterAggregationItem(ctx *AggregationItemContext) {
 		if ctx.AggregationFunction() != nil {
 			sourceField = aggregationFunctionText(ctx.AggregationFunction())
 		}
-		e.computedFields[alias] = sourceField
+		if owned {
+			e.computedFields[alias] = sourceField
+		}
 	}
 
 	if e.inSubquery > 0 {
@@ -6478,6 +6533,17 @@ func (e *conditionExtractor) EnterAggregationItem(ctx *AggregationItemContext) {
 	}
 	aggregation := newAggregation(ctx.AggregationFunction(), alias, e.currentStage, e.budget, e)
 	aggregation.Pipeline = e.currentPipeline()
+	if resultAggregate(ctx, e.budget) {
+		expression, ok := e.sourceOwners.authoredContext(ctx.AggregationFunction(), e.budget)
+		if !ok {
+			sourceAbort("aggregate result lacks authored expression")
+		}
+		e.budget.reserveMetadataStrings(1, expression)
+		aggregation.Result = &AggregationResult{CallOrdinal: ordinal, Expression: expression}
+		if ctx.AggregationNameList() != nil {
+			aggregation.Column = ""
+		}
+	}
 	// The summary owns the decoded input identity and generated output name.
 	// The dataflow pairing temporary does not retain a second summary.
 	e.budget.reserveMetadataStrings(0, aggregation.Field)

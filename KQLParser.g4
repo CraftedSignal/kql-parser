@@ -312,8 +312,13 @@ aggregationList
     : aggregationItem (COMMA aggregationItem)*
     ;
 
+aggregationNameList
+    : LPAREN columnName (COMMA columnName)* RPAREN
+    ;
+
 aggregationItem
-    : columnName ASSIGN aggregationFunction
+    : aggregationNameList ASSIGN aggregationFunction
+    | columnName ASSIGN aggregationFunction
     | aggregationFunction (AS columnName)?
     ;
 
