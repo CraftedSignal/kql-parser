@@ -80,6 +80,7 @@ type dataflowOwnerFrame struct {
 type dataflowOperatorInfo struct{ PipeStage, Pipeline int }
 
 type kqlDataflowBuilder struct {
+	aggregateOwners map[*AggregationItemContext]int
 	flow            *QueryDataflow
 	extractor       *conditionExtractor
 	owners          *kqlSourceOwners
@@ -96,6 +97,7 @@ type kqlDataflowBuilder struct {
 func buildKQLDataflow(tree antlr.Tree, owners *kqlSourceOwners, extractor *conditionExtractor, budget *parseBudget) *QueryDataflow {
 	budget.reserveMetadata(1, 0)
 	b := &kqlDataflowBuilder{flow: &QueryDataflow{Complete: true}, extractor: extractor, owners: owners, budget: budget, current: make(map[int]string), stageByPosition: make(map[dataflowOperatorInfo]int), stageBySearch: make(map[ISearchOperatorContext]int), stageByOwner: make(map[int]int), tombstones: make(map[int]bool), ownerPipeline: make(map[int]int), lastPipeStage: make(map[int]int)}
+	b.indexAggregationOwners()
 	b.ownerPipeline[owners.source.SelectedOwnerID] = extractor.queryPipeline
 	var walk func(antlr.Tree)
 	walk = func(node antlr.Tree) {
@@ -339,9 +341,16 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 			keptContexts := b.extractor.aggregationContexts[:0]
 			for i, aggregation := range b.extractor.aggregations {
 				b.budget.step()
+				owner := b.extractor.aggregationContexts[i]
+				b.budget.step()
 				if aggregation.PipeStage != info.PipeStage || aggregation.Pipeline != info.Pipeline {
+					// Rewritten synthetic summaries are removed in place. Keep
+					// the same typed-owner index aligned with that compaction.
+					b.aggregateOwners[owner] = len(kept)
 					kept = append(kept, aggregation)
-					keptContexts = append(keptContexts, b.extractor.aggregationContexts[i])
+					keptContexts = append(keptContexts, owner)
+				} else {
+					delete(b.aggregateOwners, owner)
 				}
 			}
 			b.extractor.aggregations = kept
@@ -474,71 +483,34 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 		}
 	case "aggregate":
 		mode = "closed"
-		summary := ctx.SummarizeOperator()
-		if summary.AggregationList() == nil {
+		plan := b.planSummarizeNames(ctx.SummarizeOperator(), info)
+		if plan.status != summarizeRepresented {
+			// Invalid duplicate declarations are diagnosed by Kusto. Preserve
+			// legacy summaries and the existing conservative opaque-stage contract,
+			// rather than inventing an output name or a new fatal parse policy.
 			stage.Effect = "opaque"
 			break
 		}
-		if b.unrepresentedSummarizeOutputs(summary.AggregationList()) ||
-			b.summarizeHasUnaliasedIntegerGroup(summary.GroupByList()) {
-			stage.Effect = "opaque"
-			break
-		}
-		for _, item := range summary.AggregationList().AllAggregationItem() {
-			alias := ""
-			if item.Identifier() != nil {
-				alias = b.authoredIdentifier(item.Identifier())
-			}
-			agg := newAggregation(item.AggregationFunction(), alias, info.PipeStage, b.budget, b.extractor)
-			expression, ok := b.owners.authoredContext(item.AggregationFunction(), b.budget)
-			if !ok {
-				sourceAbort("aggregate expression lacks authored span")
-			}
-			bindingID := b.addBinding(&stage, agg.Column, "aggregate", expression, input)
-			paired := false
-			for i, owner := range b.extractor.aggregationContexts {
-				b.budget.step()
-				if owner != item {
-					continue
-				}
-				candidate := &b.extractor.aggregations[i]
-				if candidate.PipeStage != info.PipeStage || candidate.Pipeline != info.Pipeline || candidate.Column != agg.Column || candidate.BindingID != "" {
-					sourceAbort("aggregate occurrence owner is invalid")
-				}
-				b.budget.reserveMetadataStrings(0, stage.ID, bindingID)
-				candidate.StageID, candidate.BindingID = stage.ID, bindingID
-				paired = true
-				break
-			}
-			if !paired {
-				sourceAbort("represented aggregate lacks structured occurrence")
+		// Reserve every replacement column before publishing any of the plan.
+		for _, metric := range plan.metrics {
+			b.budget.step()
+			candidate := &b.extractor.aggregations[metric.index]
+			b.budget.reserveWork(len(metric.column))
+			if candidate.Column != metric.column {
+				b.budget.reserveMetadataStrings(0, metric.column)
 			}
 		}
-		if groups := summary.GroupByList(); groups != nil {
-			for _, item := range groups.AllGroupByItem() {
-				if item.Expression() == nil {
-					stage.Effect = "opaque"
-					break
-				}
-				if b.extractor.typed != nil && b.extractor.typed.hasOpaqueReference(item.Expression()) {
-					stage.Effect = "opaque"
-					break
-				}
-				expression, ok := b.owners.authoredContext(item.Expression(), b.budget)
-				if !ok {
-					sourceAbort("group expression lacks authored span")
-				}
-				field := item.Expression().GetText()
-				if item.Identifier() != nil {
-					field = b.authoredIdentifier(item.Identifier())
-				} else if !isValidFieldName(field) && decodeKQLIdentifier(field, b.budget) == field {
-					stage.Effect = "opaque"
-					break
-				} else {
-					field = b.authoredIdentifier(item.Expression())
-				}
-				b.addBinding(&stage, field, "group", expression, input)
-			}
+		for _, metric := range plan.metrics {
+			b.budget.step()
+			candidate := &b.extractor.aggregations[metric.index]
+			candidate.Column = metric.column
+			bindingID := b.addBinding(&stage, metric.column, "aggregate", metric.expression, input)
+			b.budget.reserveMetadataStrings(0, stage.ID, bindingID)
+			candidate.StageID, candidate.BindingID = stage.ID, bindingID
+		}
+		for _, group := range plan.groups {
+			b.budget.step()
+			b.addBinding(&stage, group.column, "group", group.expression, input)
 		}
 	}
 	if stage.Effect == "opaque" {
