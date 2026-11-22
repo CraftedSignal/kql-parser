@@ -6433,8 +6433,14 @@ func (e *conditionExtractor) EnterAggregationItem(ctx *AggregationItemContext) {
 	if e.inSubquery > 0 {
 		return
 	}
-	aggregation := newAggregation(ctx.AggregationFunction(), alias, e.currentStage)
+	aggregation := newAggregation(ctx.AggregationFunction(), alias, e.currentStage, e.budget, e)
 	aggregation.Pipeline = e.currentPipeline()
+	// The summary owns the decoded input identity and generated output name.
+	// The dataflow pairing temporary does not retain a second summary.
+	e.budget.reserveMetadataStrings(0, aggregation.Field)
+	if alias == "" {
+		e.budget.reserveMetadataStrings(0, aggregation.Column)
+	}
 	e.budget.reserveOutput(1)
 	e.aggregations = append(e.aggregations, aggregation)
 	e.aggregationContexts = append(e.aggregationContexts, ctx)
@@ -6448,7 +6454,7 @@ func aggregationFunctionText(ctx IAggregationFunctionContext) string {
 }
 
 // newAggregation describes one summarize aggregation and the column it outputs.
-func newAggregation(ctx IAggregationFunctionContext, alias string, stage int) Aggregation {
+func newAggregation(ctx IAggregationFunctionContext, alias string, stage int, budget *parseBudget, owner *conditionExtractor) Aggregation {
 	aggregation := Aggregation{Column: alias, PipeStage: stage}
 	if ctx == nil || ctx.FunctionCall() == nil || ctx.FunctionCall().Identifier() == nil {
 		return aggregation
@@ -6464,15 +6470,77 @@ func newAggregation(ctx IAggregationFunctionContext, alias string, stage int) Ag
 	}
 	if call.ArgumentList() != nil {
 		if arguments := call.ArgumentList().AllArgument(); len(arguments) > 0 && arguments[0].ASSIGN() == nil && arguments[0].Expression() != nil {
-			if text := arguments[0].Expression().GetText(); isValidFieldName(text) {
-				aggregation.Field = text
-			}
+			aggregation.Field = owner.aggregateFieldIdentity(arguments[0].Expression(), budget)
 		}
 	}
 	if aggregation.Column == "" {
+		// Charge construction work before the temporary output-name allocation.
+		budget.reserveWork(len(aggregation.Function) + len(aggregation.Field) + 1)
 		aggregation.Column = defaultAggregationColumn(aggregation.Function, aggregation.Field)
 	}
 	return aggregation
+}
+
+// aggregateFieldIdentity accepts one grammar-proven reference, not a value or
+// computed argument. Authored ownership restores normalized digit-leading names;
+// an index access normalized into a dotted reference is not a direct column.
+func (e *conditionExtractor) aggregateFieldIdentity(tree antlr.Tree, budget *parseBudget) string {
+	if ctx, ok := tree.(antlr.ParserRuleContext); ok && e.typed != nil && ctx.GetStart() != nil && ctx.GetStop() != nil {
+		start, stop := ctx.GetStart().GetStart(), ctx.GetStop().GetStop()
+		for i := sort.SearchInts(e.typed.starts, start); i < len(e.typed.starts) && e.typed.starts[i] <= stop; i++ {
+			budget.step()
+			origin := e.typed.byStart[e.typed.starts[i]]
+			if origin.opaqueReference || origin.bracketReference {
+				return ""
+			}
+		}
+	}
+	for tree != nil {
+		budget.step()
+		switch ctx := tree.(type) {
+		case IIdentifierContext:
+			text := ctx.GetText()
+			budget.reserveWork(len(text))
+			if numericToken.MatchString(text) || text == "true" || text == "false" {
+				return ""
+			}
+			return e.authoredIdentifier(ctx)
+		case IPrimaryExpressionContext:
+			if ctx.QUOTED_IDENTIFIER() != nil {
+				return e.authoredIdentifier(ctx)
+			}
+		case IPostfixExpressionContext:
+			if len(ctx.AllPostfixOperator()) > 0 {
+				base := ctx.PrimaryExpression()
+				if base == nil || base.Identifier() == nil {
+					return ""
+				}
+				for _, op := range ctx.AllPostfixOperator() {
+					budget.step()
+					if op.DOT() == nil || op.Identifier() == nil {
+						return ""
+					}
+				}
+				first := e.aggregateFieldIdentity(base.Identifier(), budget)
+				if first == "" {
+					return ""
+				}
+				parts := appendTemporary([]string(nil), budget, first)
+				budget.reserveWork(len(first))
+				for _, op := range ctx.AllPostfixOperator() {
+					budget.step()
+					part := e.authoredIdentifier(op.Identifier())
+					// Precharge each copied component and separator before Join.
+					budget.reserveWork(len(part))
+					budget.reserveWork(1)
+					parts = appendTemporary(parts, budget, part)
+				}
+				return strings.Join(parts, ".")
+			}
+		}
+		tree = kqlTransparentScalarChild(tree, budget)
+	}
+	return ""
 }
 
 // defaultAggregationColumn is the column KQL names an aggregation without an
