@@ -6474,11 +6474,70 @@ func newAggregation(ctx IAggregationFunctionContext, alias string, stage int, bu
 		}
 	}
 	if aggregation.Column == "" {
+		function := aggregation.Function
+		if function == "make_bag" {
+			if owner.makeBagDirectOutput(call, budget) {
+				function = "bag"
+			}
+		}
 		// Charge construction work before the temporary output-name allocation.
-		budget.reserveWork(len(aggregation.Function) + len(aggregation.Field) + 1)
-		aggregation.Column = defaultAggregationColumn(aggregation.Function, aggregation.Field)
+		budget.reserveWork(len(function) + len(aggregation.Field) + 1)
+		aggregation.Column = defaultAggregationColumn(function, aggregation.Field)
 	}
 	return aggregation
+}
+
+// makeBagDirectOutput recognizes only the documented lowercase function and the
+// proven one/two-positional-argument shape with an ordinary original column.
+// A decoded field string alone cannot distinguish a path from a quoted name or
+// a normalized scalar. Callers share this check before naming or binding output.
+func (e *conditionExtractor) makeBagDirectOutput(call IFunctionCallContext, budget *parseBudget) bool {
+	if call == nil || call.Identifier() == nil || call.Identifier().IDENTIFIER() == nil {
+		return false
+	}
+	token := call.Identifier().IDENTIFIER().GetSymbol()
+	budget.reserveWork(token.GetStop() - token.GetStart() + 1)
+	if token.GetText() != "make_bag" {
+		return false
+	}
+	list := call.ArgumentList()
+	if list == nil {
+		return false
+	}
+	var first IArgumentContext
+	count := 0
+	for _, child := range list.GetChildren() {
+		budget.step()
+		argument, ok := child.(IArgumentContext)
+		if !ok {
+			continue
+		}
+		count++
+		if argument.ASSIGN() != nil || count > 2 {
+			return false
+		}
+		if first == nil {
+			first = argument
+		}
+	}
+	if first == nil || first.Expression() == nil {
+		return false
+	}
+	budget.step()
+	if e.typed != nil && e.typed.hasOrigin(first.Expression()) {
+		return false
+	}
+	var tree antlr.Tree = first.Expression()
+	for tree != nil {
+		budget.step()
+		if identifier, ok := tree.(IIdentifierContext); ok {
+			// IDENTIFIER's grammar is [a-zA-Z_][a-zA-Z0-9_]*. Keywords,
+			// quoted/numeric identifiers and postfix operators are not this token.
+			return identifier.IDENTIFIER() != nil
+		}
+		tree = kqlTransparentScalarChild(tree, budget)
+	}
+	return false
 }
 
 // aggregateFieldIdentity accepts one grammar-proven reference, not a value or
