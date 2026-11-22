@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/antlr4-go/antlr/v4"
 )
@@ -390,54 +392,47 @@ func validateMembershipRHS(rhs string, budget *parseBudget) {
 			membershipFailure("unvalidated tabular stage")
 		}
 	}
-	validateMembershipConstructors(rhs, budget)
-	protected, _ := protectMembershipSources(rhs, budget)
+	spans := validateMembershipConstructors(rhs, budget)
+	// Only the private syntax-check buffer substitutes validated constructors.
+	// Authored membership protection/ownership always retains the original rhs.
+	syntax := membershipConstructorSyntax(rhs, spans, budget)
+	protected, _ := protectMembershipSources(syntax, budget)
 	validateMembershipQuery(protected, budget)
 }
 
 // Validate every constructor before normalizers can replace it with a dummy
 // table name, including constructors nested in union/join branches.
-func validateMembershipConstructors(rhs string, budget *parseBudget) {
-	tokens := membershipTokens(rhs, budget)
-	positions := searchRuneBytes(rhs, budget)
-	for i := 0; i < len(tokens)-1; i++ {
-		budget.step()
-		kind := tokens[i].GetTokenType()
-		if kind != KQLLexerDATATABLE && kind != KQLLexerEXTERNALDATA {
-			continue
-		}
-		if i+1 >= len(tokens)-1 || tokens[i+1].GetTokenType() != KQLLexerLPAREN {
-			membershipFailure("invalid tabular constructor schema")
-		}
-		close, _ := membershipParenEnd(tokens, i+1, budget)
-		if close < 0 || close+1 >= len(tokens)-1 {
-			membershipFailure("invalid tabular constructor data")
-		}
-		end := close + 2 // one bracket-data token after the schema
-		if kind == KQLLexerEXTERNALDATA && end < len(tokens)-1 && tokens[end].GetTokenType() == KQLLexerWITH {
-			if end+1 >= len(tokens)-1 || tokens[end+1].GetTokenType() != KQLLexerLPAREN {
-				membershipFailure("invalid externaldata options")
+func validateMembershipConstructors(rhs string, budget *parseBudget) []membershipConstructorSpan {
+	var spans []membershipConstructorSpan
+	for offset := 0; offset < len(rhs); {
+		// Re-tokenize from a proven raw endpoint: an original token may cross
+		// it because the lexer mistakes a ] inside a value for a data closer.
+		tokens := membershipTokens(rhs[offset:], budget)
+		positions := searchRuneBytes(rhs[offset:], budget)
+		found := false
+		for _, token := range tokens {
+			budget.step()
+			kind := token.GetTokenType()
+			if kind != KQLLexerDATATABLE && kind != KQLLexerEXTERNALDATA {
+				continue
 			}
-			optionClose, _ := membershipParenEnd(tokens, end+1, budget)
-			if optionClose < 0 {
-				membershipFailure("invalid externaldata options")
-			}
-			end = optionClose + 1
+			start := offset + positions[token.GetStart()]
+			end := start + validateMembershipConstructor(rhs[start:], budget)
+			spans = appendTemporary(spans, budget, membershipConstructorSpan{start, end})
+			offset, found = end, true
+			break
 		}
-		startByte := positions[tokens[i].GetStart()]
-		endByte := len(rhs)
-		if end < len(tokens)-1 {
-			endByte = positions[tokens[end].GetStart()]
+		if !found {
+			break
 		}
-		validateMembershipConstructor(rhs[startByte:endByte], budget)
-		i = end - 1
 	}
+	return spans
 }
 
 // The generated grammar cannot parse adjacent bracketed constructor data: its
 // lexer emits the whole [..] as a quoted identifier. Validate that discarded
 // source explicitly before the normalizer substitutes its table reference.
-func validateMembershipConstructor(rhs string, budget *parseBudget) {
+func validateMembershipConstructor(rhs string, budget *parseBudget) int {
 	tokens := membershipTokens(rhs, budget)
 	first := 0
 	limit := len(tokens) - 1 // exclude EOF and enclosing grouping parentheses
@@ -451,11 +446,11 @@ func validateMembershipConstructor(rhs string, budget *parseBudget) {
 		limit--
 	}
 	if first >= len(tokens) {
-		return
+		return 0
 	}
 	kind := tokens[first].GetTokenType()
 	if kind != KQLLexerDATATABLE && kind != KQLLexerEXTERNALDATA {
-		return
+		return 0
 	}
 	if first+1 >= len(tokens) || tokens[first+1].GetTokenType() != KQLLexerLPAREN {
 		membershipFailure("invalid tabular constructor schema")
@@ -477,19 +472,14 @@ func validateMembershipConstructor(rhs string, budget *parseBudget) {
 				membershipFailure("invalid tabular constructor schema")
 			}
 			j++
-			if j == close {
-				membershipFailure("trailing constructor column comma")
-			}
 		}
 	}
 	if columns == 0 {
 		membershipFailure("empty tabular constructor schema")
 	}
-	data := tokens[close+1].GetText()
-	if len(data) < 2 || data[0] != '[' || data[len(data)-1] != ']' {
-		membershipFailure("invalid tabular constructor data")
-	}
-	values := membershipSplitValues(data[1:len(data)-1], budget)
+	positions := searchRuneBytes(rhs, budget)
+	dataStart, dataEnd := membershipConstructorData(rhs, positions[tokens[close].GetStop()+1], budget)
+	values := membershipSplitValues(rhs[dataStart+1:dataEnd-1], budget)
 	if kind == KQLLexerDATATABLE && len(values)%columns != 0 {
 		membershipFailure("incomplete datatable row")
 	}
@@ -509,63 +499,169 @@ func validateMembershipConstructor(rhs string, budget *parseBudget) {
 		}
 		validateMembershipQuery("T | where x == "+value, budget)
 	}
-	next := close + 2
-	if kind == KQLLexerEXTERNALDATA && next < limit && tokens[next].GetTokenType() == KQLLexerWITH {
-		if next+1 >= limit || tokens[next+1].GetTokenType() != KQLLexerLPAREN {
+	// Tokenize the suffix independently from the trusted raw endpoint. No
+	// token that began inside the data can conceal bytes beyond that endpoint.
+	suffix := rhs[dataEnd:]
+	suffixTokens := membershipTokens(suffix, budget)
+	suffixPositions := searchRuneBytes(suffix, budget)
+	next, consumed := 0, dataEnd
+	if kind == KQLLexerEXTERNALDATA && suffixTokens[next].GetTokenType() == KQLLexerWITH {
+		if next+1 >= len(suffixTokens)-1 || suffixTokens[next+1].GetTokenType() != KQLLexerLPAREN {
 			membershipFailure("invalid externaldata options")
 		}
-		optionEnd, _ := membershipParenEnd(tokens, next+1, budget)
+		optionEnd, _ := membershipParenEnd(suffixTokens, next+1, budget)
 		if optionEnd < 0 || optionEnd == next+2 {
 			membershipFailure("invalid externaldata options")
 		}
 		for j := next + 2; j < optionEnd; {
 			budget.step()
-			if j+2 >= optionEnd || !isSimpleIdentifier(tokens[j].GetText()) || tokens[j+1].GetTokenType() != KQLLexerASSIGN {
+			if j+2 >= optionEnd || !isSimpleIdentifier(suffixTokens[j].GetText()) || suffixTokens[j+1].GetTokenType() != KQLLexerASSIGN {
 				membershipFailure("invalid externaldata option")
 			}
-			validateMembershipQuery("T | where x == "+tokens[j+2].GetText(), budget)
+			validateMembershipQuery("T | where x == "+suffixTokens[j+2].GetText(), budget)
 			j += 3
 			if j < optionEnd {
-				if tokens[j].GetTokenType() != KQLLexerCOMMA {
+				if suffixTokens[j].GetTokenType() != KQLLexerCOMMA {
 					membershipFailure("invalid externaldata option")
 				}
 				j++
 			}
 		}
+		consumed = dataEnd + suffixPositions[suffixTokens[optionEnd].GetStop()+1]
 		next = optionEnd + 1
 	}
-	if next < limit && tokens[next].GetTokenType() != KQLLexerPIPE {
+	if kind := suffixTokens[next].GetTokenType(); kind != antlr.TokenEOF && kind != KQLLexerPIPE && kind != KQLLexerRPAREN {
 		membershipFailure("invalid tabular constructor suffix")
 	}
+	// Any following pipeline/group/suffix bytes remain in the syntax buffer.
+	return consumed
 }
 
-func membershipSplitValues(data string, budget *parseBudget) []string {
-	if strings.TrimSpace(data) == "" {
-		return nil
-	}
-	var values []string
-	start, depth := 0, 0
-	quote := byte(0)
-	for i := 0; i < len(data); i++ {
+// Only whitespace and // line comments are constructor trivia. Block comments
+// remain visible to validation instead of being silently accepted as a tail.
+func membershipSkipTrivia(text string, at int, budget *parseBudget) int {
+	for at < len(text) {
 		budget.step()
-		ch := data[i]
-		if quote != 0 {
-			if ch == '\\' && i+1 < len(data) {
-				i++
-				continue
-			}
-			if ch == quote {
-				if i+1 < len(data) && data[i+1] == quote {
-					i++
-				} else {
-					quote = 0
-				}
+		if strings.HasPrefix(text[at:], "//") {
+			for at < len(text) && text[at] != '\r' && text[at] != '\n' {
+				budget.step()
+				at++
 			}
 			continue
 		}
+		r, width := utf8.DecodeRuneInString(text[at:])
+		if !unicode.IsSpace(r) {
+			break
+		}
+		at += width
+	}
+	return at
+}
+
+// Read raw bytes because a multiline bracket body is not one lexer token.
+// Whole string/comment regions may themselves contain commas and brackets.
+func membershipConstructorData(text string, afterSchema int, budget *parseBudget) (start, end int) {
+	start = membershipSkipTrivia(text, afterSchema, budget)
+	if start >= len(text) || text[start] != '[' {
+		membershipFailure("invalid tabular constructor data")
+	}
+	depth := 1
+	for i := start + 1; i < len(text); {
+		budget.step()
+		if strings.HasPrefix(text[i:], "//") {
+			for i < len(text) && text[i] != '\r' && text[i] != '\n' {
+				budget.step()
+				i++
+			}
+			continue
+		}
+		if token, ok := compoundStringAt(text, i, budget); ok {
+			if !token.valid {
+				membershipFailure("invalid constructor string")
+			}
+			i = token.end
+			continue
+		}
+		switch text[i] {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				return start, i + 1
+			}
+		}
+		i++
+	}
+	membershipFailure("unbalanced tabular constructor data")
+	return 0, 0
+}
+
+type membershipConstructorSpan struct{ start, end int }
+
+func membershipConstructorSyntax(rhs string, spans []membershipConstructorSpan, budget *parseBudget) string {
+	if len(spans) == 0 {
+		return rhs
+	}
+	var names []string
+	size, last := 0, 0
+	for i, span := range spans {
+		budget.reserveWork(20) // Bounded decimal int temporary, before Itoa.
+		number := strconv.Itoa(i)
+		budget.reserveWork(len("__kql_constructor_") + len(number) + 2)
+		name := "__kql_constructor_" + number + "__"
+		for {
+			budget.reserveWork(len(rhs))
+			if !strings.Contains(rhs, name) {
+				break
+			}
+			budget.reserveWork(len(name) + 1)
+			name += "_"
+		}
+		names = appendTemporary(names, budget, name)
+		size = compoundSize(size, span.start-last, budget)
+		size = compoundSize(size, len(name)+2, budget)
+		last = span.end
+	}
+	size = compoundSize(size, len(rhs)-last, budget)
+	budget.reserveWork(size)
+	var out strings.Builder
+	out.Grow(size)
+	last = 0
+	for i, span := range spans {
+		budget.step()
+		out.WriteString(rhs[last:span.start])
+		out.WriteByte(' ')
+		out.WriteString(names[i])
+		out.WriteByte(' ')
+		last = span.end
+	}
+	out.WriteString(rhs[last:])
+	return out.String()
+}
+
+func membershipSplitValues(data string, budget *parseBudget) []string {
+	var values []string
+	start := membershipSkipTrivia(data, 0, budget)
+	depth, content := 0, false
+	for i := start; i < len(data); {
+		budget.step()
+		if strings.HasPrefix(data[i:], "//") {
+			for i < len(data) && data[i] != '\r' && data[i] != '\n' {
+				budget.step()
+				i++
+			}
+			continue
+		}
+		if token, ok := compoundStringAt(data, i, budget); ok {
+			if !token.valid {
+				membershipFailure("invalid constructor string")
+			}
+			content, i = true, token.end
+			continue
+		}
+		ch := data[i]
 		switch ch {
-		case '"', '\'':
-			quote = ch
 		case '(', '[':
 			depth++
 		case ')', ']':
@@ -575,25 +671,29 @@ func membershipSplitValues(data string, budget *parseBudget) []string {
 			}
 		case ',':
 			if depth == 0 {
-				value := strings.TrimSpace(data[start:i])
-				if value == "" {
+				if !content {
 					membershipFailure("empty constructor value")
 				}
 				budget.reserveOutput(1)
-				values = append(values, value)
-				start = i + 1
+				values = appendTemporary(values, budget, strings.TrimSpace(data[start:i]))
+				start = membershipSkipTrivia(data, i+1, budget)
+				content, i = false, start
+				continue
 			}
 		}
+		if ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n' {
+			content = true
+		}
+		i++
 	}
-	if quote != 0 || depth != 0 {
+	if depth != 0 {
 		membershipFailure("unbalanced constructor value")
 	}
-	value := strings.TrimSpace(data[start:])
-	if value == "" {
-		membershipFailure("trailing constructor value comma")
+	if content {
+		budget.reserveOutput(1)
+		values = appendTemporary(values, budget, strings.TrimSpace(data[start:]))
 	}
-	budget.reserveOutput(1)
-	return append(values, value)
+	return values
 }
 
 func validateMembershipQuery(query string, budget *parseBudget) {

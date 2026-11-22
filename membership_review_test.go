@@ -65,7 +65,7 @@ func TestReviewTabularWithoutPipe(t *testing.T) {
 	if reflect.DeepEqual(pa, pb) || reflect.DeepEqual(sa, sb) {
 		t.Errorf("different table contents conflated: parse=%+v semantic=%+v", pa.Expression.Scalar, sa.Expression.Scalar)
 	}
-	for _, atom := range []string{`Account in (datatable(a:string)["x"])`, `Account in (datatable(a:string)["y"])`, `Account in ((datatable(a:string)["x"]))`, `Account in (datatable(a:string,b:long)["x",1,"y",2])`, `Account in (externaldata(a:string)[@"https://example.test/a.csv"])`, `Account in (externaldata(a:string)[@"https://example.test/a.csv"] with (format="csv"))`} {
+	for _, atom := range []string{`Account in (datatable(a:string)["x"])`, `Account in (datatable(a:string)["y"])`, `Account in ((datatable(a:string)["x"]))`, `Account in (datatable(a:string,b:long)["x",1,"y",2])`, `Account in (externaldata(a:string)[@"https://example.test/a.csv"])`, `Account in (externaldata(a:string)[@"https://example.test/a.csv"] with (format="csv"))`, `Account in (datatable(a:string)["x",])`, `Account in (externaldata(a:string)[@"https://example.test/a.csv",])`} {
 		q := `T | where ` + atom
 		p, s := k.ExtractConditions(q), k.AnalyzeQuery(q)
 		if len(p.Errors) != 0 || len(s.Errors) != 0 || len(p.Conditions) != 0 || len(s.Conditions) != 0 || p.Expression == nil || s.Expression == nil || p.Expression.Scalar == nil || s.Expression.Scalar == nil || p.Expression.Scalar.Text != atom || s.Expression.Scalar.Text != atom {
@@ -73,10 +73,8 @@ func TestReviewTabularWithoutPipe(t *testing.T) {
 		}
 	}
 	for _, q := range []string{
-		`T | where Account in (datatable(a:string)["x",])`,
 		`T | where Account in (datatable(a:string)["x")`,
 		`T | where Account in (datatable(a:)["x"])`,
-		`T | where Account in (externaldata(a:string)[@"https://example.test/a.csv",])`,
 	} {
 		p, s := k.ExtractConditions(q), k.AnalyzeQuery(q)
 		if len(p.Errors) == 0 || len(s.Errors) == 0 || p.Expression != nil || s.Expression != nil || len(k.Validate(q)) == 0 {
