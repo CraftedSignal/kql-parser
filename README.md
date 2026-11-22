@@ -47,6 +47,12 @@ output scope. Check `Dataflow.Complete` and `Warnings` before using the graph:
 an opaque transform keeps its original stage and an unknown output scope.
 The graph describes provenance; it does not execute KQL predicates.
 
+An unaliased integer literal in `project` has a generated output name outside
+this graph's finite naming contract, so the whole projection remains opaque.
+Explicit aliases and quoted numeric column references remain distinct supported
+paths. Legacy `ProjectedFields` stays available and does not prove a complete
+output schema when the graph is incomplete.
+
 Parser-produced `ComputedFields` and `ComputedExpressions` use exact-case keys.
 For `extend Fresh=src`, look up `"Fresh"`, not `"fresh"`; a separate raw field
 named `fresh` remains distinct. These legacy maps describe the latest value
