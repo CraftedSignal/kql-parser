@@ -615,6 +615,14 @@ func (b *kqlDataflowBuilder) unrepresentedSummarizeOutputs(list IAggregationList
 		// before materialization; function recognition is deliberately case-sensitive.
 		b.budget.reserveWork(token.GetStop() - token.GetStart() + 1)
 		name := token.GetText()
+		if name == "take_any" {
+			if _, valid := takeAnySingleArgument(call.ArgumentList(), b.budget); !valid {
+				return true
+			}
+			if item.ColumnName() != nil {
+				continue
+			} // outer declaration owns the result name
+		}
 		if item.ColumnName() == nil {
 			if _, _, handled, known := b.extractor.documentedAggregateOutput(call, b.budget); handled {
 				if !known {
@@ -702,13 +710,17 @@ func (b *kqlDataflowBuilder) unrepresentedSummarizeOutputs(list IAggregationList
 // wrappers ending in primaryExpression.STAR. Operators, strings, calls and
 // parenthesized expressions are not that standalone grammar alternative.
 func (b *kqlDataflowBuilder) standaloneAggregateWildcard(argument IArgumentContext) bool {
-	b.budget.step()
+	return standaloneAggregateWildcard(argument, b.budget)
+}
+
+func standaloneAggregateWildcard(argument IArgumentContext, budget *parseBudget) bool {
+	budget.step()
 	if argument.STAR() != nil {
 		return true
 	}
 	var tree antlr.Tree = argument.Expression()
 	for tree != nil {
-		b.budget.step()
+		budget.step()
 		if primary, ok := tree.(IPrimaryExpressionContext); ok {
 			return primary.STAR() != nil
 		}

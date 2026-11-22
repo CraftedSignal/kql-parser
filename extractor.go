@@ -6511,6 +6511,15 @@ func newAggregation(ctx IAggregationFunctionContext, alias string, stage int, bu
 	case "makelist":
 		aggregation.Function = "make_list"
 	}
+	if identifier := call.Identifier().IDENTIFIER(); aggregation.Function == "take_any" && identifier != nil {
+		token := identifier.GetSymbol()
+		budget.reserveWork(token.GetStop() - token.GetStart() + 1)
+		if token.GetText() == "take_any" {
+			if argument, valid := takeAnySingleArgument(call.ArgumentList(), budget); valid {
+				aggregation.Field = owner.aggregateFieldIdentity(argument.Expression(), budget)
+			}
+		}
+	}
 	if call.ArgumentList() != nil {
 		if arguments := call.ArgumentList().AllArgument(); len(arguments) > 0 && arguments[0].ASSIGN() == nil && arguments[0].Expression() != nil {
 			aggregation.Field = owner.aggregateFieldIdentity(arguments[0].Expression(), budget)
@@ -6578,6 +6587,27 @@ func (e *conditionExtractor) documentedAggregateOutput(call IFunctionCallContext
 	case "tdigest_merge", "merge_tdigest":
 		prefix = "merge_tdigests"
 	case "binary_all_and", "binary_all_or", "binary_all_xor":
+	case "take_any":
+		handled = true
+		argument, valid := takeAnySingleArgument(call.ArgumentList(), budget)
+		if !valid {
+			return
+		}
+		if argument.ASSIGN() != nil {
+			name = e.authoredIdentifier(argument.Identifier())
+			known = name != ""
+			return
+		}
+		var kind aggregateResultNameKind
+		name, kind = e.aggregateExpressionResultName(argument.Expression(), budget)
+		switch kind {
+		case aggregateNameKnown:
+			known = name != ""
+		case aggregateNameUnnamed:
+			name = "any_arg0"
+			known = true
+		}
+		return
 	case "take_anyif":
 		min, max = 2, 2
 	default:
@@ -6594,6 +6624,30 @@ func (e *conditionExtractor) documentedAggregateOutput(call IFunctionCallContext
 		known = false
 	}
 	return
+}
+
+// take_any's one tuple column can come from a positional expression or an
+// inner named expression. A typed star or any additional argument stays opaque.
+func takeAnySingleArgument(list IArgumentListContext, budget *parseBudget) (IArgumentContext, bool) {
+	if list == nil {
+		return nil, false
+	}
+	var first IArgumentContext
+	for _, child := range list.GetChildren() {
+		budget.step()
+		argument, ok := child.(IArgumentContext)
+		if !ok {
+			continue
+		}
+		if first != nil || argument.Expression() == nil || argument.ASSIGN() != nil && argument.Identifier() == nil {
+			return nil, false
+		}
+		if standaloneAggregateWildcard(argument, budget) {
+			return nil, false
+		}
+		first = argument
+	}
+	return first, first != nil
 }
 
 // Inspect typed children directly; generated AllArgument would allocate a list
