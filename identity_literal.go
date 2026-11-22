@@ -10,6 +10,12 @@ import (
 // keep their separate representation. Temporary scanning/decoding uses shared
 // work; retained fields remain charged at their existing ownership sites.
 func identityLiteral(raw string, budget *parseBudget) (value, tail string, ok bool) {
+	return readIdentityLiteral(raw, budget, false)
+}
+
+// Complete mode rejects another component or trailing syntax before decoding
+// the first literal. Prefix callers keep their original tail/accounting path.
+func readIdentityLiteral(raw string, budget *parseBudget, complete bool) (value, tail string, ok bool) {
 	budget.input(raw)
 	budget.reserveWork(len(raw))
 	raw = strings.TrimLeftFunc(raw, unicode.IsSpace)
@@ -31,6 +37,13 @@ func identityLiteral(raw string, budget *parseBudget) (value, tail string, ok bo
 			if verbatim && i+1 < len(raw) && raw[i+1] == quote {
 				i++
 				continue
+			}
+			if complete {
+				remainder := raw[i+1:]
+				budget.reserveWork(len(remainder))
+				if strings.TrimSpace(remainder) != "" {
+					return "", "", false
+				}
 			}
 			literal := raw[:i+1]
 			budget.reserveWork(len(literal)) // reserve decoder growth before allocation

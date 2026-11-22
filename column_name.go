@@ -42,6 +42,13 @@ func columnNameSpan(text string, start int, budget *parseBudget) (end int, parts
 }
 
 func decodedColumnName(text string, budget *parseBudget) (string, bool) {
+	// A complete standard/verbatim literal needs no compound inventories or
+	// concatenation. Keep its existing scan/decode reservations intact.
+	if len(text) >= 2 && text[0] == '[' && text[len(text)-1] == ']' {
+		if value, _, complete := readIdentityLiteral(text[1:len(text)-1], budget, true); complete {
+			return value, true
+		}
+	}
 	end, parts, ok := columnNameSpan(text, 0, budget)
 	if !ok || end != len(text) {
 		return "", false

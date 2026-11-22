@@ -250,3 +250,25 @@ func TestColumnNameCommentNewlines(t *testing.T) {
 		})
 	}
 }
+
+func TestColumnNameCompleteLiteralTail(t *testing.T) {
+	// With just the scan allowance, compound/trailing text must be rejected
+	// before allocating or charging the prefix decoder. Legacy prefix mode
+	// still decodes the first literal and returns its exact tail.
+	for _, raw := range []string{`'A' 'B'`, "'A' // c\r' B'", `'A' + other`} {
+		limits := defaultParseLimits()
+		limits.maxWork = len(raw) + len(raw) - 3
+		b, cancel := newParseBudget(context.Background(), limits)
+		value, _, ok := readIdentityLiteral(raw, b, true)
+		if ok || value != "" || b.work != limits.maxWork || b.output != 0 || b.metadataBytes != 0 {
+			t.Fatalf("premature prefix decode: %q value=%q ok=%v budget=%+v", raw, value, ok, b)
+		}
+		cancel()
+	}
+	b, cancel := newParseBudget(context.Background(), defaultParseLimits())
+	defer cancel()
+	value, tail, ok := identityLiteral(`'A' 'B'`, b)
+	if !ok || value != "A" || tail != ` 'B'` {
+		t.Fatalf("legacy prefix: %q %q %v", value, tail, ok)
+	}
+}
