@@ -634,6 +634,14 @@ func (b *kqlDataflowBuilder) unrepresentedSummarizeOutputs(list IAggregationList
 		// before materialization; function recognition is deliberately case-sensitive.
 		b.budget.reserveWork(token.GetStop() - token.GetStart() + 1)
 		name := token.GetText()
+		if name == "make_bag" {
+			if item.Identifier() == nil {
+				if !b.extractor.makeBagDirectOutput(call, b.budget) {
+					return true
+				}
+			}
+			continue
+		}
 		switch name {
 		case "arg_max", "argmax", "arg_min", "argmin", "take_any", "any",
 			"percentiles", "percentilesw", "percentile", "percentiles_array",

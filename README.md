@@ -257,3 +257,12 @@ array remains one output, including its dynamic percentile-list form; opacity
 does not assert multiple outputs or choose a disputed default name. Explicit
 aliases retain their existing graph behavior. This rule does not extend to named
 arguments, other functions or unsupported arities.
+
+For exact lowercase `make_bag` with one or two positional arguments and an
+ordinary original unquoted column such as `p`, the unaliased output is `bag_p`.
+The legacy aggregate and finite graph binding share that identity. Other
+unaliased `make_bag` argument shapes (including paths, quoted names, computed
+values and normalized origins) leave the whole summarize stage opaque before
+any metric or group bindings; their authored source and legacy summaries remain.
+Explicit aliases keep their existing output spelling and representation. This
+narrow naming contract does not validate input types or backend signatures.
