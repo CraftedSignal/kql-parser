@@ -1,8 +1,9 @@
 package kql
 
 import (
-	"github.com/antlr4-go/antlr/v4"
 	"strings"
+
+	"github.com/antlr4-go/antlr/v4"
 )
 
 // AggregationResult describes the ordered members of one authored call.
