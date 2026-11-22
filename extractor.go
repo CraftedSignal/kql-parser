@@ -6021,7 +6021,7 @@ func extractConditionsSource(source kqlExtractionSource, budget *parseBudget) (r
 		}
 	}
 
-	dataSources := extractPortableDataSources(query, normalizedQuery)
+	dataSources := extractPortableDataSources(query, normalizedQuery, budget)
 	if searchCount > 0 {
 		dataSources = searchSources(extractor, budget)
 	}
@@ -7290,7 +7290,8 @@ func kqlValueIsFieldReference(raw, value string) bool {
 	return true
 }
 
-func extractPortableDataSources(originalQuery, normalizedQuery string) []string {
+func extractPortableDataSources(originalQuery, normalizedQuery string, budgets ...*parseBudget) []string {
+	budget := suppliedBudget(budgets)
 	letNames := extractLetNames(originalQuery)
 	for name := range extractLetNames(normalizedQuery) {
 		letNames[name] = true
@@ -7298,7 +7299,7 @@ func extractPortableDataSources(originalQuery, normalizedQuery string) []string 
 
 	var sources []string
 	for _, query := range []string{originalQuery, normalizedQuery} {
-		for _, source := range extractDataSourcesFromQuery(query, letNames) {
+		for _, source := range extractDataSourcesFromQuery(query, letNames, budget) {
 			sources = appendUnique(sources, source)
 		}
 	}
@@ -7367,7 +7368,8 @@ func extractLetNames(query string) map[string]bool {
 	return names
 }
 
-func extractDataSourcesFromQuery(query string, letNames map[string]bool) []string {
+func extractDataSourcesFromQuery(query string, letNames map[string]bool, budgets ...*parseBudget) []string {
+	budget := suppliedBudget(budgets)
 	query = stripLineComments(normalizeNewlines(query))
 	var sources []string
 	for _, line := range strings.Split(query, "\n") {
@@ -7375,7 +7377,7 @@ func extractDataSourcesFromQuery(query string, letNames map[string]bool) []strin
 		if !ok {
 			continue
 		}
-		for _, source := range extractDataSourcesFromStatement(rhs, letNames, true) {
+		for _, source := range extractDataSourcesFromStatement(rhs, letNames, true, budget) {
 			sources = appendUnique(sources, source)
 		}
 	}
@@ -7389,7 +7391,7 @@ func extractDataSourcesFromQuery(query string, letNames map[string]bool) []strin
 		// of every parenthesized join.
 		allowLeadingSource := i == 0 || i < len(segments)-1
 		for _, statement := range splitStatements(segment) {
-			for _, source := range extractDataSourcesFromStatement(statement, letNames, allowLeadingSource) {
+			for _, source := range extractDataSourcesFromStatement(statement, letNames, allowLeadingSource, budget) {
 				sources = appendUnique(sources, source)
 			}
 		}
@@ -7448,7 +7450,8 @@ func splitStatements(query string) []string {
 	return statements
 }
 
-func extractDataSourcesFromStatement(statement string, letNames map[string]bool, allowLeadingSource bool) []string {
+func extractDataSourcesFromStatement(statement string, letNames map[string]bool, allowLeadingSource bool, budgets ...*parseBudget) []string {
+	budget := suppliedBudget(budgets)
 	statement = strings.TrimLeft(statement, " \t\r\n(),")
 	statement = stripOuterParens(statement)
 	if statement == "" {
@@ -7456,7 +7459,7 @@ func extractDataSourcesFromStatement(statement string, letNames map[string]bool,
 	}
 
 	if _, rhs, ok := parseLetAssignment(statement); ok {
-		return extractDataSourcesFromStatement(rhs, letNames, true)
+		return extractDataSourcesFromStatement(rhs, letNames, true, budget)
 	}
 
 	lower := strings.ToLower(statement)
@@ -7468,16 +7471,16 @@ func extractDataSourcesFromStatement(statement string, letNames map[string]bool,
 	case strings.HasPrefix(lower, "union "):
 		return extractUnionSources(statement, letNames)
 	case strings.HasPrefix(lower, "join "):
-		return extractJoinSources(statement, letNames)
+		return extractJoinSources(statement, letNames, budget)
 	case strings.HasPrefix(lower, "lookup "):
 		// A lookup's right side has the form of a join's.
-		return extractJoinSources("join "+statement[len("lookup "):], letNames)
+		return extractJoinSources("join "+statement[len("lookup "):], letNames, budget)
 	}
 
 	if !allowLeadingSource {
 		return nil
 	}
-	if source := qualifiedDataSource(statement, letNames); source != "" {
+	if source := qualifiedDataSource(statement, letNames, budget); source != "" {
 		return []string{source}
 	}
 	if source := leadingDataSource(statement, letNames); source != "" {
@@ -7489,7 +7492,8 @@ func extractDataSourcesFromStatement(statement string, letNames map[string]bool,
 // qualifiedDataSource returns the table a statement starts with when it is
 // written in another scope, such as workspace("w").T, app("a").T or
 // cluster("c").database("d").T, or named by table("T").
-func qualifiedDataSource(statement string, letNames map[string]bool) string {
+func qualifiedDataSource(statement string, letNames map[string]bool, budgets ...*parseBudget) string {
+	budget := suppliedBudget(budgets)
 	rest := strings.TrimSpace(statement)
 	scoped := false
 	for {
@@ -7497,16 +7501,20 @@ func qualifiedDataSource(statement string, letNames map[string]bool) string {
 		if open <= 0 || !isSimpleIdentifier(rest[:open]) {
 			break
 		}
+		tableLiteral := !scoped && strings.TrimSpace(rest[:open]) == "table"
 		close := findMatchingParen(rest, open)
 		if close < 0 {
+			if tableLiteral {
+				sourceAbort("unterminated table identity literal")
+			}
 			return ""
 		}
-		if !scoped && rest[:open] == "table" {
-			name, tail, ok := parseStringLiteral(rest[open+1 : close])
-			if !ok || strings.TrimSpace(tail) != "" {
-				return ""
+		if tableLiteral {
+			name, tail, ok := identityLiteral(rest[open+1:close], budget)
+			if !ok || strings.TrimSpace(tail) != "" || name == "" {
+				sourceAbort("unsupported constant table identity literal")
 			}
-			return cleanDataSourceToken(name, letNames)
+			return name
 		}
 		if close+1 >= len(rest) || rest[close+1] != '.' {
 			return ""
@@ -7571,12 +7579,13 @@ func skipOperatorParameters(text string) string {
 	}
 }
 
-func extractJoinSources(statement string, letNames map[string]bool) []string {
+func extractJoinSources(statement string, letNames map[string]bool, budgets ...*parseBudget) []string {
+	budget := suppliedBudget(budgets)
 	rest := skipOperatorParameters(strings.TrimSpace(statement[len("join "):]))
 	if strings.HasPrefix(rest, "(") {
 		close := findMatchingParen(rest, 0)
 		if close > 0 {
-			return extractDataSourcesFromQuery(rest[1:close], letNames)
+			return extractDataSourcesFromQuery(rest[1:close], letNames, budget)
 		}
 	}
 	if source := leadingDataSource(rest, letNames); source != "" {
