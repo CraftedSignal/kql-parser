@@ -6474,6 +6474,16 @@ func newAggregation(ctx IAggregationFunctionContext, alias string, stage int, bu
 		}
 	}
 	if aggregation.Column == "" {
+		if prefix, name, handled, known := owner.documentedAggregateOutput(call, budget); handled && known {
+			if prefix == "" {
+				budget.reserveWork(len(name))
+				aggregation.Column = name
+			} else {
+				budget.reserveWork(len(prefix) + len(name) + 1)
+				aggregation.Column = prefix + "_" + name
+			}
+			return aggregation
+		}
 		function := aggregation.Function
 		if function == "make_bag" {
 			if owner.makeBagDirectOutput(call, budget) {
@@ -6485,6 +6495,169 @@ func newAggregation(ctx IAggregationFunctionContext, alias string, stage int, bu
 		aggregation.Column = defaultAggregationColumn(function, aggregation.Field)
 	}
 	return aggregation
+}
+
+// aggregateResultName distinguishes an unnamed expression from a name whose
+// spelling requires schema/function metadata absent from this graph.
+type aggregateResultNameKind uint8
+
+const (
+	aggregateNameUnknown aggregateResultNameKind = iota
+	aggregateNameKnown
+	aggregateNameUnnamed
+)
+
+// documentedAggregateOutput shares eligibility and typed naming between legacy
+// summaries and the whole-summarize preflight. Empty prefix means FirstArgument.
+// Unknown names retain their legacy summary but must not claim a graph binding.
+func (e *conditionExtractor) documentedAggregateOutput(call IFunctionCallContext, budget *parseBudget) (prefix, name string, handled, known bool) {
+	if call == nil || call.Identifier() == nil || call.Identifier().IDENTIFIER() == nil {
+		return
+	}
+	token := call.Identifier().IDENTIFIER().GetSymbol()
+	budget.reserveWork(token.GetStop() - token.GetStart() + 1)
+	function := token.GetText()
+	min, max := 1, 1
+	switch function {
+	case "buildschema":
+		prefix = "schema"
+	case "make_list_if":
+		prefix = "list"
+		min, max = 2, 3
+	case "make_set_if":
+		prefix = "set"
+		min, max = 2, 3
+	case "make_bag_if":
+		prefix = "bag"
+		min, max = 2, 3
+	case "make_list_with_nulls":
+		prefix = "list"
+	case "tdigest_merge", "merge_tdigest":
+		prefix = "merge_tdigests"
+	case "binary_all_and", "binary_all_or", "binary_all_xor":
+	case "take_anyif":
+		min, max = 2, 2
+	default:
+		return
+	}
+	handled = true
+	first, valid := aggregatePositionalFirst(call.ArgumentList(), min, max, budget)
+	if !valid {
+		return
+	}
+	name, kind := e.aggregateExpressionResultName(first, budget)
+	known = kind == aggregateNameKnown || prefix != "" && kind == aggregateNameUnnamed
+	if prefix == "" && name == "" {
+		known = false
+	}
+	return
+}
+
+// Inspect typed children directly; generated AllArgument would allocate a list
+// even for the preflight that only needs arity and the first expression.
+func aggregatePositionalFirst(list IArgumentListContext, min, max int, budget *parseBudget) (IExpressionContext, bool) {
+	if list == nil {
+		return nil, false
+	}
+	var first IExpressionContext
+	count := 0
+	for _, child := range list.GetChildren() {
+		budget.step()
+		argument, ok := child.(IArgumentContext)
+		if !ok {
+			continue
+		}
+		count++
+		if count > max || argument.ASSIGN() != nil || argument.Expression() == nil {
+			return nil, false
+		}
+		if count == 1 {
+			first = argument.Expression()
+		}
+	}
+	return first, count >= min
+}
+
+func (e *conditionExtractor) aggregateExpressionResultName(tree antlr.Tree, budget *parseBudget) (string, aggregateResultNameKind) {
+	for tree != nil {
+		budget.step()
+		// Match an entire transformed occurrence, not merely an origin somewhere
+		// inside arithmetic. A scalar let remains an authored NameReference even
+		// when normalization replaces it with a literal or parenthesized expression.
+		if ctx, ok := tree.(antlr.ParserRuleContext); ok && e.typed != nil && ctx.GetStart() != nil && ctx.GetStop() != nil {
+			if origin, present := e.typed.byStart[ctx.GetStart().GetStart()]; present {
+				budget.reserveWork(len(origin.normalized))
+				if utf8.RuneCountInString(origin.normalized) == ctx.GetStop().GetStop()-ctx.GetStart().GetStart()+1 {
+					if origin.bracketReference || origin.opaqueReference {
+						return "", aggregateNameUnknown
+					}
+					if origin.binding != "" {
+						return origin.binding, aggregateNameKnown
+					}
+					if origin.referenceValue != "" {
+						return origin.referenceValue, aggregateNameKnown
+					}
+				}
+			}
+		}
+		switch ctx := tree.(type) {
+		case ILiteralContext:
+			return "", aggregateNameUnnamed
+		case IIdentifierContext:
+			budget.reserveWork(ctx.GetStop().GetStop() - ctx.GetStart().GetStart() + 1)
+			text := ctx.GetText()
+			if numericToken.MatchString(text) || text == "true" || text == "false" {
+				return "", aggregateNameUnnamed
+			}
+			return e.authoredIdentifier(ctx), aggregateNameKnown
+		case IPrimaryExpressionContext:
+			if ctx.QUOTED_IDENTIFIER() != nil {
+				return e.authoredIdentifier(ctx), aggregateNameKnown
+			}
+		case IPostfixExpressionContext:
+			for _, child := range ctx.GetChildren() {
+				budget.step()
+				if _, postfix := child.(IPostfixOperatorContext); postfix {
+					return "", aggregateNameUnknown
+				}
+			}
+		case IFunctionCallContext:
+			if builtin := ctx.BuiltinFunction(); builtin != nil {
+				if builtin.BAG_PACK() != nil || builtin.PACK() != nil || builtin.PACK_ALL() != nil {
+					return "", aggregateNameUnnamed
+				}
+				return "", aggregateNameUnknown
+			}
+			if ctx.Identifier() == nil || ctx.Identifier().IDENTIFIER() == nil {
+				return "", aggregateNameUnknown
+			}
+			token := ctx.Identifier().IDENTIFIER().GetSymbol()
+			budget.reserveWork(token.GetStop() - token.GetStart() + 1)
+			function := token.GetText()
+			if function != "tostring" && function != "tolower" {
+				return "", aggregateNameUnknown
+			}
+			first, valid := aggregatePositionalFirst(ctx.ArgumentList(), 1, 1, budget)
+			if !valid {
+				return "", aggregateNameUnknown
+			}
+			if function == "tolower" {
+				return "", aggregateNameUnnamed
+			}
+			tree = first
+			continue
+		}
+		next := kqlTransparentScalarChild(tree, budget)
+		if next == nil {
+			switch tree.(type) {
+			case IOrExpressionContext, IAndExpressionContext, INotExpressionContext, IComparisonExpressionContext, IAdditiveExpressionContext, IMultiplicativeExpressionContext, IUnaryExpressionContext:
+				return "", aggregateNameUnnamed
+			}
+			return "", aggregateNameUnknown
+		}
+		tree = next
+	}
+	return "", aggregateNameUnknown
 }
 
 // makeBagDirectOutput recognizes only the documented lowercase function and the
