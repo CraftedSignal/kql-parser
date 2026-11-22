@@ -475,6 +475,10 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 			stage.Effect = "opaque"
 			break
 		}
+		if b.unrepresentedSummarizeOutputs(summary.AggregationList()) {
+			stage.Effect = "opaque"
+			break
+		}
 		for _, item := range summary.AggregationList().AllAggregationItem() {
 			alias := ""
 			if item.Identifier() != nil {
@@ -554,6 +558,89 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 	b.stageByPosition[info] = stageIndex
 	b.stageByOwner[occurrenceID] = stageIndex
 	b.lastPipeStage[info.Pipeline] = info.PipeStage
+}
+
+// unrepresentedSummarizeOutputs inspects the whole stage before publishing any
+// finite bindings. Row-returning functions and unaliased take_any output names
+// are outside this graph's single-column aggregation contract. Legacy summaries
+// remain available without claiming a binding for these opaque stages.
+func (b *kqlDataflowBuilder) unrepresentedSummarizeOutputs(list IAggregationListContext) bool {
+	for _, child := range list.GetChildren() {
+		b.budget.step()
+		item, ok := child.(IAggregationItemContext)
+		if !ok || item.AggregationFunction() == nil {
+			continue
+		}
+		call := item.AggregationFunction().FunctionCall()
+		if call == nil || call.Identifier() == nil || call.Identifier().IDENTIFIER() == nil {
+			continue
+		}
+		token := call.Identifier().IDENTIFIER().GetSymbol()
+		// The grammar's regular identifier is ASCII. Reserve its text owner/scan
+		// before materialization; function recognition is deliberately case-sensitive.
+		b.budget.reserveWork(token.GetStop() - token.GetStart() + 1)
+		name := token.GetText()
+		switch name {
+		case "arg_max", "argmax", "arg_min", "argmin", "take_any", "any":
+		default:
+			continue
+		}
+		list := call.ArgumentList()
+		if list == nil {
+			continue
+		}
+		count, star := 0, false
+		positional := true
+		for _, child := range list.GetChildren() {
+			b.budget.step()
+			argument, ok := child.(IArgumentContext)
+			if !ok {
+				continue
+			}
+			if argument.ASSIGN() != nil {
+				positional = false
+				break
+			}
+			count++
+			star = star || b.standaloneAggregateWildcard(argument)
+		}
+		if !positional {
+			continue
+		}
+		switch name {
+		case "arg_max", "argmax", "arg_min", "argmin":
+			if count >= 2 {
+				return true
+			}
+		case "take_any", "any":
+			if count > 1 || count == 1 && (star || name == "take_any" && item.Identifier() == nil) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// A wildcard can use the argument alternative or a chain of expression
+// wrappers ending in primaryExpression.STAR. Operators, strings, calls and
+// parenthesized expressions are not that standalone grammar alternative.
+func (b *kqlDataflowBuilder) standaloneAggregateWildcard(argument IArgumentContext) bool {
+	b.budget.step()
+	if argument.STAR() != nil {
+		return true
+	}
+	var tree antlr.Tree = argument.Expression()
+	for tree != nil {
+		b.budget.step()
+		if primary, ok := tree.(IPrimaryExpressionContext); ok {
+			return primary.STAR() != nil
+		}
+		if tree.GetChildCount() != 1 {
+			return false
+		}
+		tree = tree.GetChild(0)
+	}
+	return false
 }
 
 func (b *kqlDataflowBuilder) emitPriorTombstones(ownerID, before int) {
