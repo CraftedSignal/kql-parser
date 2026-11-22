@@ -6594,7 +6594,18 @@ func (e *conditionExtractor) documentedAggregateOutput(call IFunctionCallContext
 			return
 		}
 		if argument.ASSIGN() != nil {
-			name = e.authoredIdentifier(argument.Identifier())
+			authored, owned := namedArgumentSource(argument, e.sourceOwners, budget)
+			if !owned {
+				sourceAbort("named argument declaration source ownership unavailable")
+			}
+			name = authored
+			if strings.HasPrefix(authored, "[") {
+				var valid bool
+				name, valid = decodedColumnName(authored, budget)
+				if !valid {
+					sourceAbort("invalid quoted named argument declaration")
+				}
+			}
 			known = name != ""
 			return
 		}
@@ -6639,7 +6650,7 @@ func takeAnySingleArgument(list IArgumentListContext, budget *parseBudget) (IArg
 		if !ok {
 			continue
 		}
-		if first != nil || argument.Expression() == nil || argument.ASSIGN() != nil && argument.Identifier() == nil {
+		if first != nil || argument.Expression() == nil || argument.ASSIGN() != nil && argument.Identifier() == nil && argument.QUOTED_IDENTIFIER() == nil {
 			return nil, false
 		}
 		if standaloneAggregateWildcard(argument, budget) {

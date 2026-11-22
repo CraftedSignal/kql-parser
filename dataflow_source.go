@@ -192,6 +192,23 @@ func (owners *kqlSourceOwners) authoredContext(ctx antlr.ParserRuleContext, budg
 	if !ok {
 		return "", false
 	}
+	return owners.authoredSpan(span, budget)
+}
+
+// A declaration terminal maps through the same authored pieces as a context;
+// synthetic/recovered tokens and invalid rune extents never establish ownership.
+func (owners *kqlSourceOwners) authoredToken(token antlr.Token, budget *parseBudget) (string, bool) {
+	if token == nil || token.GetTokenIndex() < 0 {
+		return "", false
+	}
+	start, stop := token.GetStart(), token.GetStop()
+	if start < 0 || stop < start || stop+1 >= len(owners.runeBytes) {
+		return "", false
+	}
+	return owners.authoredSpan(kqlByteSpan{owners.runeBytes[start], owners.runeBytes[stop+1]}, budget)
+}
+
+func (owners *kqlSourceOwners) authoredSpan(span kqlByteSpan, budget *parseBudget) (string, bool) {
 	at, start, end := 0, -1, -1
 	for _, piece := range owners.source.Pieces {
 		budget.step()

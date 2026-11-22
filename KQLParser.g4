@@ -1050,7 +1050,7 @@ argumentList
 
 argument
     : expression
-    | identifier ASSIGN expression
+    | (identifier | QUOTED_IDENTIFIER) ASSIGN expression
     | STAR
     ;
 
