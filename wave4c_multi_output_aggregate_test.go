@@ -16,7 +16,6 @@ func TestWave4cMultiOutputAggregatesOpaque(t *testing.T) {
 		{"argmax(Time, Id)", "argmax", "Time", "argmax_Time", 1},
 		{"arg_min(Time, Id)", "arg_min", "Time", "arg_min_Time", 1},
 		{"argmin(Time, Id)", "argmin", "Time", "argmin_Time", 1},
-		{"take_any(Name)", "take_any", "Name", "take_any_Name", 1},
 		{"V=take_any(*)", "take_any", "", "V", 1},
 		{"any(*)", "any", "", "any_", 1},
 		{"any(Name, Value)", "any", "Name", "any_Name", 1},
@@ -77,6 +76,7 @@ func TestWave4cMultiOutputAggregatesOpaque(t *testing.T) {
 }
 func TestWave4cSingleOutputAggregateControls(t *testing.T) {
 	for _, tc := range []struct{ call, column, field string }{
+		{"take_any(Name)", "Name", "Name"},
 		{"count()", "count_", ""},
 		{"sum(Bytes)", "sum_Bytes", "Bytes"},
 		{"V=take_any(Name)", "V", "Name"},
