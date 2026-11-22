@@ -144,3 +144,24 @@ func TestProjectReorderNeighborWildcard(t *testing.T) {
 		t.Fatalf("reorder bypass changed a neighbor: normalized=%q mapped=%q", normalized, mapped.Text)
 	}
 }
+
+func TestProjectReorderAbsenceProofRetainsUnownedTypedCheck(t *testing.T) {
+	const query = "T | project-reorder a"
+	b, cancel := newParseBudget(context.Background(), defaultParseLimits())
+	defer cancel()
+	source := newKQLMappedSource(query, b)
+	stream := preflight(query, b, true, nil)
+	parser := NewKQLParser(&budgetTokenStream{CommonTokenStream: stream, budget: b})
+	parser.RemoveErrorListeners()
+	tree := parser.Query()
+	owners := associateKQLSource(tree, source, b)
+	// Remove only the authored ownership evidence. A real typed reorder must
+	// still be rejected even when the authored reorder count becomes zero.
+	for _, id := range owners.Stages {
+		source.Occurrences[id].Command = "where"
+	}
+	clear(owners.Stages)
+	if diagnostic := validateKQLProjectReorders(tree, source, owners, stream.GetAllTokens(), false, b); diagnostic == "" {
+		t.Fatal("zero authored count bypassed unowned typed reorder validation")
+	}
+}

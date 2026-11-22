@@ -9,13 +9,13 @@ import (
 // Validate typed occurrences against the pre-normalization operator inventory.
 // This includes authored occurrences that parser recovery never reached, so
 // portable predicate extraction cannot promote a malformed reorder stage.
-func validateKQLProjectReorders(tree antlr.Tree, owners *kqlSourceOwners, syntaxErrors bool, budget *parseBudget) string {
+func validateKQLProjectReorders(tree antlr.Tree, source *kqlMappedSource, owners *kqlSourceOwners, tokens []antlr.Token, syntaxErrors bool, budget *parseBudget) string {
 	budget.step()
-	if owners == nil || owners.source == nil {
+	if source == nil {
 		return "project-reorder source ownership unavailable"
 	}
 	expected := 0
-	for _, occurrence := range owners.source.Occurrences {
+	for _, occurrence := range source.Occurrences {
 		budget.step()
 		if occurrence.Kind == "stage" && len(occurrence.Command) == len("project-reorder") {
 			budget.reserveWork(len(occurrence.Command))
@@ -24,8 +24,21 @@ func validateKQLProjectReorders(tree antlr.Tree, owners *kqlSourceOwners, syntax
 			}
 		}
 	}
+	// The canonical inventory covers authored operators, including occurrences
+	// recovery did not parse. The completed lexer stream is the SAME stream
+	// fed to this parser: generated TabularOperator dispatch enters a reorder
+	// rule only on PROJECT_REORDER. Both negative facts are required before
+	// avoiding an otherwise redundant full-tree walk.
+	if expected == 0 && projectReorderTokensAbsent(tokens, budget) {
+		return ""
+	}
 	if expected > 0 && syntaxErrors {
 		return "malformed project-reorder syntax"
+	}
+	if owners == nil {
+		owners = associateKQLSource(tree, source, budget)
+	} else if owners.source != source {
+		return "project-reorder source ownership mismatch"
 	}
 	var seen []bool
 	if expected > 0 {
@@ -80,6 +93,25 @@ func validateKQLProjectReorders(tree antlr.Tree, owners *kqlSourceOwners, syntax
 		return "project-reorder authored occurrence was not parsed completely"
 	}
 	return ""
+}
+
+// A missing/partial token inventory is not absence evidence. Literal/comment
+// interiors have different lexer types and never masquerade as this operator.
+func projectReorderTokensAbsent(tokens []antlr.Token, budget *parseBudget) bool {
+	budget.step()
+	if len(tokens) == 0 {
+		return false
+	}
+	for i, token := range tokens {
+		budget.step()
+		if token == nil || token.GetTokenType() == KQLParserPROJECT_REORDER {
+			return false
+		}
+		if token.GetTokenType() == antlr.TokenEOF {
+			return i == len(tokens)-1
+		}
+	}
+	return false
 }
 
 func validateKQLProjectReorderTree(node antlr.Tree, owners *kqlSourceOwners, budget *parseBudget) string {

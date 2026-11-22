@@ -5903,7 +5903,7 @@ func extractConditionsSource(source kqlExtractionSource, budget *parseBudget) (r
 
 	// Walk the tree to extract conditions
 	owners := associateKQLSource(tree, mappedSource, budget)
-	if diagnostic := validateKQLProjectReorders(tree, owners, len(lexerErrors.errors)+len(parserErrors.errors) > 0, budget); diagnostic != "" {
+	if diagnostic := validateKQLProjectReorders(tree, mappedSource, owners, stream.GetAllTokens(), len(lexerErrors.errors)+len(parserErrors.errors) > 0, budget); diagnostic != "" {
 		budget.reserveOutput(1)
 		errors := appendTemporary([]string(nil), budget, lexerErrors.errors...)
 		errors = appendTemporary(errors, budget, parserErrors.errors...)

@@ -55,8 +55,7 @@ func validateContext(ctx context.Context, query string, limits parseLimits) (err
 			return []string{"malformed or unsupported search syntax"}
 		}
 	}
-	owners := associateKQLSource(tree, normalization.mapped, budget)
-	if diagnostic := validateKQLProjectReorders(tree, owners, len(listener.errors) > 0, budget); diagnostic != "" {
+	if diagnostic := validateKQLProjectReorders(tree, normalization.mapped, nil, stream.GetAllTokens(), len(listener.errors) > 0, budget); diagnostic != "" {
 		budget.reserveOutput(1)
 		return appendTemporary(listener.errors, budget, diagnostic)
 	}
