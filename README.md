@@ -230,6 +230,12 @@ AGPL-3.0 - see [LICENSE](LICENSE) for details.
 
 ### Summarize output boundaries
 
+Represented summarize columns use case-sensitive unique output names, reserving
+BY outputs before allocating metrics in authored order (for example, repeated
+`sum(Bytes)` outputs `sum_Bytes` and `sum_Bytes1`). Duplicate declarations and
+unaliased groups with unknown output names keep the whole stage opaque; legacy
+summaries remain available without invented finite bindings.
+
 Dataflow leaves a whole `summarize` stage opaque when documented row-returning
 `arg_max`/`arg_min` (including `argmax`/`argmin`) or multi-expression/wildcard
 `take_any`/`any` cannot be represented as one finite aggregate column. An

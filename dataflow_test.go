@@ -106,14 +106,14 @@ func TestDataflowCloneListItemFieldBindingPointer(t *testing.T) {
 }
 
 func TestDataflowRepeatedSummaryNamesKeepAggregateOwnersAcrossSemanticCopy(t *testing.T) {
-	parsed := ExtractConditions(`T | summarize n=count() by x | summarize n=count() by n`)
+	parsed := ExtractConditions(`T | summarize n=count() by x | summarize n=count() by g=n`)
 	if len(parsed.Errors) != 0 || parsed.Dataflow == nil || !parsed.Dataflow.Complete || len(parsed.Dataflow.Bindings) != 4 || len(parsed.Aggregations) != 2 {
 		t.Fatalf("two summaries missing: %+v", parsed)
 	}
 	budget, cancel := newParseBudget(context.Background(), defaultParseLimits())
 	defer cancel()
 	copy := semanticFromExtraction(parsed, budget)
-	if copy == nil || len(copy.GroupByFields) != 2 || copy.GroupByFields[0] != "x" || copy.GroupByFields[1] != "n" {
+	if copy == nil || len(copy.GroupByFields) != 2 || copy.GroupByFields[0] != "x" || copy.GroupByFields[1] != "g" {
 		t.Fatalf("semantic group metadata lost: %+v", copy)
 	}
 	for _, result := range []struct {
@@ -121,7 +121,7 @@ func TestDataflowRepeatedSummaryNamesKeepAggregateOwnersAcrossSemanticCopy(t *te
 		flow *QueryDataflow
 		aggs []Aggregation
 	}{{"extraction", parsed.Dataflow, parsed.Aggregations}, {"semantic", copy.Dataflow, copy.Aggregations}} {
-		if result.flow.Bindings[0].Kind != "aggregate" || result.flow.Bindings[1].Kind != "group" || result.flow.Bindings[2].Kind != "aggregate" || result.flow.Bindings[3].Kind != "group" || result.flow.Bindings[0].Field != "n" || result.flow.Bindings[2].Field != "n" || result.flow.Bindings[3].Field != "n" {
+		if result.flow.Bindings[0].Kind != "aggregate" || result.flow.Bindings[1].Kind != "group" || result.flow.Bindings[2].Kind != "aggregate" || result.flow.Bindings[3].Kind != "group" || result.flow.Bindings[0].Field != "n" || result.flow.Bindings[2].Field != "n" || result.flow.Bindings[3].Field != "g" {
 			t.Fatalf("%s: group/aggregate ownership: %+v", result.name, result.flow.Bindings)
 		}
 		for i, agg := range result.aggs {
