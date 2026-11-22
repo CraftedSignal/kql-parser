@@ -53,6 +53,12 @@ func identityLiteral(raw string, budget *parseBudget) (value, tail string, ok bo
 			digits = 2
 		case 'u':
 			digits = 4
+		case 'U':
+			end, valid := unicodeScalarEscape(raw, i, budget)
+			if !valid {
+				return "", "", false
+			}
+			i = end - 1
 		default:
 			return "", "", false
 		}

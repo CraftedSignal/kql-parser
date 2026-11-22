@@ -53,6 +53,7 @@ func TestWave9aCompoundStringFidelity(t *testing.T) {
 		{`h'a' @"b"`, "ab"},
 		{"```a``` 'b'", "ab"},
 		{`"\0" @'b'`, "\x00b"},
+		{`"\U0001F600" @"tail"`, "😀tail"},
 	} {
 		query := "T | where x == " + tc.literal
 		if errs := Validate(query); len(errs) != 0 {
@@ -69,7 +70,7 @@ func TestWave9aCompoundStringFidelity(t *testing.T) {
 	if got := joinAdjacentStringLiterals(`"\x61" "\u0062"`); got != `"\x61\u0062"` {
 		t.Errorf("homogeneous spelling changed: %q", got)
 	}
-	for _, literal := range []string{`"\q" @'b' 'c'`, `"\u12xz" @'b' 'c'`, `"""a""" 'b'`, `"a" /* note */ 'b'`} {
+	for _, literal := range []string{`"\q" @'b' 'c'`, `"\u12xz" @'b' 'c'`, `"\U00110000" @'b' 'c'`, `"\U0000D800" @'b' 'c'`, `"""a""" 'b'`, `"a" /* note */ 'b'`} {
 		if got := joinAdjacentStringLiterals(literal); got != literal {
 			t.Errorf("invalid token or whole-token boundary changed: %q -> %q", literal, got)
 		}
@@ -97,5 +98,16 @@ func TestWave9aCompoundStringResourceFailure(t *testing.T) {
 		if len(result.Errors) != 1 || !strings.Contains(result.Errors[0], limit) || result.Dataflow != nil || len(result.Conditions) != 0 {
 			t.Errorf("%s failure exposed partial result: %+v", limit, result)
 		}
+	}
+}
+
+func TestWave10InvalidUnicodeCompoundIsAtomic(t *testing.T) {
+	for _, literal := range []string{`"\U00110000" @'b' 'c'`, `"\U0000D800" @'b' 'c'`} {
+		query := "T | where x == " + literal
+		if errs := Validate(query); len(errs) == 0 {
+			t.Errorf("invalid U8 scalar accepted: %s", literal)
+		}
+		p, s := ExtractConditions(query), AnalyzeQuery(query)
+		requireRejectedUnicodeModels(t, p, s)
 	}
 }

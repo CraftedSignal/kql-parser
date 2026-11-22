@@ -173,6 +173,7 @@ func TestIdentityLiteralExtentAndGrammarBoundary(t *testing.T) {
 		{`'A\'B'`, "A'B"}, {`"A\"B"`, `A"B`}, {`"A\\B"`, `A\B`},
 		{`@"A""B"`, `A"B`}, {`@'A''B'`, "A'B"},
 		{`"\u00E9"`, "é"}, {`"\uD83D\uDE00"`, "😀"}, {`"é"`, "é"},
+		{`"\U0001F600"`, "😀"},
 	} {
 		t.Run(tc.literal, func(t *testing.T) {
 			value, tail, ok := identityLiteral(" \t"+tc.literal+" trailing ", nil)
@@ -181,18 +182,19 @@ func TestIdentityLiteralExtentAndGrammarBoundary(t *testing.T) {
 			}
 		})
 	}
-	for _, literal := range []string{`"unterminated`, `'A\`, `'\q'`, `'\x1'`, `'\u123'`, `'\u12xz'`, `"\U0001F600"`, "\"a\nb\""} {
+	for _, literal := range []string{`"unterminated`, `'A\`, `'\q'`, `'\x1'`, `'\u123'`, `'\u12xz'`, `"\U00110000"`, `"\U0000D800"`, `"\U0001F60"`, `"\U0001F60z"`, "\"a\nb\""} {
 		if value, _, ok := identityLiteral(literal, nil); ok {
 			t.Errorf("unsupported/incomplete literal %q invented value %q", literal, value)
 		}
 	}
-	// Uppercase-U is not admitted by the current lexer; reuse of the broader
-	// existing decoder must not silently extend the identity grammar.
-	for _, query := range []string{`Event | where ['F\U00000069eld'] == "x"`, `table("Ev\U00000065nt") | where Field == "x"`} {
-		p, s := ExtractConditions(query), AnalyzeQuery(query)
-		if len(p.Errors) == 0 || len(s.Errors) == 0 || len(p.Conditions) != 0 || len(s.Conditions) != 0 || p.Dataflow != nil || s.Dataflow != nil {
-			t.Fatalf("unsupported identity escape exposed a model: %+v / %+v", p, s)
-		}
+	const fieldQuery = `Event | where ['F\U00000069eld'] == "x"`
+	p, _ := requireIdentityModels(t, fieldQuery)
+	if len(p.Conditions) != 1 || p.Conditions[0].Field != "Field" || p.Conditions[0].FieldBinding == nil || p.Conditions[0].FieldBinding.Kind != "input" || p.Conditions[0].FieldBinding.ScopeID != p.Conditions[0].InputScopeID || len(p.Dataflow.Stages) != 1 || p.Dataflow.Stages[0].Source != `where ['F\U00000069eld'] == "x"` {
+		t.Fatalf("U8 field identity/source/binding lost: %+v / %+v", p.Conditions, p.Dataflow)
+	}
+	p, _ = requireIdentityModels(t, `table("Ev\U00000065nt") | where Field == "x"`)
+	if !reflect.DeepEqual(p.DataSources, []string{"Event"}) || len(p.Pipelines) != 1 || p.Pipelines[0].Source != "" || p.Dataflow.Scopes[0].Source != "" || len(p.Conditions) != 1 || p.Conditions[0].FieldBinding == nil || p.Conditions[0].FieldBinding.ScopeID != p.Conditions[0].InputScopeID || p.Dataflow.Stages[0].Source != `where Field == "x"` {
+		t.Fatalf("U8 table identity/source/binding lost: %+v", p)
 	}
 }
 
