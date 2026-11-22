@@ -323,52 +323,7 @@ func normalizeTrailingDecimalsTracked(query string, p *typedProtection, budget *
 }
 
 func joinAdjacentStringLiteralsTracked(query string, p *typedProtection, budget *parseBudget, recorders ...*kqlSourceRecorder) string {
-	var rewrites []literalRewrite
-	for i := 0; i < len(query); {
-		budget.step()
-		if strings.HasPrefix(query[i:], "//") {
-			for i < len(query) && query[i] != '\n' {
-				i++
-			}
-			continue
-		}
-		if strings.HasPrefix(query[i:], "/*") {
-			if j := strings.Index(query[i+2:], "*/"); j >= 0 {
-				i += j + 4
-				continue
-			}
-		}
-		if !isStringLiteralStart(query, i) {
-			i++
-			continue
-		}
-		start, end := i, stringLiteralEnd(query, i)
-		if end <= i {
-			i++
-			continue
-		}
-		count := 1
-		for {
-			next := end
-			for next < len(query) && strings.IndexByte(" \t\r\n", query[next]) >= 0 {
-				next++
-			}
-			if !isStringLiteralStart(query, next) || !sameStringLiteralKind(query, start, next) {
-				break
-			}
-			nextEnd := stringLiteralEnd(query, next)
-			if nextEnd <= next {
-				break
-			}
-			end = nextEnd
-			count++
-		}
-		if count > 1 {
-			rewrites = append(rewrites, literalRewrite{start, end, joinAdjacentStringLiterals(query[start:end])})
-		}
-		i = end
-	}
-	return rewriteLiteralSources(query, rewrites, p, budget, recorders...)
+	return applyCompoundStrings(query, planCompoundStrings(query, budget), p, budget, recorders...)
 }
 
 func markNullEscapeStrings(query string, p *typedProtection, budget *parseBudget, recorders ...*kqlSourceRecorder) string {

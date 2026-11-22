@@ -518,7 +518,7 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 	if metadata != nil {
 		normalized = joinAdjacentStringLiteralsTracked(normalized, metadata.typed, budget, kqlRecorder(metadata, budget))
 	} else {
-		normalized = joinAdjacentStringLiterals(normalized)
+		normalized = joinAdjacentStringLiterals(normalized, budget)
 	}
 	budget.input(normalized)
 	budget.step()

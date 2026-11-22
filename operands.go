@@ -65,6 +65,12 @@ func trimObfuscationPrefix(s string) string {
 }
 
 func decodeKQLString(source string) string {
+	return decodeKQLStringBudgeted(source, nil)
+}
+
+// decodeKQLStringBudgeted reserves a single source-bounded backing buffer
+// before decoding; the public internal helper retains its existing value API.
+func decodeKQLStringBudgeted(source string, budget *parseBudget) string {
 	s := source
 	if strings.HasPrefix(s, "```") && strings.HasSuffix(s, "```") && len(s) >= 6 {
 		return s[3 : len(s)-3]
@@ -82,18 +88,42 @@ func decodeKQLString(source string) string {
 		return s
 	}
 	width := 1
-	if len(s) >= 6 && strings.HasPrefix(s, strings.Repeat(string(quote), 3)) {
+	if len(s) >= 6 && s[0] == s[1] && s[1] == s[2] {
 		width = 3
 	}
 	if len(s) < 2*width {
 		return s
 	}
 	s = s[width : len(s)-width]
-	if verbatim {
-		return strings.ReplaceAll(s, string([]byte{quote, quote}), string(quote))
-	}
+	budget.reserveWork(len(s)) // Precharge the complete decoding scan.
 	var b strings.Builder
+	if verbatim {
+		size := len(s)
+		for i := 0; i+1 < len(s); i++ {
+			budget.check()
+			if s[i] == quote && s[i+1] == quote {
+				size--
+				i++
+			}
+		}
+		if size == len(s) {
+			return s
+		}
+		budget.reserveWork(size)
+		b.Grow(size)
+		for i := 0; i < len(s); i++ {
+			budget.check()
+			b.WriteByte(s[i])
+			if s[i] == quote && i+1 < len(s) && s[i+1] == quote {
+				i++
+			}
+		}
+		return b.String()
+	}
+	budget.reserveWork(len(s)) // One backing allocation; decoded bytes fit.
+	b.Grow(len(s))
 	for i := 0; i < len(s); i++ {
+		budget.check()
 		if s[i] != '\\' || i+1 >= len(s) {
 			b.WriteByte(s[i])
 			continue
