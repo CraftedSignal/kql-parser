@@ -91,6 +91,24 @@ func columnNamesAbsent(raw, normalized *antlr.CommonTokenStream, rawText, normal
 	return true
 }
 
+// Argument keeps its original Identifier/Expression/ASSIGN getters. Only the
+// declaration role uses the additive quoted terminal, with exact mapped source.
+func namedArgumentSource(argument IArgumentContext, owners *kqlSourceOwners, budget *parseBudget) (string, bool) {
+	if argument == nil || owners == nil || argument.ASSIGN() == nil {
+		return "", false
+	}
+	if identifier := argument.Identifier(); identifier != nil {
+		if identifier.GetStart() == nil || identifier.GetStop() == nil || identifier.GetStart().GetTokenIndex() < 0 || identifier.GetStop().GetTokenIndex() < 0 {
+			return "", false
+		}
+		return owners.authoredContext(identifier, budget)
+	}
+	if quoted := argument.QUOTED_IDENTIFIER(); quoted != nil {
+		return owners.authoredToken(quoted.GetSymbol(), budget)
+	}
+	return "", false
+}
+
 func validateKQLColumnNames(tree antlr.Tree, source *kqlMappedSource, owners *kqlSourceOwners, budget *parseBudget) (map[*TabularOperatorContext]bool, string) {
 	if owners == nil {
 		owners = associateKQLSource(tree, source, budget)
@@ -110,6 +128,20 @@ func validateKQLColumnNames(tree antlr.Tree, source *kqlMappedSource, owners *kq
 			}
 		}
 	}
+	validateDeclaration := func(authored string, node antlr.Tree) string {
+		value := authored
+		if strings.HasPrefix(authored, "[") {
+			var valid bool
+			value, valid = decodedColumnName(authored, budget)
+			if !valid {
+				return "invalid quoted column name"
+			}
+		}
+		if value == "" {
+			markEmpty(node)
+		}
+		return ""
+	}
 	var walk func(antlr.Tree) string
 	walk = func(node antlr.Tree) string {
 		budget.step()
@@ -121,19 +153,20 @@ func validateKQLColumnNames(tree antlr.Tree, source *kqlMappedSource, owners *kq
 			if !found {
 				return "column name source ownership unavailable"
 			}
-			value := authored
-			if strings.HasPrefix(authored, "[") {
-				var valid bool
-				value, valid = decodedColumnName(authored, budget)
-				if !valid {
-					return "invalid quoted column name"
-				}
-			}
-
-			if value == "" {
-				markEmpty(name)
+			if diagnostic := validateDeclaration(authored, name); diagnostic != "" {
+				return diagnostic
 			}
 		}
+		if argument, ok := node.(*ArgumentContext); ok && argument.ASSIGN() != nil {
+			authored, found := namedArgumentSource(argument, owners, budget)
+			if !found {
+				return "named argument declaration source ownership unavailable"
+			}
+			if diagnostic := validateDeclaration(authored, argument); diagnostic != "" {
+				return diagnostic
+			}
+		}
+
 		// Empty standalone references have the same unrepresentable identity
 		// in passthrough/group/filter roles. Other legacy reference admission
 		// remains independent of declaration validation.
