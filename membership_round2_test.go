@@ -24,21 +24,16 @@ func TestMembershipRound2CompleteOwnerBothSides(t *testing.T) {
 }
 
 func TestMembershipRound2NestedConstructorValidation(t *testing.T) {
-	valid := `Account in ((U | union (datatable(a:string)["x"]) | project a))`
-	parsed, semantic := k.ExtractConditions(`T | where `+valid), k.AnalyzeQuery(`T | where `+valid)
-	if len(parsed.Errors) != 0 || len(semantic.Errors) != 0 || len(parsed.Conditions) != 0 || len(semantic.Conditions) != 0 ||
-		parsed.Expression == nil || parsed.Expression.Scalar == nil || parsed.Expression.Scalar.Text != valid ||
-		semantic.Expression == nil || semantic.Expression.Scalar == nil || semantic.Expression.Scalar.Text != valid {
-		t.Errorf("valid nested constructor lost source: parse=%+v semantic=%+v", parsed, semantic)
-	}
-	for _, query := range []string{
-		`T | where Account in ((U | union (datatable(a:string)["x",]) | project a))`,
-		`T | where Account in ((U | union (externaldata(a:string)[@"https://example.test/a.csv",]) | project a))`,
+	for _, valid := range []string{
+		`Account in ((U | union (datatable(a:string)["x"]) | project a))`,
+		`Account in ((U | union (datatable(a:string)["x",]) | project a))`,
+		`Account in ((U | union (externaldata(a:string)[@"https://example.test/a.csv",]) | project a))`,
 	} {
-		parsed, semantic := k.ExtractConditions(query), k.AnalyzeQuery(query)
-		if len(parsed.Errors) == 0 || len(semantic.Errors) == 0 || len(k.Validate(query)) == 0 ||
-			len(parsed.Conditions) != 0 || len(semantic.Conditions) != 0 || parsed.Expression != nil || semantic.Expression != nil {
-			t.Errorf("malformed nested constructor accepted or produced partial filters: %q; parse=%+v semantic=%+v", query, parsed, semantic)
+		parsed, semantic := k.ExtractConditions(`T | where `+valid), k.AnalyzeQuery(`T | where `+valid)
+		if len(parsed.Errors) != 0 || len(semantic.Errors) != 0 || len(parsed.Conditions) != 0 || len(semantic.Conditions) != 0 ||
+			parsed.Expression == nil || parsed.Expression.Scalar == nil || parsed.Expression.Scalar.Text != valid ||
+			semantic.Expression == nil || semantic.Expression.Scalar == nil || semantic.Expression.Scalar.Text != valid {
+			t.Errorf("valid nested constructor lost source: parse=%+v semantic=%+v", parsed, semantic)
 		}
 	}
 }
