@@ -227,3 +227,13 @@ name is not represented by the legacy summary. Explicitly aliased single-value
 retain their existing graph behavior. Legacy aggregation summaries and authored
 stage text remain available; opaque stages do not publish fabricated bindings.
 This boundary does not validate backend function signatures or execution.
+
+Plural `percentiles`/`percentilesw` with multiple percentile ranks also make the
+whole summarize stage opaque. An explicitly aliased one-rank plural aggregation
+keeps its existing single-column graph behavior. Unaliased `percentile`,
+one-rank plural forms, and `percentiles_array` remain opaque because their
+rank-dependent/default names are not represented by the legacy summary.
+Explicitly aliased scalar and array-returning forms (including the documented
+dynamic percentile-array argument) keep their existing graph behavior; multiple
+arguments alone do not imply multiple outputs. This narrow boundary preserves
+legacy names and does not validate signatures or add weighted scalar/array rules.
