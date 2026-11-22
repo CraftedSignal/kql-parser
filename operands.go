@@ -88,7 +88,7 @@ func decodeKQLStringBudgeted(source string, budget *parseBudget) string {
 		return s
 	}
 	width := 1
-	if len(s) >= 6 && s[0] == s[1] && s[1] == s[2] {
+	if !verbatim && len(s) >= 6 && s[0] == s[1] && s[1] == s[2] {
 		width = 3
 	}
 	if len(s) < 2*width {
