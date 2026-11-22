@@ -53,6 +53,12 @@ Explicit aliases and quoted numeric column references remain distinct supported
 paths. Legacy `ProjectedFields` stays available and does not prove a complete
 output schema when the graph is incomplete.
 
+An unaliased standalone integer literal in a `summarize` BY list also has
+an unrepresented generated output name. The whole summarize stage is opaque
+before publishing any metric or group bindings; authored source and legacy
+aggregation/group summaries remain available. Explicit group aliases, quoted
+numeric field names, and ordinary field groups keep their existing behavior.
+
 Parser-produced `ComputedFields` and `ComputedExpressions` use exact-case keys.
 For `extend Fresh=src`, look up `"Fresh"`, not `"fresh"`; a separate raw field
 named `fresh` remains distinct. These legacy maps describe the latest value

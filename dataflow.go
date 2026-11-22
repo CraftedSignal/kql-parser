@@ -479,7 +479,8 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 			stage.Effect = "opaque"
 			break
 		}
-		if b.unrepresentedSummarizeOutputs(summary.AggregationList()) {
+		if b.unrepresentedSummarizeOutputs(summary.AggregationList()) ||
+			b.summarizeHasUnaliasedIntegerGroup(summary.GroupByList()) {
 			stage.Effect = "opaque"
 			break
 		}
@@ -574,17 +575,41 @@ func (b *kqlDataflowBuilder) projectHasUnaliasedIntegerLiteral(list IProjectItem
 		if !ok || item.Identifier() != nil {
 			continue
 		}
-		var tree antlr.Tree = item.Expression()
-		for tree != nil {
-			b.budget.step()
-			if literal, ok := tree.(ILiteralContext); ok {
-				if literal.INT_NUMBER() != nil {
-					return true
-				}
-				break
-			}
-			tree = kqlTransparentScalarChild(tree, b.budget)
+		if b.standaloneIntegerLiteral(item.Expression()) {
+			return true
 		}
+	}
+	return false
+}
+
+// summarizeHasUnaliasedIntegerGroup inspects all BY items before any metric
+// or group binding is published. Literal spellings are not output names.
+func (b *kqlDataflowBuilder) summarizeHasUnaliasedIntegerGroup(list IGroupByListContext) bool {
+	if list == nil {
+		return false
+	}
+	for _, child := range list.GetChildren() {
+		b.budget.step()
+		item, ok := child.(IGroupByItemContext)
+		if !ok || item.Identifier() != nil {
+			continue
+		}
+		if b.standaloneIntegerLiteral(item.Expression()) {
+			return true
+		}
+	}
+	return false
+}
+
+// standaloneIntegerLiteral follows only transparent typed scalar wrappers.
+// Quoted identifiers, operators and function calls do not become literals.
+func (b *kqlDataflowBuilder) standaloneIntegerLiteral(tree antlr.Tree) bool {
+	for tree != nil {
+		b.budget.step()
+		if literal, ok := tree.(ILiteralContext); ok {
+			return literal.INT_NUMBER() != nil
+		}
+		tree = kqlTransparentScalarChild(tree, b.budget)
 	}
 	return false
 }
