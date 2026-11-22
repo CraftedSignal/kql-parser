@@ -12,17 +12,13 @@ func TestWave4cMultiOutputAggregatesOpaque(t *testing.T) {
 		count                         int
 	}{
 		{"arg_max(Time, *)", "arg_max", "Time", "arg_max_Time", 1},
-		{"V=arg_max(Time, Id)", "arg_max", "Time", "V", 1},
 		{"argmax(Time, Id)", "argmax", "Time", "argmax_Time", 1},
-		{"arg_min(Time, Id)", "arg_min", "Time", "arg_min_Time", 1},
 		{"argmin(Time, Id)", "argmin", "Time", "argmin_Time", 1},
 		{"V=take_any(*)", "take_any", "", "V", 1},
 		{"any(*)", "any", "", "any_", 1},
 		{"any(Name, Value)", "any", "Name", "any_Name", 1},
-		{"arg_max(Time, Id)", "arg_max", "Time", "arg_max_Time", 1},
 		{"take_any(*)", "take_any", "", "take_any_", 1},
 		{"take_any(Name, Value) as V", "take_any", "Name", "V", 1},
-		{"count(), arg_max(Time, Id)", "arg_max", "Time", "arg_max_Time", 2},
 	} {
 		t.Run(tc.call, func(t *testing.T) {
 			query := "Events | summarize " + tc.call + " by User"
@@ -178,21 +174,26 @@ func TestWave4cMultiOutputLaterReferenceAndClone(t *testing.T) {
 	}{
 		{p.Dataflow, p.Conditions, p.Errors}, {s.Dataflow, s.Conditions, s.Errors},
 	} {
-		if len(api.errors) != 0 || api.flow == nil || api.flow.Complete || len(api.flow.Bindings) != 0 || len(api.conditions) != 1 {
-			t.Fatalf("opaque later reference: %+v", api)
+		if len(api.errors) != 0 || api.flow == nil || !api.flow.Complete || len(api.flow.Bindings) != 4 || len(api.conditions) != 1 {
+			t.Fatalf("finite later reference: %+v", api)
 		}
 		c := api.conditions[0]
-		if c.Field != "Id" || c.Operator != "==" || c.Value != "1" || c.FieldBinding == nil || c.FieldBinding.Kind != "unknown" || c.FieldBinding.BindingID != "" {
-			t.Errorf("invented finite output reference: %+v", c)
+		if c.Field != "Id" || c.Operator != "==" || c.Value != "1" || c.FieldBinding == nil || c.FieldBinding.BindingID != p.Aggregations[1].Result.Outputs[1].BindingID {
+			t.Errorf("missing finite output reference: %+v", c)
 		}
+	}
+	requireAggregateResult(t, p, 1, []string{"Time", "Id"})
+	if len(p.Aggregations) != 2 {
+		t.Fatal("authored call inventory")
 	}
 	b, cancel := newParseBudget(context.Background(), defaultParseLimits())
 	clone := semanticFromExtraction(p, b)
 	cancel()
-	p.Aggregations[1].Column = "mutated"
+	p.Aggregations[1].Result.Outputs[1].BindingID = "mutated"
+	p.Aggregations[1].Result.Expression = "mutated"
 	p.Dataflow.Stages[0].Source = "mutated"
 	p.Conditions[0].FieldBinding.ScopeID = "mutated"
-	if clone.Aggregations[1].Column != "arg_max_Time" || clone.Dataflow.Stages[0].Source != "summarize count(), arg_max(Time, Id) by User" || clone.Conditions[0].FieldBinding.ScopeID == "mutated" {
+	if clone.Aggregations[1].Column != "" || clone.Aggregations[1].Result.Expression != "arg_max(Time, Id)" || clone.Aggregations[1].Result.Outputs[1].BindingID == "mutated" || clone.Dataflow.Stages[0].Source != "summarize count(), arg_max(Time, Id) by User" || clone.Conditions[0].FieldBinding.ScopeID == "mutated" {
 		t.Fatal("semantic model aliases extracted metadata/source/reference")
 	}
 }

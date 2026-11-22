@@ -316,3 +316,14 @@ including explicitly named unknown expressions and AS suffix allocation.
 Every member remains an aggregate from the same sampled-row call, with the
 same exact whole-call expression; members are not independent sampling calls
 or passthroughs. This adds provenance, not execution or deterministic sampling.
+
+Modern lowercase non-STAR `arg_min` and `arg_max` expose one ordered Result
+member per argument, including the selector at ordinal zero. Direct and inner
+names are retained; unnamed selectors use `min_`/`max_`, and later unnamed
+members use `min_<original-selector-name>_arg<i>` or its `max_` equivalent.
+Outer declarations override successive names; unknown required defaults keep
+the whole stage opaque. Selector-only calls also expose Result. Simple ASSIGN
+uses tuple replacement, while AS keeps suffix allocation and remains opaque
+for multiple outputs. STAR, deprecated spellings and unknown cardinalities
+remain unsupported. Each member retains the exact whole-call source and common
+input ownership; this adds provenance, not row-selection execution guarantees.
