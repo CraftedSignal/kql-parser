@@ -119,8 +119,11 @@ func decodeKQLIdentifier(text string, budgets ...*parseBudget) string {
 
 	if strings.HasPrefix(text, "[") && strings.HasSuffix(text, "]") {
 		text = text[1 : len(text)-1]
-		if value, _, ok := parseStringLiteral(text); ok {
+		if value, tail, ok := identityLiteral(text, budget); ok && strings.TrimSpace(tail) == "" && value != "" {
 			return value
+		}
+		if quotedIdentityPrefix(text) {
+			sourceAbort("unsupported quoted field identity literal")
 		}
 	}
 	return text
