@@ -561,7 +561,7 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 }
 
 // unrepresentedSummarizeOutputs inspects the whole stage before publishing any
-// finite bindings. Row-returning functions and unaliased take_any output names
+// finite bindings. Row-returning functions and unrepresented default output names
 // are outside this graph's single-column aggregation contract. Legacy summaries
 // remain available without claiming a binding for these opaque stages.
 func (b *kqlDataflowBuilder) unrepresentedSummarizeOutputs(list IAggregationListContext) bool {
@@ -581,7 +581,8 @@ func (b *kqlDataflowBuilder) unrepresentedSummarizeOutputs(list IAggregationList
 		b.budget.reserveWork(token.GetStop() - token.GetStart() + 1)
 		name := token.GetText()
 		switch name {
-		case "arg_max", "argmax", "arg_min", "argmin", "take_any", "any":
+		case "arg_max", "argmax", "arg_min", "argmin", "take_any", "any",
+			"percentiles", "percentilesw", "percentile", "percentiles_array":
 		default:
 			continue
 		}
@@ -614,6 +615,22 @@ func (b *kqlDataflowBuilder) unrepresentedSummarizeOutputs(list IAggregationList
 			}
 		case "take_any", "any":
 			if count > 1 || count == 1 && (star || name == "take_any" && item.Identifier() == nil) {
+				return true
+			}
+		case "percentiles":
+			if count >= 3 || count == 2 && item.Identifier() == nil {
+				return true
+			}
+		case "percentilesw":
+			if count >= 4 || count == 3 && item.Identifier() == nil {
+				return true
+			}
+		case "percentile":
+			if count == 2 && item.Identifier() == nil {
+				return true
+			}
+		case "percentiles_array":
+			if count >= 2 && item.Identifier() == nil {
 				return true
 			}
 		}
