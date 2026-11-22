@@ -403,6 +403,10 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 				stage.Effect = "opaque"
 				break
 			}
+			if b.projectHasUnaliasedIntegerLiteral(projection.ProjectItemList()) {
+				stage.Effect = "opaque"
+				break
+			}
 			for _, item := range projection.ProjectItemList().AllProjectItem() {
 				b.budget.step()
 				if item.Expression() == nil {
@@ -558,6 +562,31 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 	b.stageByPosition[info] = stageIndex
 	b.stageByOwner[occurrenceID] = stageIndex
 	b.lastPipeStage[info.Pipeline] = info.PipeStage
+}
+
+// A standalone integer literal has a generated output name, not a passthrough
+// numeric field identity. Inspect the whole project before retaining bindings;
+// explicit aliases and quoted numeric references keep their existing paths.
+func (b *kqlDataflowBuilder) projectHasUnaliasedIntegerLiteral(list IProjectItemListContext) bool {
+	for _, child := range list.GetChildren() {
+		b.budget.step()
+		item, ok := child.(IProjectItemContext)
+		if !ok || item.Identifier() != nil {
+			continue
+		}
+		var tree antlr.Tree = item.Expression()
+		for tree != nil {
+			b.budget.step()
+			if literal, ok := tree.(ILiteralContext); ok {
+				if literal.INT_NUMBER() != nil {
+					return true
+				}
+				break
+			}
+			tree = kqlTransparentScalarChild(tree, b.budget)
+		}
+	}
+	return false
 }
 
 // unrepresentedSummarizeOutputs inspects the whole stage before publishing any
