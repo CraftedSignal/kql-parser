@@ -266,3 +266,13 @@ values and normalized origins) leave the whole summarize stage opaque before
 any metric or group bindings; their authored source and legacy summaries remain.
 Explicit aliases keep their existing output spelling and representation. This
 narrow naming contract does not validate input types or backend signatures.
+
+Documented scalar aggregate names use their language result-name policy:
+`buildschema` uses `schema_`, conditional list/set/bag builders use `list_`,
+`set_` or `bag_`, and `tdigest_merge`/`merge_tdigest` use `merge_tdigests_`.
+`make_list_with_nulls` uses `list_`; `binary_all_and`/`or`/`xor` and `take_anyif`
+use the first argument's result name. Quoted/parenthesized direct names and
+provably unnamed prefix expressions are represented. Unaliased names requiring
+schema-dependent path naming, uncatalogued nested function policies or generated
+`ColumnN` allocation make the whole summarize dataflow opaque; explicit aliases
+retain their authored output identity. Legacy summaries remain available.
