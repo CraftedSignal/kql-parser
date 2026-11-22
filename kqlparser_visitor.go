@@ -163,6 +163,9 @@ type KQLParserVisitor interface {
 	// Visit a parse tree produced by KQLParser#aggregationList.
 	VisitAggregationList(ctx *AggregationListContext) interface{}
 
+	// Visit a parse tree produced by KQLParser#aggregationNameList.
+	VisitAggregationNameList(ctx *AggregationNameListContext) interface{}
+
 	// Visit a parse tree produced by KQLParser#aggregationItem.
 	VisitAggregationItem(ctx *AggregationItemContext) interface{}
 

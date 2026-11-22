@@ -332,6 +332,12 @@ func (s *BaseKQLParserListener) EnterAggregationList(ctx *AggregationListContext
 // ExitAggregationList is called when production aggregationList is exited.
 func (s *BaseKQLParserListener) ExitAggregationList(ctx *AggregationListContext) {}
 
+// EnterAggregationNameList is called when production aggregationNameList is entered.
+func (s *BaseKQLParserListener) EnterAggregationNameList(ctx *AggregationNameListContext) {}
+
+// ExitAggregationNameList is called when production aggregationNameList is exited.
+func (s *BaseKQLParserListener) ExitAggregationNameList(ctx *AggregationNameListContext) {}
+
 // EnterAggregationItem is called when production aggregationItem is entered.
 func (s *BaseKQLParserListener) EnterAggregationItem(ctx *AggregationItemContext) {}
 

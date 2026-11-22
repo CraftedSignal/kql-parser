@@ -215,6 +215,10 @@ func (v *BaseKQLParserVisitor) VisitAggregationList(ctx *AggregationListContext)
 	return v.VisitChildren(ctx)
 }
 
+func (v *BaseKQLParserVisitor) VisitAggregationNameList(ctx *AggregationNameListContext) interface{} {
+	return v.VisitChildren(ctx)
+}
+
 func (v *BaseKQLParserVisitor) VisitAggregationItem(ctx *AggregationItemContext) interface{} {
 	return v.VisitChildren(ctx)
 }

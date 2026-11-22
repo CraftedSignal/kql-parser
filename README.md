@@ -282,3 +282,25 @@ provably unnamed prefix expressions are represented. Unaliased names requiring
 schema-dependent path naming, uncatalogued nested function policies or generated
 `ColumnN` allocation make the whole summarize dataflow opaque; explicit aliases
 retain their authored output identity. Legacy summaries remain available.
+
+### Ordered aggregate results
+
+Summarize keeps one `Aggregation` per authored call. Parenthesized declarations
+and `percentile`, `percentiles`, `percentilew`, and `percentilesw` additionally
+carry optional `result` metadata: the zero-based `call_ordinal` among all calls
+in that stage, exact authored RHS `expression`, `complete`, and ordered
+`outputs` (`ordinal`, `column`, `binding_id`). Integer literal ranks have proven
+default names; fully supplied aliases can also name decimal/exponent ranks.
+Unproved defaults, unsupported calls, invalid declarations or an opaque sibling
+keep the result incomplete with no output IDs.
+
+A committed single output mirrors legacy `Column`/`BindingID`. Multiple outputs
+leave both legacy fields empty and retain `StageID`; consumers must read the
+result members. Complete means the containing stage committed every member,
+including historical definitions later replaced by a simple declaration. Final
+visible `FieldScope.BindingIDs` excludes replaced definitions; historical stage
+IDs and immutable result ordinals remain. Semantic conversion deep-clones the
+result and its outputs. Ordinary scalar calls retain a nil result. Adding the
+optional struct field affects external unkeyed `Aggregation` literals; keyed
+literals and field readers remain source-compatible. This metadata describes
+provenance, not percentile execution or a consumer execution catalog.

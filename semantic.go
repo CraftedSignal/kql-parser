@@ -100,6 +100,9 @@ func semanticFromExtraction(result *ParseResult, budget *parseBudget) *SemanticQ
 			budget.reserveMetadataStrings(0, aggregation.StageID, aggregation.BindingID, aggregation.Function, aggregation.Field, aggregation.Column)
 		}
 		semantic.Aggregations = append([]Aggregation(nil), result.Aggregations...)
+		for i := range semantic.Aggregations {
+			semantic.Aggregations[i].Result = cloneAggregationResult(result.Aggregations[i].Result, budget)
+		}
 	}
 	if len(result.Pipelines) != 0 {
 		budget.reserveMetadata(len(result.Pipelines), 0)
