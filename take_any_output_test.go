@@ -94,7 +94,7 @@ func TestTakeAnyUnknownRollback(t *testing.T) {
 }
 
 func TestTakeAnyNamedMultiOutputOpaque(t *testing.T) {
-	for _, call := range []string{`take_any(Chosen=State, Other)`, `Result=take_any(Chosen=State, Other)`, `take_any()`} {
+	for _, call := range []string{`take_any()`} {
 		query := `T | summarize N=count(), ` + call
 		p, s := ExtractConditions(query), AnalyzeQuery(query)
 		for _, flow := range []*QueryDataflow{p.Dataflow, s.Dataflow} {

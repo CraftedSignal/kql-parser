@@ -1,6 +1,7 @@
 package kql
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/antlr4-go/antlr/v4"
@@ -49,9 +50,149 @@ func resultAggregate(item IAggregationItemContext, budget *parseBudget) bool {
 	if item.AggregationNameList() != nil {
 		return true
 	}
-	_, _, ok := percentileFamily(aggregateCallName(item, budget))
+	function := aggregateCallName(item, budget)
+	if function == "take_any" {
+		call := item.AggregationFunction().FunctionCall()
+		if call.ArgumentList() == nil {
+			return false
+		}
+		count := 0
+		for _, child := range call.ArgumentList().GetChildren() {
+			budget.step()
+			if _, ok := child.(IArgumentContext); ok {
+				count++
+				if count >= 2 {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	_, _, ok := percentileFamily(function)
 	return ok
 }
+
+// This walk is deliberately take_any-only; positional rank/scalar policies
+// stay in aggregateArguments. Cardinality is independent of name inference.
+func takeAnyResultArguments(item IAggregationItemContext, owners *kqlSourceOwners, budget *parseBudget) ([]IArgumentContext, bool) {
+	if item.AggregationFunction() == nil || item.AggregationFunction().FunctionCall() == nil {
+		return nil, false
+	}
+	call := item.AggregationFunction().FunctionCall()
+	if call.ArgumentList() == nil {
+		return nil, false
+	}
+	var complete func(antlr.Tree) bool
+	complete = func(tree antlr.Tree) bool {
+		budget.step()
+		if _, bad := tree.(antlr.ErrorNode); bad {
+			return false
+		}
+		if terminal, ok := tree.(antlr.TerminalNode); ok && terminal.GetSymbol().GetTokenIndex() < 0 {
+			return false
+		}
+		if ctx, ok := tree.(antlr.ParserRuleContext); ok && (ctx.GetStart() == nil || ctx.GetStop() == nil || ctx.GetStart().GetTokenIndex() < 0 || ctx.GetStop().GetTokenIndex() < ctx.GetStart().GetTokenIndex()) {
+			return false
+		}
+		for _, child := range tree.GetChildren() {
+			if !complete(child) {
+				return false
+			}
+		}
+		return true
+	}
+	var args []IArgumentContext
+	for _, child := range call.ArgumentList().GetChildren() {
+		budget.step()
+		argument, ok := child.(IArgumentContext)
+		if !ok {
+			continue
+		}
+		if argument.Expression() == nil || !complete(argument) || standaloneAggregateWildcard(argument, budget) {
+			return nil, false
+		}
+		if argument.ASSIGN() != nil {
+			authored, found := namedArgumentSource(argument, owners, budget)
+			if !found {
+				sourceAbort("take_any declaration source ownership unavailable")
+			}
+			if strings.HasPrefix(authored, "[") {
+				value, valid := decodedColumnName(authored, budget)
+				if !valid || value == "" {
+					return nil, false
+				}
+			}
+		}
+		args = appendTemporary(args, budget, argument)
+	}
+	return args, len(args) > 0
+}
+
+func planTakeAnyMembers(item IAggregationItemContext, e *conditionExtractor, budget *parseBudget) ([]string, []bool, bool) {
+	args, valid := takeAnyResultArguments(item, e.sourceOwners, budget)
+	if !valid || item.AS() != nil && len(args) > 1 {
+		return nil, nil, false
+	}
+	aliases := aggregateDeclarations(item, e, budget)
+	if len(aliases) > len(args) {
+		return nil, nil, false
+	}
+	budget.reserveWork(len(args))
+	budget.reserveWork(len(args))
+	names := make([]string, len(args))
+	declared := make([]bool, len(args))
+	for i, argument := range args {
+		budget.step()
+		if i < len(aliases) {
+			if aliases[i] == "" {
+				return nil, nil, false
+			}
+			names[i] = aliases[i]
+			declared[i] = true
+			continue
+		}
+		if argument.ASSIGN() != nil {
+			authored, found := namedArgumentSource(argument, e.sourceOwners, budget)
+			if !found {
+				sourceAbort("take_any declaration source ownership unavailable")
+			}
+			name := authored
+			if strings.HasPrefix(authored, "[") {
+				var known bool
+				name, known = decodedColumnName(authored, budget)
+				if !known {
+					return nil, nil, false
+				}
+			}
+			if name == "" {
+				return nil, nil, false
+			}
+			names[i] = name
+			continue
+		}
+		name, kind := e.aggregateExpressionResultName(argument.Expression(), budget)
+		switch kind {
+		case aggregateNameKnown:
+			if name == "" {
+				return nil, nil, false
+			}
+			names[i] = name
+		case aggregateNameUnnamed:
+			width := 1
+			for n := i; n >= 10; n /= 10 {
+				budget.step()
+				width++
+			}
+			budget.reserveWork(width)
+			budget.reserveWork(len("any_arg") + width)
+			names[i] = "any_arg" + strconv.Itoa(i)
+		default:
+			return nil, nil, false
+		}
+	}
+	return names, declared, true
+}
+
 func aggregateArguments(item IAggregationItemContext, budget *parseBudget) ([]IExpressionContext, bool) {
 	if item.AggregationFunction() == nil || item.AggregationFunction().FunctionCall() == nil {
 		return nil, false
@@ -127,6 +268,9 @@ func aggregateDeclarations(item IAggregationItemContext, e *conditionExtractor, 
 // Returns complete member bases and declaration flags without mutating summaries.
 func planAggregateMembers(item IAggregationItemContext, e *conditionExtractor, budget *parseBudget) (names []string, declared []bool, known bool) {
 	function := aggregateCallName(item, budget)
+	if function == "take_any" {
+		return planTakeAnyMembers(item, e, budget)
+	}
 	aliases := aggregateDeclarations(item, e, budget)
 	args, valid := aggregateArguments(item, budget)
 	if !valid {
@@ -254,6 +398,12 @@ func validateAggregateTuples(tree antlr.Tree, source *kqlMappedSource, owners *k
 			function := aggregateCallName(item, budget)
 			args, valid := aggregateArguments(item, budget)
 			arity := 0
+			if function == "take_any" {
+				arguments, proven := takeAnyResultArguments(item, owners, budget)
+				if proven {
+					arity = len(arguments)
+				}
+			}
 			if start, singular, percentile := percentileFamily(function); percentile && valid && len(args) > start && (!singular || len(args) == start+1) {
 				rankProof := true
 				for _, rank := range args[start:] {

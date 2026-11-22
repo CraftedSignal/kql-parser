@@ -21,10 +21,8 @@ func TestWave4cMultiOutputAggregatesOpaque(t *testing.T) {
 		{"any(Name, Value)", "any", "Name", "any_Name", 1},
 		{"arg_max(Time, Id)", "arg_max", "Time", "arg_max_Time", 1},
 		{"take_any(*)", "take_any", "", "take_any_", 1},
-		{"take_any(Name, Value)", "take_any", "Name", "take_any_Name", 1},
 		{"take_any(Name, Value) as V", "take_any", "Name", "V", 1},
 		{"count(), arg_max(Time, Id)", "arg_max", "Time", "arg_max_Time", 2},
-		{"count(), take_any(Name, Value)", "take_any", "Name", "take_any_Name", 2},
 	} {
 		t.Run(tc.call, func(t *testing.T) {
 			query := "Events | summarize " + tc.call + " by User"
