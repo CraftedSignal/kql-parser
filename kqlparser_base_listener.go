@@ -242,6 +242,18 @@ func (s *BaseKQLParserListener) EnterProjectReorderOperator(ctx *ProjectReorderO
 // ExitProjectReorderOperator is called when production projectReorderOperator is exited.
 func (s *BaseKQLParserListener) ExitProjectReorderOperator(ctx *ProjectReorderOperatorContext) {}
 
+// EnterProjectReorderItem is called when production projectReorderItem is entered.
+func (s *BaseKQLParserListener) EnterProjectReorderItem(ctx *ProjectReorderItemContext) {}
+
+// ExitProjectReorderItem is called when production projectReorderItem is exited.
+func (s *BaseKQLParserListener) ExitProjectReorderItem(ctx *ProjectReorderItemContext) {}
+
+// EnterProjectReorderDirection is called when production projectReorderDirection is entered.
+func (s *BaseKQLParserListener) EnterProjectReorderDirection(ctx *ProjectReorderDirectionContext) {}
+
+// ExitProjectReorderDirection is called when production projectReorderDirection is exited.
+func (s *BaseKQLParserListener) ExitProjectReorderDirection(ctx *ProjectReorderDirectionContext) {}
+
 // EnterProjectItemList is called when production projectItemList is entered.
 func (s *BaseKQLParserListener) EnterProjectItemList(ctx *ProjectItemListContext) {}
 

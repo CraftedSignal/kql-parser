@@ -231,7 +231,17 @@ projectRenameOperator
     ;
 
 projectReorderOperator
-    : PROJECT_REORDER identifierOrWildcardList (ASC | DESC)?
+    : PROJECT_REORDER (projectReorderItem (COMMA projectReorderItem)*)?
+    ;
+
+projectReorderItem
+    : (identifierOrWildcard | QUOTED_IDENTIFIER) projectReorderDirection?
+    ;
+
+projectReorderDirection
+    : ASC
+    | DESC
+    | IDENTIFIER MINUS (ASC | DESC)
     ;
 
 projectItemList
