@@ -359,6 +359,8 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 	}
 	switch {
 	case stage.Effect == "opaque":
+	case b.extractor.emptyColumnStages[ctx]:
+		stage.Effect = "opaque"
 	case ctx.WhereOperator() != nil:
 		stage.Effect = "filter"
 	case ctx.SearchOperator() != nil:
@@ -399,15 +401,18 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 		}
 		for _, item := range items.AllExtendItem() {
 			b.budget.step()
-			if item.Identifier() == nil || item.Expression() == nil {
+			if item.ColumnName() == nil || item.Expression() == nil {
 				stage.Effect = "opaque"
 				break
 			}
 			expression, ok := b.owners.rhsSource(item)
+			if !ok && item.AS() != nil {
+				expression, ok = b.owners.authoredContext(item.Expression(), b.budget)
+			}
 			if !ok {
 				sourceAbort("extend RHS lacks authored occurrence")
 			}
-			b.addBinding(&stage, b.authoredIdentifier(item.Identifier()), "assignment", expression, input)
+			b.addBinding(&stage, b.authoredIdentifier(item.ColumnName()), "assignment", expression, input)
 		}
 	case "project":
 		if projection := ctx.ProjectOperator(); projection != nil {
@@ -433,8 +438,8 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 				if !ok {
 					sourceAbort("project expression lacks authored source")
 				}
-				if item.Identifier() != nil {
-					b.addBinding(&stage, b.authoredIdentifier(item.Identifier()), "assignment", expression, input)
+				if item.ColumnName() != nil {
+					b.addBinding(&stage, b.authoredIdentifier(item.ColumnName()), "assignment", expression, input)
 				} else if b.extractor.typed != nil && b.extractor.typed.hasOpaqueReference(item.Expression()) {
 					stage.Effect = "opaque"
 					break
@@ -466,7 +471,7 @@ func (b *kqlDataflowBuilder) operator(ctx *TabularOperatorContext) {
 		}
 		seen := map[string]bool{}
 		for _, item := range ctx.ProjectRenameOperator().RenameList().AllRenameItem() {
-			ids := item.AllIdentifier()
+			ids := item.AllColumnName()
 			if len(ids) != 2 {
 				stage.Effect = "opaque"
 				break
@@ -548,7 +553,7 @@ func (b *kqlDataflowBuilder) projectHasUnaliasedIntegerLiteral(list IProjectItem
 	for _, child := range list.GetChildren() {
 		b.budget.step()
 		item, ok := child.(IProjectItemContext)
-		if !ok || item.Identifier() != nil {
+		if !ok || item.ColumnName() != nil {
 			continue
 		}
 		if b.standaloneIntegerLiteral(item.Expression()) {
@@ -567,7 +572,7 @@ func (b *kqlDataflowBuilder) summarizeHasUnaliasedIntegerGroup(list IGroupByList
 	for _, child := range list.GetChildren() {
 		b.budget.step()
 		item, ok := child.(IGroupByItemContext)
-		if !ok || item.Identifier() != nil {
+		if !ok || item.ColumnName() != nil {
 			continue
 		}
 		if b.standaloneIntegerLiteral(item.Expression()) {
@@ -610,7 +615,7 @@ func (b *kqlDataflowBuilder) unrepresentedSummarizeOutputs(list IAggregationList
 		// before materialization; function recognition is deliberately case-sensitive.
 		b.budget.reserveWork(token.GetStop() - token.GetStart() + 1)
 		name := token.GetText()
-		if item.Identifier() == nil {
+		if item.ColumnName() == nil {
 			if _, _, handled, known := b.extractor.documentedAggregateOutput(call, b.budget); handled {
 				if !known {
 					return true
@@ -619,7 +624,7 @@ func (b *kqlDataflowBuilder) unrepresentedSummarizeOutputs(list IAggregationList
 			}
 		}
 		if name == "make_bag" {
-			if item.Identifier() == nil {
+			if item.ColumnName() == nil {
 				if !b.extractor.makeBagDirectOutput(call, b.budget) {
 					return true
 				}
@@ -661,31 +666,31 @@ func (b *kqlDataflowBuilder) unrepresentedSummarizeOutputs(list IAggregationList
 				return true
 			}
 		case "take_any", "any":
-			if count > 1 || count == 1 && (star || name == "take_any" && item.Identifier() == nil) {
+			if count > 1 || count == 1 && (star || name == "take_any" && item.ColumnName() == nil) {
 				return true
 			}
 		case "percentiles":
-			if count >= 3 || count == 2 && item.Identifier() == nil {
+			if count >= 3 || count == 2 && item.ColumnName() == nil {
 				return true
 			}
 		case "percentilesw":
-			if count >= 4 || count == 3 && item.Identifier() == nil {
+			if count >= 4 || count == 3 && item.ColumnName() == nil {
 				return true
 			}
 		case "percentile":
-			if count == 2 && item.Identifier() == nil {
+			if count == 2 && item.ColumnName() == nil {
 				return true
 			}
 		case "percentiles_array":
-			if count >= 2 && item.Identifier() == nil {
+			if count >= 2 && item.ColumnName() == nil {
 				return true
 			}
 		case "percentilew":
-			if count == 3 && item.Identifier() == nil {
+			if count == 3 && item.ColumnName() == nil {
 				return true
 			}
 		case "percentilesw_array":
-			if count >= 3 && item.Identifier() == nil {
+			if count >= 3 && item.ColumnName() == nil {
 				return true
 			}
 		}

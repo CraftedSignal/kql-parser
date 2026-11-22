@@ -170,6 +170,8 @@ func (b *parseBudget) outputSize(items int) {
 // so excessive nesting never reaches adaptive prediction. The real lexer
 // keeps literal, identifier, regex and comment delimiters out of this count.
 type budgetLexer struct {
+	source                        string
+	complete, hasQuotedIdentifier bool
 	antlr.Lexer
 	budget     *parseBudget
 	charge     bool
@@ -182,10 +184,14 @@ func (l *budgetLexer) NextToken() antlr.Token {
 	token := l.Lexer.NextToken()
 	kind := token.GetTokenType()
 	if kind == antlr.TokenEOF {
+		l.complete = true
 		return token
 	}
 	if l.tokens >= l.budget.limits.maxTokens {
 		l.budget.reject("token count")
+	}
+	if kind == KQLLexerQUOTED_IDENTIFIER {
+		l.hasQuotedIdentifier = true
 	}
 	l.tokens++
 	if l.charge {
@@ -245,7 +251,7 @@ func preflight(query string, b *parseBudget, charge bool, listener *errorListene
 	if listener != nil {
 		lexer.AddErrorListener(listener)
 	}
-	limited := &budgetLexer{Lexer: lexer, budget: b, charge: charge}
+	limited := &budgetLexer{Lexer: lexer, budget: b, charge: charge, source: query}
 	stream := antlr.NewCommonTokenStream(limited, antlr.TokenDefaultChannel)
 	stream.Fill()
 	stream.Seek(0)

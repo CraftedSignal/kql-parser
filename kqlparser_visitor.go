@@ -127,6 +127,9 @@ type KQLParserVisitor interface {
 	// Visit a parse tree produced by KQLParser#projectItemList.
 	VisitProjectItemList(ctx *ProjectItemListContext) interface{}
 
+	// Visit a parse tree produced by KQLParser#columnName.
+	VisitColumnName(ctx *ColumnNameContext) interface{}
+
 	// Visit a parse tree produced by KQLParser#projectItem.
 	VisitProjectItem(ctx *ProjectItemContext) interface{}
 

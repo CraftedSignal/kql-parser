@@ -163,8 +163,8 @@ func (b *kqlDataflowBuilder) planSummarizeNames(summary ISummarizeOperatorContex
 				sourceAbort("group expression lacks authored span")
 			}
 			var column string
-			if item.Identifier() != nil {
-				column = b.authoredIdentifier(item.Identifier())
+			if item.ColumnName() != nil {
+				column = b.authoredIdentifier(item.ColumnName())
 			} else {
 				column, ok = b.summarizeGroupReferenceName(item.Expression())
 				if !ok {
@@ -195,14 +195,14 @@ func (b *kqlDataflowBuilder) planSummarizeNames(summary ISummarizeOperatorContex
 		// An unnamed scalar without a base name needs contextual ColumnN
 		// allocation. Leave the whole plan unknown before allocating suffixes;
 		// explicitly named scalars still have their existing known aliases.
-		if candidate.Column == "" && item.Identifier() == nil {
+		if candidate.Column == "" && item.ColumnName() == nil {
 			return plan
 		}
 		expression, ok := b.owners.authoredContext(item.AggregationFunction(), b.budget)
 		if !ok {
 			sourceAbort("aggregate expression lacks authored span")
 		}
-		plan.metrics = append(plan.metrics, summarizeMetricName{index, candidate.Column, expression, item.Identifier() != nil})
+		plan.metrics = append(plan.metrics, summarizeMetricName{index, candidate.Column, expression, item.ColumnName() != nil})
 	}
 	allocator := newSummarizeNameAllocator(metricCount+groupCount, b.budget)
 	for i := range plan.groups {

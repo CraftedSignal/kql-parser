@@ -248,9 +248,13 @@ projectItemList
     : projectItem (COMMA projectItem)*
     ;
 
+columnName
+    : identifier | QUOTED_IDENTIFIER
+    ;
+
 projectItem
-    : expression (AS identifier)?
-    | identifier ASSIGN expression
+    : expression (AS columnName)?
+    | columnName ASSIGN expression
     ;
 
 identifierOrWildcardList
@@ -270,7 +274,7 @@ renameList
     ;
 
 renameItem
-    : identifier ASSIGN identifier
+    : columnName ASSIGN columnName
     ;
 
 // -----------------------------------------------------------------------------
@@ -287,8 +291,8 @@ extendItemList
     ;
 
 extendItem
-    : identifier ASSIGN expression
-    | expression (AS identifier)?
+    : columnName ASSIGN expression
+    | expression (AS columnName)?
     ;
 
 // -----------------------------------------------------------------------------
@@ -309,8 +313,8 @@ aggregationList
     ;
 
 aggregationItem
-    : identifier ASSIGN aggregationFunction
-    | aggregationFunction (AS identifier)?
+    : columnName ASSIGN aggregationFunction
+    | aggregationFunction (AS columnName)?
     ;
 
 aggregationFunction
@@ -323,8 +327,8 @@ groupByList
     ;
 
 groupByItem
-    : expression (AS identifier)?
-    | identifier ASSIGN expression
+    : expression (AS columnName)?
+    | columnName ASSIGN expression
     ;
 
 // -----------------------------------------------------------------------------

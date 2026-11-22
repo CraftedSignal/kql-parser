@@ -29,7 +29,7 @@ func validateContext(ctx context.Context, query string, limits parseLimits) (err
 	budget, cancel := newParseBudget(ctx, limits)
 	defer cancel()
 	budget.input(query)
-	preflight(query, budget, false, nil)
+	rawStream := preflight(query, budget, false, nil)
 	if strings.TrimSpace(query) == "" {
 		return []string{"query is empty"}
 	}
@@ -59,6 +59,13 @@ func validateContext(ctx context.Context, query string, limits parseLimits) (err
 		budget.reserveOutput(1)
 		return appendTemporary(listener.errors, budget, diagnostic)
 	}
+	if !columnNamesAbsent(rawStream, stream, query, normalized, budget) {
+		if _, diagnostic := validateKQLColumnNames(tree, normalization.mapped, nil, budget); diagnostic != "" {
+			budget.reserveOutput(1)
+			return appendTemporary(listener.errors, budget, diagnostic)
+		}
+	}
+
 	budget.check()
 	for i, msg := range listener.errors {
 		budget.step()
