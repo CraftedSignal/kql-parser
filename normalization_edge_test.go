@@ -383,6 +383,22 @@ func TestKQLSubqueryJoinUnionAndSourceNormalizationEdges(t *testing.T) {
 	}
 }
 
+func TestStripJoinHintsDoesNotMatchHintSuffixInIdentifier(t *testing.T) {
+	query := `T | where somehint.foo == 1`
+	if got := stripJoinHints(query); got != query {
+		t.Fatalf("stripJoinHints() changed property access %q to %q", query, got)
+	}
+
+	result := ExtractConditions(query)
+	if len(result.Conditions) != 1 {
+		t.Fatalf("ExtractConditions() returned %d conditions and errors %q, want one", len(result.Conditions), result.Errors)
+	}
+	condition := result.Conditions[0]
+	if condition.Field != "somehint.foo" || condition.Operator != "==" || condition.Value != "1" {
+		t.Fatalf("ExtractConditions() returned %+v, want somehint.foo == 1", condition)
+	}
+}
+
 func TestKQLPreambleCommentAndProvenanceEdges(t *testing.T) {
 	doc := "Description: narrative text\nKQL Query: SecurityEvent\n| where EventID == 4688"
 	if got, want := stripDocumentationPreamble(doc), "SecurityEvent\n| where EventID == 4688"; got != want {
