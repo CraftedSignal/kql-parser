@@ -399,6 +399,26 @@ func TestStripJoinHintsDoesNotMatchHintSuffixInIdentifier(t *testing.T) {
 	}
 }
 
+func TestStripJoinHintsDoesNotMatchHintPrefixedField(t *testing.T) {
+	query := `T | where Hint.foo == 1`
+	if got := stripJoinHints(query); got != query {
+		t.Fatalf("stripJoinHints() changed property access %q to %q", query, got)
+	}
+	malformedHint := `T | join hint. =broadcast (U) on Id`
+	if got := stripJoinHints(malformedHint); got != malformedHint {
+		t.Fatalf("stripJoinHints() changed malformed hint to %q", got)
+	}
+
+	result := ExtractConditions(query)
+	if len(result.Conditions) != 1 {
+		t.Fatalf("ExtractConditions() returned %d conditions and errors %q, want one", len(result.Conditions), result.Errors)
+	}
+	condition := result.Conditions[0]
+	if condition.Field != "Hint.foo" || condition.Operator != "==" || condition.Value != "1" {
+		t.Fatalf("ExtractConditions() returned %+v, want Hint.foo == 1", condition)
+	}
+}
+
 func TestKQLPreambleCommentAndProvenanceEdges(t *testing.T) {
 	doc := "Description: narrative text\nKQL Query: SecurityEvent\n| where EventID == 4688"
 	if got, want := stripDocumentationPreamble(doc), "SecurityEvent\n| where EventID == 4688"; got != want {
