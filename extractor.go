@@ -3785,6 +3785,10 @@ func stripJoinHints(query string, recorders ...*kqlSourceRecorder) string {
 			break
 		}
 		hintIdx += searchFrom
+		if hintIdx > 0 && (isIdentChar(query[hintIdx-1]) || query[hintIdx-1] == '.') {
+			searchFrom = hintIdx + len("hint.")
+			continue
+		}
 
 		// Find the end of hint.xxx=value
 		// First find the = sign
