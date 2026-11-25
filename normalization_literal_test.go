@@ -2,6 +2,7 @@ package kql
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -70,5 +71,20 @@ func TestNormalizationKeepsLiteralAndCommentText(t *testing.T) {
 				t.Fatalf("conditions = %v errors=%q, want %v", got, result.Errors, tc.want)
 			}
 		})
+	}
+}
+
+func TestNormalizeQueryForDebugPreservesDatetimeLiteralAndCommentText(t *testing.T) {
+	query := `T | where Message == "datetime(2026-02-04 10:00:00)" // datetime(2026-02-04 10:00:00)
+| where TimeGenerated > datetime(2026-02-04 10:00:00)`
+	got := NormalizeQueryForDebug(query)
+	if !strings.Contains(got, `Message == "datetime(2026-02-04 10:00:00)"`) {
+		t.Fatalf("date-time-looking string literal changed: %q", got)
+	}
+	if !strings.Contains(got, "// datetime(2026-02-04 10:00:00)") {
+		t.Fatalf("date-time-looking comment changed: %q", got)
+	}
+	if !strings.Contains(got, "TimeGenerated > datetime(2026-02-04T10:00:00)") {
+		t.Fatalf("date-time syntax outside literal was not normalized: %q", got)
 	}
 }

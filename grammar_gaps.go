@@ -12,8 +12,33 @@ var datetimeWithSpaceRe = regexp.MustCompile(`(?i)\bdatetime\(\s*(\d{4}-\d{1,2}-
 
 // normalizeDatetimeLiterals writes datetime(2026-02-04 10:00:00) as
 // datetime(2026-02-04T10:00:00).
-func normalizeDatetimeLiterals(query string) string {
-	return datetimeWithSpaceRe.ReplaceAllString(query, "datetime(${1}T${2})")
+func normalizeDatetimeLiterals(query string, budgets ...*parseBudget) string {
+	budget := suppliedBudget(budgets)
+	matches := datetimeWithSpaceRe.FindAllStringSubmatchIndex(query, -1)
+	if len(matches) == 0 {
+		return query
+	}
+	protected := protectedKQLBytes(query, budget)
+	var out strings.Builder
+	last := 0
+	for _, match := range matches {
+		budget.step()
+		if protected[match[0]] {
+			continue
+		}
+		out.WriteString(query[last:match[0]])
+		out.WriteString("datetime(")
+		out.WriteString(query[match[2]:match[3]])
+		out.WriteByte('T')
+		out.WriteString(query[match[4]:match[5]])
+		out.WriteByte(')')
+		last = match[1]
+	}
+	if last == 0 {
+		return query
+	}
+	out.WriteString(query[last:])
+	return out.String()
 }
 
 // joinAdjacentStringLiterals applies the same compound-token plan as extraction.
