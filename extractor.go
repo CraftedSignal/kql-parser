@@ -522,7 +522,7 @@ func normalizeBudgetedMetadata(query string, strict bool, budget *parseBudget, m
 	if metadata != nil {
 		normalized = markedRegexLiterals(normalized, datetimeWithSpaceRe, "datetime(${1}T${2})", metadata.typed, budget, kqlRecorder(metadata, budget))
 	} else {
-		normalized = normalizeDatetimeLiterals(normalized)
+		normalized = normalizeDatetimeLiterals(normalized, budget)
 	}
 	budget.input(normalized)
 	budget.step()
@@ -3790,13 +3790,23 @@ func stripJoinHints(query string, recorders ...*kqlSourceRecorder) string {
 			continue
 		}
 
-		// Find the end of hint.xxx=value
-		// First find the = sign
-		eqIdx := strings.Index(query[hintIdx:], "=")
-		if eqIdx == -1 {
-			break // No = found, malformed
+		// A hint has an option name immediately after "hint." and an assignment
+		// operator. Do not search ahead for an equals sign: it may belong to a
+		// later predicate such as `where hint.foo == 1`.
+		eqIdx := hintIdx + len("hint.")
+		optionStart := eqIdx
+		for eqIdx < len(query) && isIdentChar(query[eqIdx]) {
+			eqIdx++
 		}
-		eqIdx += hintIdx
+		optionEnd := eqIdx
+		for eqIdx < len(query) && (query[eqIdx] == ' ' || query[eqIdx] == '\t') {
+			eqIdx++
+		}
+		if optionEnd == optionStart || eqIdx >= len(query) || query[eqIdx] != '=' ||
+			(eqIdx+1 < len(query) && query[eqIdx+1] == '=') {
+			searchFrom = optionStart
+			continue
+		}
 
 		// Find end of value - can be simple identifier or a function call with parens
 		endIdx := eqIdx + 1
