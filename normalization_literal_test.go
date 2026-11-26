@@ -124,6 +124,17 @@ func TestConvertBracketAccessPreservesEscapedSingleQuotedLiteral(t *testing.T) {
 	}
 }
 
+func TestConvertBracketAccessPreservesEscapedQuoteInConstantProperty(t *testing.T) {
+	query := `SecurityEvent | where Properties['can\'t'] == 1`
+	result := ExtractConditions(query)
+	if len(result.Errors) != 0 || len(result.Conditions) != 1 {
+		t.Fatalf("conditions=%+v errors=%q", result.Conditions, result.Errors)
+	}
+	if got := result.Conditions[0].Field; got != "Properties._can_t_" {
+		t.Fatalf("condition field = %q, want constant property identity %q", got, "Properties._can_t_")
+	}
+}
+
 func TestSkipLetStatementHandlesEscapedSingleQuotedLiteral(t *testing.T) {
 	query := `let ignored = 'can\'t'; SecurityEvent | where EventID == 1`
 	want := strings.IndexByte(query, ';') + 1

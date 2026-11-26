@@ -1166,18 +1166,15 @@ func convertBracketAccess(query string, recorders ...*kqlSourceRecorder) string 
 
 			// Case 1: ['...'] or ["..."] - quoted property access or column alias
 			if query[i+1] == '\'' || query[i+1] == '"' {
-				quote := query[i+1]
-				// Find the closing quote and bracket
-				end := i + 2
-				for end < len(query) && query[end] != quote {
-					end++
-				}
-				if end < len(query) && end+1 < len(query) && query[end] == quote && query[end+1] == ']' {
-					// Extract the key
-					key := query[i+2 : end]
+				literalEnd := stringLiteralEnd(query, i+1)
+				if literalEnd > i+1 && literalEnd < len(query) && query[literalEnd] == ']' {
+					// Decode the key before sanitizing it; escapes are part of the
+					// literal syntax, not the property name.
+					key := decodeKQLString(query[i+1 : literalEnd])
+					bracketEnd := literalEnd + 1
 					if !precededByIdent {
-						result.WriteString(query[i : end+2])
-						i = end + 2
+						result.WriteString(query[i:bracketEnd])
+						i = bracketEnd
 						continue
 					}
 					// Check if key is a valid identifier (alphanumeric + underscore
@@ -1189,15 +1186,15 @@ func convertBracketAccess(query string, recorders ...*kqlSourceRecorder) string 
 						}
 						result.WriteString(key)
 						if recorder != nil {
-							recorder.Replace(i, end+2, result.String()[before:], "")
+							recorder.Replace(i, bracketEnd, result.String()[before:], "")
 						}
-						i = end + 2
+						i = bracketEnd
 						continue
 					}
 					// Key has special characters (like $) - sanitize it
 					// Check if this is a column alias pattern: ['special name'] = expr
 					// Look ahead for = sign
-					afterBracket := end + 2
+					afterBracket := bracketEnd
 					for afterBracket < len(query) && (query[afterBracket] == ' ' || query[afterBracket] == '\t') {
 						afterBracket++
 					}
@@ -1208,9 +1205,9 @@ func convertBracketAccess(query string, recorders ...*kqlSourceRecorder) string 
 						sanitized := sanitizeIdentifier(key)
 						result.WriteString(sanitized)
 						if recorder != nil {
-							recorder.Replace(i, end+2, sanitized, "")
+							recorder.Replace(i, bracketEnd, sanitized, "")
 						}
-						i = end + 2
+						i = bracketEnd
 						continue
 					}
 					// Property access with special characters in key (like obj['$kind'])
@@ -1222,9 +1219,9 @@ func convertBracketAccess(query string, recorders ...*kqlSourceRecorder) string 
 					}
 					result.WriteString(sanitized)
 					if recorder != nil {
-						recorder.Replace(i, end+2, result.String()[before:], "")
+						recorder.Replace(i, bracketEnd, result.String()[before:], "")
 					}
-					i = end + 2
+					i = bracketEnd
 					continue
 				}
 			}
