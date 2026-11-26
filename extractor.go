@@ -1030,11 +1030,12 @@ func skipLetStatement(query string, i int) int {
 
 		if inString {
 			if c == stringChar {
-				if isVerbatim {
-					// Verbatim strings: backslash doesn't escape, so any closing quote ends the string
-					inString = false
-				} else if stringChar == '"' {
-					// Regular double-quoted strings: check if escaped
+				if isVerbatim && i+1 < len(query) && query[i+1] == stringChar {
+					i += 2
+					continue
+				}
+				if !isVerbatim {
+					// Regular strings of either quote style use backslash escapes.
 					backslashes := 0
 					for j := i - 1; j >= 0 && query[j] == '\\'; j-- {
 						backslashes++
@@ -1043,7 +1044,6 @@ func skipLetStatement(query string, i int) int {
 						inString = false
 					}
 				} else {
-					// Single-quoted strings: no backslash escaping in KQL
 					inString = false
 				}
 			}
@@ -1126,10 +1126,14 @@ func convertBracketAccess(query string, recorders ...*kqlSourceRecorder) string 
 			result.WriteByte(c)
 			if c == stringChar {
 				if isVerbatim {
-					// Verbatim strings: no escape characters, closing quote ends the string
+					if i+1 < len(query) && query[i+1] == stringChar {
+						result.WriteByte(query[i+1])
+						i += 2
+						continue
+					}
 					inString = false
-				} else if stringChar == '"' {
-					// Regular double-quoted strings have backslash escaping
+				} else {
+					// Regular strings of either quote style use backslash escapes.
 					backslashes := 0
 					for j := i - 1; j >= 0 && query[j] == '\\'; j-- {
 						backslashes++
@@ -1137,9 +1141,6 @@ func convertBracketAccess(query string, recorders ...*kqlSourceRecorder) string 
 					if backslashes%2 == 0 {
 						inString = false
 					}
-				} else {
-					// Single-quoted strings don't use backslash escaping
-					inString = false
 				}
 			}
 			i++
@@ -1326,6 +1327,7 @@ func fixNumericIdentifiers(query string, recorders ...*kqlSourceRecorder) string
 	i := 0
 	inString := false
 	stringChar := byte(0)
+	verbatimString := false
 
 	for i < len(query) {
 		c := query[i]
@@ -1353,15 +1355,21 @@ func fixNumericIdentifiers(query string, recorders ...*kqlSourceRecorder) string
 		if !inString && (c == '"' || c == '\'') {
 			inString = true
 			stringChar = c
+			verbatimString = i > 0 && query[i-1] == '@'
 			result.WriteByte(c)
 			i++
 			continue
 		}
 
 		if inString {
+			if verbatimString && c == stringChar && i+1 < len(query) && query[i+1] == stringChar {
+				result.WriteString(query[i : i+2])
+				i += 2
+				continue
+			}
 			result.WriteByte(c)
 			if c == stringChar {
-				if stringChar == '"' {
+				if !verbatimString {
 					backslashes := 0
 					for j := i - 1; j >= 0 && query[j] == '\\'; j-- {
 						backslashes++
@@ -1771,7 +1779,8 @@ func normalizeUnicodeWhitespace(query string, recorders ...*kqlSourceRecorder) s
 						inString = false
 						isVerbatim = false
 					}
-				} else if stringChar == '"' {
+				} else {
+					// Regular strings of either quote style use backslash escapes.
 					backslashes := 0
 					for j := i - 1; j >= 0 && query[j] == '\\'; j-- {
 						backslashes++
@@ -1779,8 +1788,6 @@ func normalizeUnicodeWhitespace(query string, recorders ...*kqlSourceRecorder) s
 					if backslashes%2 == 0 {
 						inString = false
 					}
-				} else {
-					inString = false
 				}
 			}
 			i++
@@ -2221,6 +2228,7 @@ func stripMvApplySubquery(query string, recorders ...*kqlSourceRecorder) string 
 		parenEnd := parenStart + 1
 		inString := false
 		stringChar := byte(0)
+		isVerbatim := false
 		for parenEnd < len(query) && depth > 0 {
 			c := query[parenEnd]
 			if !inString {
@@ -2228,18 +2236,27 @@ func stripMvApplySubquery(query string, recorders ...*kqlSourceRecorder) string 
 				case '"', '\'':
 					inString = true
 					stringChar = c
+					isVerbatim = parenEnd > 0 && query[parenEnd-1] == '@'
 				case '(':
 					depth++
 				case ')':
 					depth--
 				}
 			} else {
-				// In KQL, only double-quoted strings have backslash escaping
 				if c == stringChar {
-					if stringChar == '"' && parenEnd > 0 && query[parenEnd-1] == '\\' {
-						// Escaped quote, continue
-					} else {
+					if isVerbatim && parenEnd+1 < len(query) && query[parenEnd+1] == stringChar {
+						parenEnd++
+					} else if isVerbatim {
 						inString = false
+						isVerbatim = false
+					} else {
+						backslashes := 0
+						for j := parenEnd - 1; j >= 0 && query[j] == '\\'; j-- {
+							backslashes++
+						}
+						if backslashes%2 == 0 {
+							inString = false
+						}
 					}
 				}
 			}
@@ -2969,7 +2986,8 @@ func normalizeTrailingDecimals(query string) string {
 					}
 					inString = false
 					isVerbatim = false
-				} else if stringChar == '"' {
+				} else {
+					// Regular strings of either quote style use backslash escapes.
 					backslashes := 0
 					for j := i - 1; j >= 0 && query[j] == '\\'; j-- {
 						backslashes++
@@ -2977,8 +2995,6 @@ func normalizeTrailingDecimals(query string) string {
 					if backslashes%2 == 0 {
 						inString = false
 					}
-				} else {
-					inString = false
 				}
 			}
 			result.WriteByte(c)

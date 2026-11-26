@@ -90,3 +90,85 @@ func TestNormalizeQueryForDebugPreservesDatetimeLiteralAndCommentText(t *testing
 		t.Fatalf("date-time syntax outside literal was not normalized: %q", got)
 	}
 }
+
+func TestFixNumericIdentifiersPreservesEscapedSingleQuotedLiteral(t *testing.T) {
+	query := `SecurityEvent | where QueryText == 'can\'t 3plogTime'`
+	if got := fixNumericIdentifiers(query); got != query {
+		t.Fatalf("numeric identifier normalization changed a quoted value: got %q, want %q", got, query)
+	}
+
+	result := ExtractConditions(query)
+	if len(result.Errors) != 0 || len(result.Conditions) != 1 {
+		t.Fatalf("conditions=%+v errors=%q", result.Conditions, result.Errors)
+	}
+	condition := result.Conditions[0]
+	if got := condition.Value; got != `can\'t 3plogTime` {
+		t.Fatalf("condition value = %q, want raw literal contents %q", got, `can\'t 3plogTime`)
+	}
+	if condition.RHS == nil || condition.RHS.Value != "can't 3plogTime" {
+		t.Fatalf("condition RHS = %+v, want decoded value %q", condition.RHS, "can't 3plogTime")
+	}
+}
+
+func TestConvertBracketAccessPreservesEscapedSingleQuotedLiteral(t *testing.T) {
+	query := `SecurityEvent | where QueryText == 'can\'t item[0]'`
+	if got := convertBracketAccess(query); got != query {
+		t.Fatalf("bracket normalization changed a quoted value: got %q, want %q", got, query)
+	}
+	result := ExtractConditions(query)
+	if len(result.Errors) != 0 || len(result.Conditions) != 1 {
+		t.Fatalf("conditions=%+v errors=%q", result.Conditions, result.Errors)
+	}
+	if result.Conditions[0].RHS == nil || result.Conditions[0].RHS.Value != "can't item[0]" {
+		t.Fatalf("condition RHS = %+v, want decoded value %q", result.Conditions[0].RHS, "can't item[0]")
+	}
+}
+
+func TestSkipLetStatementHandlesEscapedSingleQuotedLiteral(t *testing.T) {
+	query := `let ignored = 'can\'t'; SecurityEvent | where EventID == 1`
+	want := strings.IndexByte(query, ';') + 1
+	if got := skipLetStatement(query, 0); got != want {
+		t.Fatalf("skipLetStatement() = %d, want semicolon boundary %d", got, want)
+	}
+	result := ExtractConditions(query)
+	if len(result.Errors) != 0 || len(result.Conditions) != 1 || result.Conditions[0].Field != "EventID" {
+		t.Fatalf("conditions=%+v errors=%q", result.Conditions, result.Errors)
+	}
+}
+
+func TestNormalizeUnicodeWhitespacePreservesEscapedSingleQuotedLiteral(t *testing.T) {
+	query := "SecurityEvent | where QueryText == 'can\\'t\u00a0value'"
+	if got := normalizeUnicodeWhitespace(query); got != query {
+		t.Fatalf("Unicode whitespace normalization changed a quoted value: got %q, want %q", got, query)
+	}
+	result := ExtractConditions(query)
+	if len(result.Errors) != 0 || len(result.Conditions) != 1 || result.Conditions[0].RHS == nil {
+		t.Fatalf("conditions=%+v errors=%q", result.Conditions, result.Errors)
+	}
+	if got := result.Conditions[0].RHS.Value; got != "can't\u00a0value" {
+		t.Fatalf("condition RHS value = %q, want escaped apostrophe and NBSP preserved", got)
+	}
+}
+
+func TestNormalizeTrailingDecimalsPreservesEscapedSingleQuotedLiteral(t *testing.T) {
+	query := `SecurityEvent | where QueryText == 'can\'t 1000. value'`
+	if got := normalizeTrailingDecimals(query); got != query {
+		t.Fatalf("decimal normalization changed a quoted value: got %q, want %q", got, query)
+	}
+	result := ExtractConditions(query)
+	if len(result.Errors) != 0 || len(result.Conditions) != 1 || result.Conditions[0].RHS == nil {
+		t.Fatalf("conditions=%+v errors=%q", result.Conditions, result.Errors)
+	}
+	if got := result.Conditions[0].RHS.Value; got != "can't 1000. value" {
+		t.Fatalf("condition RHS value = %q, want %q", got, "can't 1000. value")
+	}
+}
+
+func TestStripMvApplySubqueryHandlesEscapedSingleQuotedLiteral(t *testing.T) {
+	query := `T | mv-apply x on (where QueryText == 'can\')') | where EventID == 1`
+	got := stripMvApplySubquery(query)
+	want := "T  | where EventID == 1"
+	if got != want {
+		t.Fatalf("stripMvApplySubquery() = %q, want %q", got, want)
+	}
+}
