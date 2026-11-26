@@ -58,6 +58,8 @@ func TestNormalizationKeepsLiteralAndCommentText(t *testing.T) {
 			[]condition{{"x", "==", "1"}, {"y", "==", "2"}}},
 		{"syntax beside a literal", `SecurityEvent | where QueryText contains "1<>1" and Count <> 2`,
 			[]condition{{"QueryText", "contains", "1<>1"}, {"Count", "!=", "2"}}},
+		{"numeric identifier text in a backtick literal", "SecurityEvent | where QueryText == ```3plogTime```",
+			[]condition{{"QueryText", "==", "```3plogTime```"}}},
 		{"summarize by beside a literal", `SecurityEvent | where QueryText contains "summarize by x" | summarize by Account`,
 			[]condition{{"QueryText", "contains", "summarize by x"}}},
 	} {

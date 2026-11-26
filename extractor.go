@@ -1338,6 +1338,16 @@ func fixNumericIdentifiers(query string, recorders ...*kqlSourceRecorder) string
 			}
 			continue
 		}
+		if !inString && strings.HasPrefix(query[i:], "```") {
+			if end := strings.Index(query[i+3:], "```"); end >= 0 {
+				end += i + 6
+				result.WriteString(query[i:end])
+				i = end
+				continue
+			}
+			result.WriteString(query[i:])
+			break
+		}
 
 		// Track strings
 		if !inString && (c == '"' || c == '\'') {
