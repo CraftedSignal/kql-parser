@@ -2226,39 +2226,16 @@ func stripMvApplySubquery(query string, recorders ...*kqlSourceRecorder) string 
 		// Find matching closing paren
 		depth := 1
 		parenEnd := parenStart + 1
-		inString := false
-		stringChar := byte(0)
-		isVerbatim := false
 		for parenEnd < len(query) && depth > 0 {
-			c := query[parenEnd]
-			if !inString {
-				switch c {
-				case '"', '\'':
-					inString = true
-					stringChar = c
-					isVerbatim = parenEnd > 0 && query[parenEnd-1] == '@'
-				case '(':
-					depth++
-				case ')':
-					depth--
-				}
-			} else {
-				if c == stringChar {
-					if isVerbatim && parenEnd+1 < len(query) && query[parenEnd+1] == stringChar {
-						parenEnd++
-					} else if isVerbatim {
-						inString = false
-						isVerbatim = false
-					} else {
-						backslashes := 0
-						for j := parenEnd - 1; j >= 0 && query[j] == '\\'; j-- {
-							backslashes++
-						}
-						if backslashes%2 == 0 {
-							inString = false
-						}
-					}
-				}
+			if lowerQuery[parenEnd] == 0 {
+				parenEnd++
+				continue
+			}
+			switch query[parenEnd] {
+			case '(':
+				depth++
+			case ')':
+				depth--
 			}
 			parenEnd++
 		}

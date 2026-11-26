@@ -172,3 +172,24 @@ func TestStripMvApplySubqueryHandlesEscapedSingleQuotedLiteral(t *testing.T) {
 		t.Fatalf("stripMvApplySubquery() = %q, want %q", got, want)
 	}
 }
+
+func TestStripMvApplySubqueryIgnoresParenthesesInComments(t *testing.T) {
+	queries := map[string]string{
+		"line":  "T | mv-apply x on (where QueryText == \"a\" // )\n) | where EventID == 1",
+		"block": `T | mv-apply x on (where QueryText == "a" /* ) */) | where EventID == 1`,
+	}
+	for name, query := range queries {
+		t.Run(name, func(t *testing.T) {
+			got := stripMvApplySubquery(query)
+			want := "T  | where EventID == 1"
+			if got != want {
+				t.Fatalf("stripMvApplySubquery() = %q, want %q", got, want)
+			}
+
+			result := ExtractConditions(query)
+			if len(result.Errors) != 0 || len(result.Conditions) != 1 || result.Conditions[0].Field != "EventID" {
+				t.Fatalf("conditions=%+v errors=%q", result.Conditions, result.Errors)
+			}
+		})
+	}
+}
