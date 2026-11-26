@@ -17,7 +17,17 @@ type QueryEntry struct {
 	Query  string `json:"query"`
 }
 
-// TestLargeCorpusFuzz tests the KQL parser against a large corpus of real-world queries
+func collectedCorpusQueries(queries []QueryEntry) []QueryEntry {
+	collected := make([]QueryEntry, 0, len(queries))
+	for _, query := range queries {
+		if !strings.EqualFold(strings.TrimSpace(query.Source), "Generated") {
+			collected = append(collected, query)
+		}
+	}
+	return collected
+}
+
+// TestLargeCorpusFuzz tests the KQL parser against collected real-world queries.
 func TestLargeCorpusFuzz(t *testing.T) {
 	corpusPath := "testdata/corpus.json"
 
@@ -36,11 +46,15 @@ func TestLargeCorpusFuzz(t *testing.T) {
 	if err := json.Unmarshal(data, &queries); err != nil {
 		t.Fatalf("Failed to parse corpus: %v", err)
 	}
+	queries = collectedCorpusQueries(queries)
+	if len(queries) == 0 {
+		t.Fatal("no collected queries in corpus")
+	}
 
-	t.Logf("Loaded %d queries from corpus", len(queries))
+	t.Logf("Loaded %d collected queries from corpus", len(queries))
 	if testing.Short() && len(queries) > 256 {
-		// Keep concurrent parsing in race runs without replaying the entire
-		// 51k corpus there. The full coverage step always tests every query.
+		// Keep concurrent parsing bounded in race runs. The full run tests every
+		// collected query.
 		sample := make([]QueryEntry, 256)
 		for i := range sample {
 			sample[i] = queries[i*(len(queries)-1)/(len(sample)-1)]
@@ -151,7 +165,7 @@ func TestLargeCorpusFuzz(t *testing.T) {
 	t.Logf("\nExtracted predicate rate (conditions or scalar expression): %.1f%%", successRate)
 }
 
-// TestLargeCorpusSample tests a random sample of queries for faster iteration
+// TestLargeCorpusSample tests a deterministic sample of collected queries.
 func TestLargeCorpusSample(t *testing.T) {
 	corpusPath := "testdata/corpus.json"
 
@@ -168,9 +182,16 @@ func TestLargeCorpusSample(t *testing.T) {
 	if err := json.Unmarshal(data, &queries); err != nil {
 		t.Fatalf("Failed to parse corpus: %v", err)
 	}
+	queries = collectedCorpusQueries(queries)
+	if len(queries) == 0 {
+		t.Fatal("no collected queries in corpus")
+	}
 
 	// Test every 100th query for a quick sample
 	sampleSize := len(queries) / 100
+	if sampleSize == 0 {
+		sampleSize = len(queries)
+	}
 	if sampleSize > 1000 {
 		sampleSize = 1000
 	}
@@ -237,20 +258,14 @@ func TestLargeCorpusBySource(t *testing.T) {
 	if err := json.Unmarshal(data, &queries); err != nil {
 		t.Fatalf("Failed to parse corpus: %v", err)
 	}
+	queries = collectedCorpusQueries(queries)
 
-	// Group queries by source repo
+	// Group collected queries by source.
 	bySource := make(map[string][]QueryEntry)
 	for _, q := range queries {
-		// Extract repo name from source path
-		source := "unknown"
-		if strings.Contains(q.Source, "kql_corpus/") {
-			parts := strings.Split(q.Source, "kql_corpus/")
-			if len(parts) > 1 {
-				subparts := strings.Split(parts[1], "/")
-				if len(subparts) > 0 {
-					source = subparts[0]
-				}
-			}
+		source := strings.TrimSpace(q.Source)
+		if source == "" {
+			source = "unknown"
 		}
 		bySource[source] = append(bySource[source], q)
 	}
@@ -278,6 +293,7 @@ func BenchmarkLargeCorpus(b *testing.B) {
 	if err := json.Unmarshal(data, &queries); err != nil {
 		b.Fatalf("Failed to parse corpus: %v", err)
 	}
+	queries = collectedCorpusQueries(queries)
 
 	// Use a subset for benchmarking
 	sampleSize := 1000
@@ -313,6 +329,7 @@ func TestFindFailingQueries(t *testing.T) {
 	if err := json.Unmarshal(data, &queries); err != nil {
 		t.Fatalf("Failed to parse corpus: %v", err)
 	}
+	queries = collectedCorpusQueries(queries)
 
 	selected := queries
 	if os.Getenv("KQL_FULL_DIAGNOSTIC") != "1" && len(queries) > 1000 {
