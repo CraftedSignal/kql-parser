@@ -1602,7 +1602,7 @@ func sanitizeIdentifier(s string) string {
 	return result.String()
 }
 
-// normalizeEscapeSequences converts literal \r\n to actual newlines and \uXXXX to Unicode chars, but only outside strings
+// normalizeEscapeSequences converts literal \r\n to actual newlines and \uXXXX to Unicode chars, but only outside strings and comments
 func normalizeEscapeSequences(query string, recorders ...*kqlSourceRecorder) string {
 	var result strings.Builder
 	var recorder *kqlSourceRecorder
@@ -1611,10 +1611,45 @@ func normalizeEscapeSequences(query string, recorders ...*kqlSourceRecorder) str
 	}
 	inString := false
 	stringChar := byte(0)
+	inLineComment := false
+	inBlockComment := false
 	i := 0
 
 	for i < len(query) {
 		c := query[i]
+		if inLineComment {
+			result.WriteByte(c)
+			i++
+			if c == '\n' || c == '\r' {
+				inLineComment = false
+			}
+			continue
+		}
+		if inBlockComment {
+			if c == '*' && i+1 < len(query) && query[i+1] == '/' {
+				result.WriteString("*/")
+				i += 2
+				inBlockComment = false
+			} else {
+				result.WriteByte(c)
+				i++
+			}
+			continue
+		}
+		if !inString && c == '/' && i+1 < len(query) {
+			switch query[i+1] {
+			case '/':
+				result.WriteString("//")
+				i += 2
+				inLineComment = true
+				continue
+			case '*':
+				result.WriteString("/*")
+				i += 2
+				inBlockComment = true
+				continue
+			}
+		}
 
 		// Track string literal boundaries
 		if !inString && (c == '"' || c == '\'') {
@@ -8189,6 +8224,8 @@ func findMatchingParen(s string, open int) int {
 // extractPortableConditions extracts translatable conditions from KQL shapes
 // that parse successfully but do not produce portable predicates in the tree walker.
 func extractPortableConditions(originalQuery, normalizedQuery string, allowGenericKeyword bool) ([]Condition, string) {
+	originalQuery = stripKQLComments(originalQuery)
+	normalizedQuery = stripKQLComments(normalizedQuery)
 	if conditions := extractPortablePredicates(originalQuery); len(conditions) > 0 {
 		return conditions, portablePredicateExtractionNote
 	}
@@ -8206,6 +8243,52 @@ func extractPortableConditions(originalQuery, normalizedQuery string, allowGener
 		return nil, ""
 	}
 	return []Condition{portableKeywordCondition(keyword)}, portableKeywordExtractionNote
+}
+
+func stripKQLComments(query string) string {
+	var masked []byte
+	for i := 0; i < len(query); {
+		if isStringLiteralStart(query, i) {
+			end := stringLiteralEnd(query, i)
+			if end < 0 {
+				break
+			}
+			i = end
+			continue
+		}
+
+		end := i
+		switch {
+		case strings.HasPrefix(query[i:], "//"):
+			end = i + 2
+			for end < len(query) && query[end] != '\r' && query[end] != '\n' {
+				end++
+			}
+		case strings.HasPrefix(query[i:], "/*"):
+			if close := strings.Index(query[i+2:], "*/"); close >= 0 {
+				end = i + 2 + close + 2
+			} else {
+				end = len(query)
+			}
+		}
+		if end > i {
+			if masked == nil {
+				masked = []byte(query)
+			}
+			for j := i; j < end; j++ {
+				if query[j] != '\r' && query[j] != '\n' {
+					masked[j] = ' '
+				}
+			}
+			i = end
+			continue
+		}
+		i++
+	}
+	if masked == nil {
+		return query
+	}
+	return string(masked)
 }
 
 // A successfully parsed structured query can legitimately have no row filters.

@@ -14,6 +14,41 @@ func TestKQLUnicodeEscapeWordJoinerIsDroppedOutsideStrings(t *testing.T) {
 	}
 }
 
+func TestKQLUnicodeEscapeNormalizationPreservesLineComments(t *testing.T) {
+	query := `SecurityEvent | where true // comment \u000a| where EventID == 4624`
+	if got := normalizeEscapeSequences(query); got != query {
+		t.Fatalf("line comment changed during escape normalization: got %q, want %q", got, query)
+	}
+	result := ExtractConditions(query)
+	if len(result.Conditions) != 0 {
+		t.Fatalf("extracted conditions from line comment: %+v", result.Conditions)
+	}
+	if len(result.Errors) != 0 {
+		t.Fatalf("valid query produced errors: %v", result.Errors)
+	}
+}
+
+func TestKQLUnicodeEscapeNormalizationPreservesBlockComments(t *testing.T) {
+	query := `SecurityEvent | where true /* comment \u002a/ | where EventID == 4624 */`
+	result := ExtractConditions(query)
+	if len(result.Errors) != 0 {
+		t.Fatalf("valid query produced errors: %v", result.Errors)
+	}
+	if len(result.Conditions) != 0 {
+		t.Fatalf("extracted conditions from block comment: %+v", result.Conditions)
+	}
+	if got := normalizeEscapeSequences(query); got != query {
+		t.Fatalf("block comment changed during escape normalization: got %q, want %q", got, query)
+	}
+}
+
+func TestStripKQLCommentsPreservesStringLiterals(t *testing.T) {
+	query := `T | where Message == @"/* not a comment */ // still a literal"`
+	if got := stripKQLComments(query); got != query {
+		t.Fatalf("string literal changed while stripping comments: got %q, want %q", got, query)
+	}
+}
+
 func TestKQLHandleUnicodeEscapeZeroWidthAndUppercaseHex(t *testing.T) {
 	var b strings.Builder
 	handleUnicodeEscape("2060", &b)
