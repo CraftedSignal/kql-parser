@@ -56,6 +56,16 @@ func TestKQLStripReturnTypeAnnotationsEdges(t *testing.T) {
 		t.Fatalf("stripReturnTypeAnnotations() = %q, want %q", got, want)
 	}
 
+	commented := "T | evaluate bag_unpack(foo // )\n) : (Payload:string)"
+	commentedWant := "T | evaluate bag_unpack(foo // )\n)"
+	if got := stripReturnTypeAnnotations(commented); got != commentedWant {
+		t.Fatalf("stripReturnTypeAnnotations() with a line comment = %q, want %q", got, commentedWant)
+	}
+	commentedType := `T | evaluate bag_unpack(foo) : (*, /* ) */ Payload:string)`
+	if got := stripReturnTypeAnnotations(commentedType); got != `T | evaluate bag_unpack(foo)` {
+		t.Fatalf("stripReturnTypeAnnotations() with a block comment = %q", got)
+	}
+
 	unchanged := `T | evaluate bag_unpack(Properties) | where Account == "x"`
 	if got := stripReturnTypeAnnotations(unchanged); got != unchanged {
 		t.Fatalf("query without return annotation changed to %q", got)

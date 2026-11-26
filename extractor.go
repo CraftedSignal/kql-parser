@@ -1956,6 +1956,9 @@ func stripReturnTypeAnnotations(query string, recorders ...*kqlSourceRecorder) s
 		evalSearchStart := idx + 8
 		parenStart := -1
 		for i := evalSearchStart; i < len(query); i++ {
+			if lowerQuery[i] == 0 {
+				continue
+			}
 			if query[i] == '(' {
 				parenStart = i
 				break
@@ -1976,28 +1979,16 @@ func stripReturnTypeAnnotations(query string, recorders ...*kqlSourceRecorder) s
 		// Find matching closing paren
 		depth := 1
 		parenEnd := parenStart + 1
-		inString := false
-		stringChar := byte(0)
 		for parenEnd < len(query) && depth > 0 {
-			c := query[parenEnd]
-			if !inString {
-				switch c {
-				case '"', '\'':
-					inString = true
-					stringChar = c
-				case '(':
-					depth++
-				case ')':
-					depth--
-				}
-			} else {
-				if c == stringChar {
-					if stringChar == '"' && parenEnd > 0 && query[parenEnd-1] == '\\' {
-						// escaped
-					} else {
-						inString = false
-					}
-				}
+			if lowerQuery[parenEnd] == 0 {
+				parenEnd++
+				continue
+			}
+			switch query[parenEnd] {
+			case '(':
+				depth++
+			case ')':
+				depth--
 			}
 			parenEnd++
 		}
@@ -2033,6 +2024,10 @@ func stripReturnTypeAnnotations(query string, recorders ...*kqlSourceRecorder) s
 		depth = 1
 		typeEnd := typeStart + 1
 		for typeEnd < len(query) && depth > 0 {
+			if lowerQuery[typeEnd] == 0 {
+				typeEnd++
+				continue
+			}
 			switch query[typeEnd] {
 			case '(':
 				depth++
@@ -2124,6 +2119,10 @@ func normalizeLookupSubquery(query string, recorders ...*kqlSourceRecorder) stri
 		depth := 1
 		parenEnd := parenStart + 1
 		for parenEnd < len(query) && depth > 0 {
+			if lowerQuery[parenEnd] == 0 {
+				parenEnd++
+				continue
+			}
 			switch query[parenEnd] {
 			case '(':
 				depth++

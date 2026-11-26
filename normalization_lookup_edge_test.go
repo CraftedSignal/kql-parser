@@ -23,6 +23,15 @@ func TestKQLNormalizeLookupSubqueryWithNestedUnionExpression(t *testing.T) {
 	}
 }
 
+func TestKQLNormalizeLookupSubqueryIgnoresParenthesesInComments(t *testing.T) {
+	input := "T | lookup kind=inner (WatchlistA // )\n| union WatchlistB) on Id"
+	want := `T | lookup kind=inner (LookupTable) on Id`
+
+	if got := normalizeLookupSubquery(input); got != want {
+		t.Fatalf("normalizeLookupSubquery() = %q, want %q", got, want)
+	}
+}
+
 func TestKQLNormalizeLookupSubqueryRequiresLookupOperator(t *testing.T) {
 	input := `T | extend mylookup = "(union A, B)" | where mylookup contains "union"`
 
