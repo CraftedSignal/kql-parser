@@ -1609,8 +1609,6 @@ func normalizeEscapeSequences(query string, recorders ...*kqlSourceRecorder) str
 	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query {
 		recorder = recorders[0]
 	}
-	inString := false
-	stringChar := byte(0)
 	inLineComment := false
 	inBlockComment := false
 	i := 0
@@ -1636,7 +1634,17 @@ func normalizeEscapeSequences(query string, recorders ...*kqlSourceRecorder) str
 			}
 			continue
 		}
-		if !inString && c == '/' && i+1 < len(query) {
+		if isStringLiteralStart(query, i) {
+			end := stringLiteralEnd(query, i)
+			if end < 0 {
+				result.WriteString(query[i:])
+				break
+			}
+			result.WriteString(query[i:end])
+			i = end
+			continue
+		}
+		if c == '/' && i+1 < len(query) {
 			switch query[i+1] {
 			case '/':
 				result.WriteString("//")
@@ -1649,32 +1657,6 @@ func normalizeEscapeSequences(query string, recorders ...*kqlSourceRecorder) str
 				inBlockComment = true
 				continue
 			}
-		}
-
-		// Track string literal boundaries
-		if !inString && (c == '"' || c == '\'') {
-			inString = true
-			stringChar = c
-			result.WriteByte(c)
-			i++
-			continue
-		}
-
-		if inString {
-			if c == stringChar {
-				// Check if it's escaped
-				backslashes := 0
-				for j := i - 1; j >= 0 && query[j] == '\\'; j-- {
-					backslashes++
-				}
-				if backslashes%2 == 0 {
-					// Not escaped, end of string
-					inString = false
-				}
-			}
-			result.WriteByte(c)
-			i++
-			continue
 		}
 
 		// Outside strings, convert escape sequences

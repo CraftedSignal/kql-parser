@@ -353,11 +353,14 @@ func visitListItems(s string, budget *parseBudget, visit func(string) bool) bool
 	return true
 }
 
-// isStringLiteralStart reports whether a string literal, regular or verbatim
-// (@"..."), starts at s[i].
+// isStringLiteralStart reports whether a regular, verbatim (@"..."), or
+// multiline string literal starts at s[i].
 func isStringLiteralStart(s string, i int) bool {
 	if i >= len(s) {
 		return false
+	}
+	if strings.HasPrefix(s[i:], "```") || strings.HasPrefix(s[i:], `"""`) {
+		return true
 	}
 	if s[i] == '"' || s[i] == '\'' {
 		return true
@@ -367,8 +370,21 @@ func isStringLiteralStart(s string, i int) bool {
 
 // stringLiteralEnd returns the index just past the string literal starting
 // at s[start], or -1 when it is not closed. Regular strings escape with a
-// backslash; verbatim strings double the quote.
+// backslash, verbatim strings double the quote, and multiline strings close
+// at the next matching triple delimiter.
 func stringLiteralEnd(s string, start int) int {
+	if start < 0 || start >= len(s) {
+		return -1
+	}
+	for _, delimiter := range []string{"```", `"""`} {
+		if strings.HasPrefix(s[start:], delimiter) {
+			close := strings.Index(s[start+len(delimiter):], delimiter)
+			if close < 0 {
+				return -1
+			}
+			return start + len(delimiter) + close + len(delimiter)
+		}
+	}
 	verbatim := s[start] == '@'
 	i := start
 	if verbatim {

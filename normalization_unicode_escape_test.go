@@ -42,10 +42,43 @@ func TestKQLUnicodeEscapeNormalizationPreservesBlockComments(t *testing.T) {
 	}
 }
 
+func TestKQLUnicodeEscapeNormalizationPreservesMultilineLiteral(t *testing.T) {
+	for _, tc := range []struct{ literal, want string }{
+		{"```\\u0041```", `\u0041`},
+		{`"""one " quote \u2060"""`, "one \" quote \u2060"},
+	} {
+		query := "SecurityEvent | where Message == " + tc.literal
+		t.Run(tc.literal, func(t *testing.T) {
+			if got := normalizeEscapeSequences(query); got != query {
+				t.Fatalf("multiline literal changed during escape normalization: got %q, want %q", got, query)
+			}
+			result := ExtractConditions(query)
+			if len(result.Errors) != 0 || len(result.Conditions) != 1 {
+				t.Fatalf("conditions=%+v errors=%q", result.Conditions, result.Errors)
+			}
+			if got := result.Conditions[0].RHS.Value; got != tc.want {
+				t.Fatalf("multiline literal value = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestStripKQLCommentsPreservesStringLiterals(t *testing.T) {
 	query := `T | where Message == @"/* not a comment */ // still a literal"`
 	if got := stripKQLComments(query); got != query {
 		t.Fatalf("string literal changed while stripping comments: got %q, want %q", got, query)
+	}
+}
+
+func TestStripKQLCommentsPreservesMultilineLiterals(t *testing.T) {
+	for _, literal := range []string{
+		"```first line\n// still literal\n/* still literal */```",
+		"\"\"\"first line\n// still literal\n/* still literal */\"\"\"",
+	} {
+		query := "T | where Message == " + literal
+		if got := stripKQLComments(query); got != query {
+			t.Errorf("multiline literal changed while stripping comments: got %q, want %q", got, query)
+		}
 	}
 }
 
