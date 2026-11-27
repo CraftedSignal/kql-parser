@@ -7804,7 +7804,7 @@ func extractPortableDataSources(originalQuery, normalizedQuery string, budgets .
 func extractLetStatements(query string) []LetStatement {
 	var statements []LetStatement
 	for _, statement := range splitStatements(normalizeNewlines(query)) {
-		cleaned := trimLeadingLineComments(statement)
+		cleaned := trimLeadingComments(statement)
 		name, expression, ok := parseLetAssignment(strings.TrimSpace(cleaned))
 		if !ok || expression == "" {
 			continue
@@ -7817,17 +7817,27 @@ func extractLetStatements(query string) []LetStatement {
 	return statements
 }
 
-func trimLeadingLineComments(value string) string {
-	lines := strings.Split(normalizeNewlines(value), "\n")
-	for len(lines) > 0 {
-		line := strings.TrimSpace(lines[0])
-		if line == "" || strings.HasPrefix(line, "//") {
-			lines = lines[1:]
-			continue
+func trimLeadingComments(value string) string {
+	value = normalizeNewlines(value)
+	for {
+		value = strings.TrimLeft(value, " \t\r\n")
+		switch {
+		case strings.HasPrefix(value, "//"):
+			if end := strings.IndexByte(value, '\n'); end >= 0 {
+				value = value[end+1:]
+				continue
+			}
+			return ""
+		case strings.HasPrefix(value, "/*"):
+			if end := strings.Index(value[2:], "*/"); end >= 0 {
+				value = value[end+4:]
+				continue
+			}
+			return ""
+		default:
+			return value
 		}
-		break
 	}
-	return strings.Join(lines, "\n")
 }
 
 func hasPortableFieldConditions(conditions []Condition) bool {
@@ -7916,6 +7926,22 @@ func splitStatements(query string) []string {
 				verbatim = false
 			}
 			continue
+		}
+		if ch == '/' && i+1 < len(query) {
+			switch query[i+1] {
+			case '/':
+				for i < len(query) && query[i] != '\r' && query[i] != '\n' {
+					i++
+				}
+				continue
+			case '*':
+				if end := strings.Index(query[i+2:], "*/"); end >= 0 {
+					i += end + 3
+				} else {
+					i = len(query)
+				}
+				continue
+			}
 		}
 		if ch == '@' && i+1 < len(query) && (query[i+1] == '"' || query[i+1] == '\'') {
 			quote = query[i+1]

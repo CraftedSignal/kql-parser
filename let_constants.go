@@ -94,7 +94,7 @@ func inlineLetConstantsWithSource(query string, lets []LetStatement, budget *par
 	statementStart := 0
 	for index, statement := range statements {
 		budget.step()
-		name, expression, isLet := parseLetAssignment(strings.TrimSpace(trimLeadingLineComments(statement)))
+		name, expression, isLet := parseLetAssignment(strings.TrimSpace(trimLeadingComments(statement)))
 		if isLet {
 			if constant, ok := parseLetConstant(expression, budget); ok {
 				constants[name] = constant

@@ -653,6 +653,30 @@ func TestKQLLetConstantAfterLineCommentAcrossLineEndings(t *testing.T) {
 	}
 }
 
+func TestKQLLetConstantAfterUnmatchedQuoteInLineComment(t *testing.T) {
+	query := "let unused = \"x\";\n// semicolon in comment; unmatched quote \"\nlet app = \"alice\";\nSecurityEvent | where Account == app"
+	result := ExtractConditions(query)
+	if len(result.Errors) != 0 || len(result.Conditions) != 1 {
+		t.Fatalf("conditions=%+v errors=%q; want Account == alice", result.Conditions, result.Errors)
+	}
+	condition := result.Conditions[0]
+	if condition.Field != "Account" || condition.Operator != "==" || condition.Value != "alice" {
+		t.Fatalf("condition = %+v, want Account == alice", condition)
+	}
+}
+
+func TestKQLLetConstantAfterSemicolonInBlockComment(t *testing.T) {
+	query := "let unused = \"x\";\n/* semicolon in comment; ignored */\nlet app = \"alice\";\nSecurityEvent | where Account == app"
+	result := ExtractConditions(query)
+	if len(result.Errors) != 0 || len(result.Conditions) != 1 {
+		t.Fatalf("conditions=%+v errors=%q; want Account == alice", result.Conditions, result.Errors)
+	}
+	condition := result.Conditions[0]
+	if condition.Field != "Account" || condition.Operator != "==" || condition.Value != "alice" {
+		t.Fatalf("condition = %+v, want Account == alice", condition)
+	}
+}
+
 func TestKQLBracketAccessAfterCROnlyLineComment(t *testing.T) {
 	query := "SecurityEvent // comment\r| where object['Account'] == \"alice\""
 	want := "SecurityEvent // comment\r| where object.Account == \"alice\""
