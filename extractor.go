@@ -7823,7 +7823,10 @@ func trimLeadingComments(value string) string {
 		value = strings.TrimLeft(value, " \t\r\n")
 		switch {
 		case strings.HasPrefix(value, "//"):
-			if end := strings.IndexByte(value, '\n'); end >= 0 {
+			if end := strings.IndexAny(value, "\r\n"); end >= 0 {
+				if value[end] == '\r' && end+1 < len(value) && value[end+1] == '\n' {
+					end++
+				}
 				value = value[end+1:]
 				continue
 			}
@@ -7859,7 +7862,7 @@ func hasPortableFieldConditions(conditions []Condition) bool {
 func extractLetNames(query string) map[string]bool {
 	names := make(map[string]bool)
 	for _, statement := range splitStatements(normalizeNewlines(query)) {
-		name, _, ok := parseLetAssignment(strings.TrimSpace(statement))
+		name, _, ok := parseLetAssignment(strings.TrimSpace(trimLeadingComments(statement)))
 		if ok {
 			names[strings.ToLower(name)] = true
 		}
@@ -9181,7 +9184,7 @@ func stripLineComments(query string) string {
 		}
 		if strings.HasPrefix(query[i:], "//") {
 			b.WriteString(query[last:i])
-			for i < len(query) && query[i] != '\n' {
+			for i < len(query) && query[i] != '\r' && query[i] != '\n' {
 				i++
 			}
 			last = i

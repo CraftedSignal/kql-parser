@@ -46,6 +46,11 @@ func TestDataSourcesSingleSegmentAndJoin(t *testing.T) {
 	}
 }
 
+func TestDataSourcesAfterCROnlyLineComment(t *testing.T) {
+	query := "let first = SecurityEvent; // comment\rlet second = DeviceProcessEvents;\nsecond"
+	assertSameSources(t, query, ExtractConditions(query).DataSources, []string{"SecurityEvent", "DeviceProcessEvents"})
+}
+
 // TestDataSourcesJoinShapes exercises join forms beyond the minimal repro: the
 // operand may be filtered, aggregated, chained, or itself a union, and a query
 // may join more than once.
