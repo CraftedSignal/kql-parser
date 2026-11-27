@@ -519,3 +519,31 @@ func TestKQLOperatorNormalizationEdges(t *testing.T) {
 		t.Fatalf("non-leading search operator should be preserved")
 	}
 }
+
+func TestKQLNormalizeSummarizeByAfterLineComment(t *testing.T) {
+	for _, tc := range []struct{ name, lineEnding string }{
+		{"LF", "\n"},
+		{"CRLF", "\r\n"},
+		{"CR", "\r"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			query := "SecurityEvent // comment" + tc.lineEnding + "| summarize by Account | where Account == \"alice\""
+			want := "SecurityEvent // comment" + tc.lineEnding + "| summarize count() by Account | where Account == \"alice\""
+			if got := normalizeSummarizeBy(query); got != want {
+				t.Fatalf("normalizeSummarizeBy() = %q, want %q", got, want)
+			}
+			if got := normalizeQuery(query); !strings.Contains(got, "summarize count() by Account") {
+				t.Fatalf("normalizeQuery() did not normalize summarize by: %q", got)
+			}
+
+			result := ExtractConditions(query)
+			if len(result.Errors) != 0 || len(result.Conditions) != 1 {
+				t.Fatalf("ExtractConditions() conditions=%+v errors=%q, normalized=%q; want one condition without errors", result.Conditions, result.Errors, normalizeQuery(query))
+			}
+			condition := result.Conditions[0]
+			if condition.Field != "Account" || condition.Operator != "==" || condition.Value != "alice" {
+				t.Fatalf("ExtractConditions() condition = %+v, want Account == alice", condition)
+			}
+		})
+	}
+}

@@ -60,7 +60,7 @@ func protectedKQLBytes(query string, budget *parseBudget) []bool {
 			end = stringLiteralEnd(query, i)
 		case strings.HasPrefix(query[i:], "//"):
 			end = i + 2
-			for end < len(query) && query[end] != '\n' {
+			for end < len(query) && query[end] != '\r' && query[end] != '\n' {
 				end++
 			}
 		case strings.HasPrefix(query[i:], "/*"):

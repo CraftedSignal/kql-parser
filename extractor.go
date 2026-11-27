@@ -2774,7 +2774,7 @@ func stripTrailingSemicolonsAndComments(query string, recorders ...*kqlSourceRec
 				}
 			case result[i] == '/' && i+1 < len(result) && result[i+1] == '/':
 				lastCommentIdx = i
-				for i < len(result) && result[i] != '\n' {
+				for i < len(result) && result[i] != '\r' && result[i] != '\n' {
 					i++
 				}
 			default:
@@ -2787,7 +2787,7 @@ func stripTrailingSemicolonsAndComments(query string, recorders ...*kqlSourceRec
 			// Check if there's a newline after this comment
 			hasNewlineAfter := false
 			for j := lastCommentIdx + 2; j < len(result); j++ {
-				if result[j] == '\n' {
+				if result[j] == '\r' || result[j] == '\n' {
 					hasNewlineAfter = true
 					break
 				}
