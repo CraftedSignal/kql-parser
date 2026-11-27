@@ -864,7 +864,7 @@ func skipLetStatements(query string) int {
 		// Check for line comment
 		if i+1 < n && query[i] == '/' && query[i+1] == '/' {
 			// Skip to end of line
-			for i < n && query[i] != '\n' {
+			for i < n && query[i] != '\n' && query[i] != '\r' {
 				i++
 			}
 			continue
@@ -1011,50 +1011,22 @@ func skipLetStatement(query string, i int) int {
 	// Find the semicolon that ends this let statement, tracking nesting
 	parenDepth := 0
 	braceDepth := 0
-	inString := false
-	stringChar := byte(0)
-	isVerbatim := false // Tracks if current string is a verbatim string (@"..." or @'...')
 
 	for i < n {
-		c := query[i]
-
-		// Handle string literals
-		if !inString && (c == '"' || c == '\'') {
-			// Check for verbatim string prefix (@)
-			isVerbatim = i > 0 && query[i-1] == '@'
-			inString = true
-			stringChar = c
-			i++
-			continue
-		}
-
-		if inString {
-			if c == stringChar {
-				if isVerbatim && i+1 < len(query) && query[i+1] == stringChar {
-					i += 2
-					continue
-				}
-				if !isVerbatim {
-					// Regular strings of either quote style use backslash escapes.
-					backslashes := 0
-					for j := i - 1; j >= 0 && query[j] == '\\'; j-- {
-						backslashes++
-					}
-					if backslashes%2 == 0 {
-						inString = false
-					}
-				} else {
-					inString = false
-				}
+		if isStringLiteralStart(query, i) {
+			end := stringLiteralEnd(query, i)
+			if end < 0 {
+				return n
 			}
-			i++
+			i = end
 			continue
 		}
+		c := query[i]
 
 		// Handle line comments
 		if c == '/' && i+1 < n && query[i+1] == '/' {
 			// Skip to end of line
-			for i < n && query[i] != '\n' {
+			for i < n && query[i] != '\n' && query[i] != '\r' {
 				i++
 			}
 			continue
@@ -5212,13 +5184,25 @@ func stripDeclareStatements(query string, recorders ...*kqlSourceRecorder) strin
 // strict, it also removes what is not KQL: leading # comments and URL lines,
 // and /| lines (a mistyped // commenting out a pipe stage).
 func stripLeadingComments(query string, strict bool, recorders ...*kqlSourceRecorder) string {
-	lines := strings.Split(query, "\n")
+	lines := make([]string, 0, strings.Count(query, "\n")+1)
 	var result []string
-	var kept []kqlByteSpan
-	lineStart := 0
-	for _, line := range lines {
-		kept = append(kept, kqlByteSpan{Start: lineStart, End: lineStart + len(line)})
-		lineStart += len(line) + 1
+	kept := make([]kqlByteSpan, 0, cap(lines))
+	changed := false
+	for lineStart := 0; lineStart <= len(query); {
+		lineEnd := lineStart
+		for lineEnd < len(query) && query[lineEnd] != '\r' && query[lineEnd] != '\n' {
+			lineEnd++
+		}
+		lines = append(lines, query[lineStart:lineEnd])
+		kept = append(kept, kqlByteSpan{Start: lineStart, End: lineEnd})
+		if lineEnd == len(query) {
+			break
+		}
+		if query[lineEnd] == '\r' && lineEnd+1 < len(query) && query[lineEnd+1] == '\n' {
+			lineStart = lineEnd + 2
+		} else {
+			lineStart = lineEnd + 1
+		}
 	}
 	var retained []kqlByteSpan
 	foundCode := false
@@ -5228,6 +5212,7 @@ func stripLeadingComments(query string, strict bool, recorders ...*kqlSourceReco
 		// Skip empty lines, comment lines (// and #), and URL lines at the start
 		if !foundCode {
 			if trimmed == "" || strings.HasPrefix(trimmed, "//") {
+				changed = true
 				continue
 			}
 			if strict {
@@ -5237,11 +5222,13 @@ func stripLeadingComments(query string, strict bool, recorders ...*kqlSourceReco
 				continue
 			}
 			if strings.HasPrefix(trimmed, "#") {
+				changed = true
 				continue
 			}
 			// Skip lines that are URLs (http:// or https://)
 			lowerTrimmed := strings.ToLower(trimmed)
 			if strings.HasPrefix(lowerTrimmed, "http://") || strings.HasPrefix(lowerTrimmed, "https://") {
+				changed = true
 				continue
 			}
 			foundCode = true
@@ -5252,11 +5239,15 @@ func stripLeadingComments(query string, strict bool, recorders ...*kqlSourceReco
 		trimmedLine := strings.TrimSpace(line)
 		if !strict && strings.HasPrefix(trimmedLine, "/|") {
 			// This is a commented-out pipe statement, skip it
+			changed = true
 			continue
 		}
 
 		result = append(result, line)
 		retained = append(retained, kept[index])
+	}
+	if !changed {
+		return query
 	}
 	text := strings.Join(result, "\n")
 	if len(recorders) > 0 && recorders[0] != nil && recorders[0].Source.Text == query && text != query {

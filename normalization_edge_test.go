@@ -547,3 +547,42 @@ func TestKQLNormalizeSummarizeByAfterLineComment(t *testing.T) {
 		})
 	}
 }
+
+func TestKQLLeadingCommentWithCRLineEndingPreservesQuery(t *testing.T) {
+	for _, tc := range []struct{ name, lineEnding string }{
+		{"LF", "\n"},
+		{"CRLF", "\r\n"},
+		{"CR", "\r"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			query := "// leading comment" + tc.lineEnding + `SecurityEvent | where Account == "alice"`
+			result := ExtractConditions(query)
+			if len(result.Errors) != 0 || len(result.Conditions) != 1 {
+				t.Fatalf("conditions=%+v errors=%q; want Account == alice", result.Conditions, result.Errors)
+			}
+			condition := result.Conditions[0]
+			if condition.Field != "Account" || condition.Operator != "==" || condition.Value != "alice" {
+				t.Fatalf("condition = %+v, want Account == alice", condition)
+			}
+		})
+	}
+}
+
+func TestKQLLetStatementSkipsSemicolonsInsideMultilineStrings(t *testing.T) {
+	for _, tc := range []struct{ name, literal string }{
+		{"triple-quoted", `"""left; right"""`},
+		{"triple-backtick", "```left; right```"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			query := "let payload = " + tc.literal + ";\nSecurityEvent | where Account == \"alice\""
+			result := ExtractConditions(query)
+			if len(result.Errors) != 0 || len(result.Conditions) != 1 {
+				t.Fatalf("conditions=%+v errors=%q; want Account == alice", result.Conditions, result.Errors)
+			}
+			condition := result.Conditions[0]
+			if condition.Field != "Account" || condition.Operator != "==" || condition.Value != "alice" {
+				t.Fatalf("condition = %+v, want Account == alice", condition)
+			}
+		})
+	}
+}
