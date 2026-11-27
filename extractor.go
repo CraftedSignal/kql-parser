@@ -1949,7 +1949,7 @@ func stripReturnTypeAnnotations(query string, recorders ...*kqlSourceRecorder) s
 				parenStart = i
 				break
 			}
-			if query[i] != ' ' && query[i] != '\t' && query[i] != '\n' &&
+			if query[i] != ' ' && query[i] != '\t' && query[i] != '\n' && query[i] != '\r' &&
 				((query[i] < 'a' || query[i] > 'z') &&
 					(query[i] < 'A' || query[i] > 'Z') &&
 					query[i] != '_') {
@@ -1985,7 +1985,7 @@ func stripReturnTypeAnnotations(query string, recorders ...*kqlSourceRecorder) s
 
 		// Now look for " : (" after the closing paren
 		colonStart := parenEnd
-		for colonStart < len(query) && (query[colonStart] == ' ' || query[colonStart] == '\t' || query[colonStart] == '\n') {
+		for colonStart < len(query) && (query[colonStart] == ' ' || query[colonStart] == '\t' || query[colonStart] == '\n' || query[colonStart] == '\r') {
 			colonStart++
 		}
 
@@ -1997,7 +1997,7 @@ func stripReturnTypeAnnotations(query string, recorders ...*kqlSourceRecorder) s
 
 		// Find the opening paren after the colon
 		typeStart := colonStart + 1
-		for typeStart < len(query) && (query[typeStart] == ' ' || query[typeStart] == '\t' || query[typeStart] == '\n') {
+		for typeStart < len(query) && (query[typeStart] == ' ' || query[typeStart] == '\t' || query[typeStart] == '\n' || query[typeStart] == '\r') {
 			typeStart++
 		}
 

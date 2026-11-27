@@ -77,6 +77,30 @@ func TestKQLStripReturnTypeAnnotationsEdges(t *testing.T) {
 	}
 }
 
+func TestKQLStripReturnTypeAnnotationsAcrossLineEndings(t *testing.T) {
+	for _, tc := range []struct{ name, lineEnding string }{
+		{"LF", "\n"},
+		{"CRLF", "\r\n"},
+		{"CR", "\r"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			query := "T | evaluate" + tc.lineEnding + "bag_unpack(Properties)" + tc.lineEnding + ":" + tc.lineEnding + "(*, Account:string)" + tc.lineEnding + `| where Account == "x"`
+			want := "T | evaluate" + tc.lineEnding + "bag_unpack(Properties)" + tc.lineEnding + `| where Account == "x"`
+			if got := stripReturnTypeAnnotations(query); got != want {
+				t.Errorf("stripReturnTypeAnnotations() = %q, want %q", got, want)
+			}
+			result := ExtractConditions(query)
+			if len(result.Errors) != 0 || len(result.Conditions) != 1 {
+				t.Fatalf("conditions=%+v errors=%q; want Account == x", result.Conditions, result.Errors)
+			}
+			condition := result.Conditions[0]
+			if condition.Field != "Account" || condition.Operator != "==" || condition.Value != "x" {
+				t.Fatalf("condition = %+v, want Account == x", condition)
+			}
+		})
+	}
+}
+
 func TestKQLLookupUnionASIMAndDeclareNormalizationEdges(t *testing.T) {
 	lookupInput := `T | where x in (lookup (union A, B)) | project x`
 	lookupWant := `T | where x in (lookup (LookupTable)) | project x`
