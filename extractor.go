@@ -909,7 +909,7 @@ func mainQuerySpan(query string) kqlByteSpan {
 		// Check for newlines (two or more blank lines indicate possible new query)
 		nlCount := 0
 		for j < n && (query[j] == '\n' || query[j] == '\r') {
-			if query[j] == '\n' {
+			if query[j] == '\n' || (query[j] == '\r' && (j+1 >= n || query[j+1] != '\n')) {
 				nlCount++
 			}
 			j++
@@ -927,7 +927,7 @@ func mainQuerySpan(query string) kqlByteSpan {
 				// Check for comment
 				if checkPos+1 < n && query[checkPos] == '/' && query[checkPos+1] == '/' {
 					// Skip comment line
-					for checkPos < n && query[checkPos] != '\n' {
+					for checkPos < n && query[checkPos] != '\n' && query[checkPos] != '\r' {
 						checkPos++
 					}
 					continue
@@ -972,19 +972,19 @@ func mainQuerySpan(query string) kqlByteSpan {
 
 // skipLineTrackingDepth advances from i to the end of the line, or past a
 // string literal that spans lines, and updates depth for the brackets outside
-// strings and comments. It returns the index of the newline or len(query).
+// strings and comments. It returns the index of the line ending or len(query).
 func skipLineTrackingDepth(query string, i int, depth *int) int {
-	for i < len(query) && query[i] != '\n' {
+	for i < len(query) && query[i] != '\n' && query[i] != '\r' {
 		switch c := query[i]; {
 		case c == '/' && i+1 < len(query) && query[i+1] == '/':
-			for i < len(query) && query[i] != '\n' {
+			for i < len(query) && query[i] != '\n' && query[i] != '\r' {
 				i++
 			}
 			return i
 		case isStringLiteralStart(query, i):
 			end := stringLiteralEnd(query, i)
 			if end < 0 {
-				for i < len(query) && query[i] != '\n' {
+				for i < len(query) && query[i] != '\n' && query[i] != '\r' {
 					i++
 				}
 				return i

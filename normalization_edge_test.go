@@ -620,3 +620,23 @@ func TestKQLBracketAccessAfterCROnlyLineComment(t *testing.T) {
 		t.Errorf("conditions=%+v errors=%q; want one extracted condition", result.Conditions, result.Errors)
 	}
 }
+
+func TestKQLSelectsFirstQueryAcrossBlankLines(t *testing.T) {
+	for _, tc := range []struct{ name, lineEnding string }{
+		{"LF", "\n"},
+		{"CRLF", "\r\n"},
+		{"CR", "\r"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			query := `SecurityEvent | where Account == "alice" // first query comment` + tc.lineEnding + tc.lineEnding + "// second query comment" + tc.lineEnding + `OtherTable | where EventID == 1`
+			result := ExtractConditions(query)
+			if len(result.Errors) != 0 || len(result.Conditions) != 1 {
+				t.Fatalf("conditions=%+v errors=%q; want only Account == alice", result.Conditions, result.Errors)
+			}
+			condition := result.Conditions[0]
+			if condition.Field != "Account" || condition.Operator != "==" || condition.Value != "alice" {
+				t.Fatalf("condition = %+v, want Account == alice", condition)
+			}
+		})
+	}
+}
