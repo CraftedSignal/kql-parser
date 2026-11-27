@@ -633,6 +633,26 @@ func TestKQLNormalizationContinuesAfterCROnlyLineComment(t *testing.T) {
 	}
 }
 
+func TestKQLLetConstantAfterLineCommentAcrossLineEndings(t *testing.T) {
+	for _, tc := range []struct{ name, lineEnding string }{
+		{"LF", "\n"},
+		{"CRLF", "\r\n"},
+		{"CR", "\r"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			query := "let app = \"alice\";\nSecurityEvent // comment" + tc.lineEnding + "| where Account == app"
+			result := ExtractConditions(query)
+			if len(result.Errors) != 0 || len(result.Conditions) != 1 {
+				t.Fatalf("conditions=%+v errors=%q; want Account == alice", result.Conditions, result.Errors)
+			}
+			condition := result.Conditions[0]
+			if condition.Field != "Account" || condition.Operator != "==" || condition.Value != "alice" {
+				t.Fatalf("condition = %+v, want Account == alice", condition)
+			}
+		})
+	}
+}
+
 func TestKQLBracketAccessAfterCROnlyLineComment(t *testing.T) {
 	query := "SecurityEvent // comment\r| where object['Account'] == \"alice\""
 	want := "SecurityEvent // comment\r| where object.Account == \"alice\""

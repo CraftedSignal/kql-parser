@@ -139,7 +139,7 @@ func inlineLetConstantOperands(query string, constants map[string]letConstant, b
 		ch := query[i]
 		switch {
 		case ch == '/' && i+1 < len(query) && query[i+1] == '/':
-			for i < len(query) && query[i] != '\n' {
+			for i < len(query) && query[i] != '\r' && query[i] != '\n' {
 				i++
 			}
 		case isStringLiteralStart(query, i):
