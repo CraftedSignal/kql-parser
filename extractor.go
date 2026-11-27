@@ -1459,7 +1459,7 @@ func convertTupleUnpacking(query string, recorders ...*kqlSourceRecorder) string
 			end := i + 1
 			parenDepth := 1
 			for end < len(query) && parenDepth > 0 {
-				switch query[end] {
+				switch code[end] {
 				case '(':
 					parenDepth++
 				case ')':
@@ -1470,7 +1470,7 @@ func convertTupleUnpacking(query string, recorders ...*kqlSourceRecorder) string
 
 			if parenDepth == 0 && end < len(query) {
 				// Check if what's inside looks like identifiers with commas
-				inside := query[i+1 : end-1]
+				inside := strings.ReplaceAll(code[i+1:end-1], "\x00", " ")
 				if looksLikeTupleUnpacking(inside) {
 					// Find the = sign after the closing paren
 					eqIdx := end
