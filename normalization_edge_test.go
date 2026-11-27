@@ -586,3 +586,37 @@ func TestKQLLetStatementSkipsSemicolonsInsideMultilineStrings(t *testing.T) {
 		})
 	}
 }
+
+func TestKQLNormalizationContinuesAfterCROnlyLineComment(t *testing.T) {
+	query := "SecurityEvent // comment\r| where 3plogTime\u00a0== \"alice\""
+	wantNumeric := strings.Replace(query, "3plogTime", "_3plogTime", 1)
+	if got := fixNumericIdentifiers(query); got != wantNumeric {
+		t.Errorf("fixNumericIdentifiers() = %q, want %q", got, wantNumeric)
+	}
+	wantWhitespace := strings.Replace(query, "\u00a0", " ", 1)
+	if got := normalizeUnicodeWhitespace(query); got != wantWhitespace {
+		t.Errorf("normalizeUnicodeWhitespace() = %q, want %q", got, wantWhitespace)
+	}
+
+	result := ExtractConditions(query)
+	if len(result.Errors) != 0 || len(result.Conditions) != 1 {
+		t.Errorf("conditions=%+v errors=%q; want 3plogTime == alice", result.Conditions, result.Errors)
+		return
+	}
+	condition := result.Conditions[0]
+	if condition.Field != "3plogTime" || condition.Operator != "==" || condition.Value != "alice" {
+		t.Fatalf("condition = %+v, want 3plogTime == alice", condition)
+	}
+}
+
+func TestKQLBracketAccessAfterCROnlyLineComment(t *testing.T) {
+	query := "SecurityEvent // comment\r| where object['Account'] == \"alice\""
+	want := "SecurityEvent // comment\r| where object.Account == \"alice\""
+	if got := convertBracketAccess(query); got != want {
+		t.Errorf("convertBracketAccess() = %q, want %q", got, want)
+	}
+	result := ExtractConditions(query)
+	if len(result.Errors) != 0 || len(result.Conditions) != 1 {
+		t.Errorf("conditions=%+v errors=%q; want one extracted condition", result.Conditions, result.Errors)
+	}
+}

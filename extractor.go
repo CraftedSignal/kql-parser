@@ -1076,7 +1076,7 @@ func convertBracketAccess(query string, recorders ...*kqlSourceRecorder) string 
 		// Skip line comments (// ...) - important to avoid false string detection in comments
 		if !inString && c == '/' && i+1 < len(query) && query[i+1] == '/' {
 			// Write the comment as-is until end of line
-			for i < len(query) && query[i] != '\n' {
+			for i < len(query) && query[i] != '\n' && query[i] != '\r' {
 				result.WriteByte(query[i])
 				i++
 			}
@@ -1303,7 +1303,7 @@ func fixNumericIdentifiers(query string, recorders ...*kqlSourceRecorder) string
 
 		// Skip line comments
 		if !inString && c == '/' && i+1 < len(query) && query[i+1] == '/' {
-			for i < len(query) && query[i] != '\n' {
+			for i < len(query) && query[i] != '\n' && query[i] != '\r' {
 				result.WriteByte(query[i])
 				i++
 			}
@@ -1721,7 +1721,7 @@ func normalizeUnicodeWhitespace(query string, recorders ...*kqlSourceRecorder) s
 		c := query[i]
 
 		if !inString && c == '/' && i+1 < len(query) && query[i+1] == '/' {
-			for i < len(query) && query[i] != '\n' {
+			for i < len(query) && query[i] != '\n' && query[i] != '\r' {
 				result.WriteByte(query[i])
 				i++
 			}
