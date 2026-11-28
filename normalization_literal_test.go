@@ -109,6 +109,20 @@ func TestNormalizeQueryForDebugPreservesTimespanLookingLiteralAndCommentText(t *
 	}
 }
 
+func TestNormalizeQueryForDebugPreservesTrailingDecimalsInMultilineLiterals(t *testing.T) {
+	query := "T | where Message == ```build 1000.\n2000.``` // 3000.\n| where Amount > 1000."
+	got := NormalizeQueryForDebug(query)
+	if !strings.Contains(got, "```build 1000.\n2000.```") {
+		t.Fatalf("trailing-decimal normalization changed multiline literal: %q", got)
+	}
+	if !strings.Contains(got, "// 3000.") {
+		t.Fatalf("trailing-decimal normalization changed comment text: %q", got)
+	}
+	if !strings.Contains(got, "Amount > 1000.0") {
+		t.Fatalf("actual trailing decimal was not normalized: %q", got)
+	}
+}
+
 func TestFixNumericIdentifiersPreservesEscapedSingleQuotedLiteral(t *testing.T) {
 	query := `SecurityEvent | where QueryText == 'can\'t 3plogTime'`
 	if got := fixNumericIdentifiers(query); got != query {

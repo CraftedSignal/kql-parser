@@ -2868,12 +2868,17 @@ func normalizeTimespanLiterals(query string) string {
 func normalizeTrailingDecimals(query string) string {
 	var result strings.Builder
 	result.Grow(len(query))
+	protected := protectedKQLBytes(query, nil)
 	inString := false
 	stringChar := byte(0)
 	isVerbatim := false
 
 	for i := 0; i < len(query); i++ {
 		c := query[i]
+		if protected[i] {
+			result.WriteByte(c)
+			continue
+		}
 
 		// Track strings to avoid modifying decimals inside string literals
 		if !inString && (c == '"' || c == '\'') {
