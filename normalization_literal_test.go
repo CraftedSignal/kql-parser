@@ -91,6 +91,38 @@ func TestNormalizeQueryForDebugPreservesDatetimeLiteralAndCommentText(t *testing
 	}
 }
 
+func TestNormalizeQueryForDebugPreservesTimespanLookingLiteralAndCommentText(t *testing.T) {
+	query := `T | where Message == "5days" and Duration10days == 2 // 10minutes
+| where TimeGenerated > ago(1day)`
+	got := NormalizeQueryForDebug(query)
+	if !strings.Contains(got, `Message == "5days"`) {
+		t.Fatalf("timespan-looking string literal changed: %q", got)
+	}
+	if !strings.Contains(got, "Duration10days == 2") {
+		t.Fatalf("identifier ending in a timespan-looking suffix changed: %q", got)
+	}
+	if !strings.Contains(got, "// 10minutes") {
+		t.Fatalf("timespan-looking comment changed: %q", got)
+	}
+	if !strings.Contains(got, "ago(1d)") {
+		t.Fatalf("actual timespan syntax was not normalized: %q", got)
+	}
+}
+
+func TestNormalizeQueryForDebugPreservesTrailingDecimalsInMultilineLiterals(t *testing.T) {
+	query := "T | where Message == ```build 1000.\n2000.``` // 3000.\n| where Amount > 1000."
+	got := NormalizeQueryForDebug(query)
+	if !strings.Contains(got, "```build 1000.\n2000.```") {
+		t.Fatalf("trailing-decimal normalization changed multiline literal: %q", got)
+	}
+	if !strings.Contains(got, "// 3000.") {
+		t.Fatalf("trailing-decimal normalization changed comment text: %q", got)
+	}
+	if !strings.Contains(got, "Amount > 1000.0") {
+		t.Fatalf("actual trailing decimal was not normalized: %q", got)
+	}
+}
+
 func TestFixNumericIdentifiersPreservesEscapedSingleQuotedLiteral(t *testing.T) {
 	query := `SecurityEvent | where QueryText == 'can\'t 3plogTime'`
 	if got := fixNumericIdentifiers(query); got != query {
