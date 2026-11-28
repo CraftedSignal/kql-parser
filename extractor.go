@@ -2297,101 +2297,58 @@ func stripParseStatements(query string, recorders ...*kqlSourceRecorder) string 
 		parseStart := idx + 2 + parseKeywordLen
 		pipeOrEnd := parseStart
 
-		// Track string literals and parentheses
-		inString := false
-		stringChar := byte(0)
-		isVerbatim := false
+		// Count starting paren depth from query beginning to idx, ignoring
+		// protected literals and comments.
 		parenDepth := 0
-
-		// Count starting paren depth from query beginning to idx (ignoring strings)
-		inStrInit := false
-		strCharInit := byte(0)
-		isVerbatimInit := false
 		for i := 0; i < idx; i++ {
-			c := query[i]
-			if !inStrInit {
-				switch c {
-				case '"', '\'':
-					inStrInit = true
-					strCharInit = c
-					isVerbatimInit = i > 0 && query[i-1] == '@'
-				case '(':
-					parenDepth++
-				case ')':
-					parenDepth--
-				}
-			} else {
-				if c == strCharInit {
-					if isVerbatimInit {
-						// Verbatim strings: any closing quote ends the string
-						inStrInit = false
-					} else if strCharInit == '"' {
-						// Regular double-quoted: check backslash escaping
-						if i == 0 || query[i-1] != '\\' {
-							inStrInit = false
-						}
-					} else {
-						// Single-quoted: no escaping
-						inStrInit = false
-					}
-				}
+			if lowerQuery[i] == 0 {
+				continue
+			}
+			switch lowerQuery[i] {
+			case '(':
+				parenDepth++
+			case ')':
+				parenDepth--
 			}
 		}
 		startingDepth := parenDepth
 
 		for pipeOrEnd < len(query) {
-			c := query[pipeOrEnd]
-			if !inString {
-				if c == '"' || c == '\'' {
-					inString = true
-					stringChar = c
-					isVerbatim = pipeOrEnd > 0 && query[pipeOrEnd-1] == '@'
-				} else if c == '|' {
-					// Found next pipe at same paren level
-					break
-				} else if c == ';' {
-					// Semicolon ends statements (like let statements that contain parse)
-					if parenDepth <= startingDepth {
-						break
-					}
-				} else if c == ')' {
-					// Closing paren - stop here if we'd go below starting depth
-					if parenDepth <= startingDepth {
-						break
-					}
+			c := lowerQuery[pipeOrEnd]
+			if c == 0 {
+				pipeOrEnd++
+				continue
+			}
+			endStage := false
+			switch c {
+			case '|':
+				// The syntax view masks string and comment contents.
+				endStage = true
+			case ';':
+				// Semicolon ends statements (like let statements that contain parse)
+				endStage = parenDepth <= startingDepth
+			case ')':
+				// Closing paren - stop here if we'd go below starting depth
+				if parenDepth <= startingDepth {
+					endStage = true
+				} else {
 					parenDepth--
-				} else if c == '(' {
-					parenDepth++
-				} else if c == '\n' {
-					// Check if next non-whitespace is a new operator
-					nextNonSpace := pipeOrEnd + 1
-					for nextNonSpace < len(query) && (query[nextNonSpace] == ' ' || query[nextNonSpace] == '\t') {
-						nextNonSpace++
-					}
-					if nextNonSpace < len(query) && query[nextNonSpace] == '|' {
-						pipeOrEnd = nextNonSpace
-						break
-					}
 				}
-			} else {
-				if c == stringChar {
-					if isVerbatim {
-						// Verbatim strings (@"..."): any closing quote ends the string
-						inString = false
-					} else if stringChar == '"' {
-						// Regular double-quoted strings: check backslash escaping
-						backslashes := 0
-						for j := pipeOrEnd - 1; j >= 0 && query[j] == '\\'; j-- {
-							backslashes++
-						}
-						if backslashes%2 == 0 {
-							inString = false
-						}
-					} else {
-						// Single quote - no escaping, so this ends the string
-						inString = false
-					}
+			case '(':
+				parenDepth++
+			case '\n':
+				// Check if next non-whitespace is a new operator
+				nextNonSpace := pipeOrEnd + 1
+				for nextNonSpace < len(query) && (query[nextNonSpace] == ' ' || query[nextNonSpace] == '\t') {
+					nextNonSpace++
 				}
+				if nextNonSpace < len(query) && lowerQuery[nextNonSpace] == '|' {
+					pipeOrEnd = nextNonSpace
+					endStage = true
+				}
+			}
+			if endStage {
+				break
 			}
 			pipeOrEnd++
 		}

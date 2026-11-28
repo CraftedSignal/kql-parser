@@ -101,6 +101,23 @@ func TestKQLStripReturnTypeAnnotationsAcrossLineEndings(t *testing.T) {
 	}
 }
 
+func TestKQLStripParseStatementsIgnoresParenthesesInComments(t *testing.T) {
+	for _, query := range []string{
+		"T | parse raw with prefix ':' parsed // )\n| where user == \"alice\"",
+		`T | parse raw with prefix ':' parsed /* ) | */ | where user == "alice"`,
+	} {
+		result := ExtractConditions(query)
+		if len(result.Errors) != 0 || len(result.Conditions) != 1 {
+			t.Errorf("parse-stage comment corrupted following filter for %q: conditions=%+v errors=%q", query, result.Conditions, result.Errors)
+			continue
+		}
+		condition := result.Conditions[0]
+		if condition.Field != "user" || condition.Operator != "==" || condition.Value != "alice" {
+			t.Errorf("following filter for %q = %+v, want user == alice", query, condition)
+		}
+	}
+}
+
 func TestKQLLookupUnionASIMAndDeclareNormalizationEdges(t *testing.T) {
 	lookupInput := `T | where x in (lookup (union A, B)) | project x`
 	lookupWant := `T | where x in (lookup (LookupTable)) | project x`
