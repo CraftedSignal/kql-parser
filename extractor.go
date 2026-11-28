@@ -2813,12 +2813,9 @@ func stripRenderParameters(query string, recorders ...*kqlSourceRecorder) string
 	return query
 }
 
-// normalizeTimespanLiterals adds spaces between numbers and timespan suffixes where needed
-// Converts: 0min -> 0min, 30min -> 30min (actually keeps them but in valid form)
-// The issue is patterns like "0min" that get tokenized as number "0" + identifier "min"
-// We convert them to the format the lexer recognizes: 0m, 30m, etc.
+// normalizeTimespanLiterals shortens long-form timespan units outside literals
+// and comments so the lexer recognizes them.
 func normalizeTimespanLiterals(query string) string {
-	// Map of full suffix to short suffix that the lexer recognizes
 	suffixMap := map[string]string{
 		"min":     "m",
 		"minute":  "m",
@@ -2832,46 +2829,38 @@ func normalizeTimespanLiterals(query string) string {
 		"days":    "d",
 	}
 
-	result := query
-	for longSuffix, shortSuffix := range suffixMap {
-		// Find number followed immediately by suffix — build output incrementally
-		var b strings.Builder
-		b.Grow(len(result))
-		lastCopied := 0
-		changed := false
-		for i := 0; i < len(result); i++ {
-			// Check if we're at a digit
-			if result[i] >= '0' && result[i] <= '9' {
-				// Find end of number
-				numEnd := i + 1
-				for numEnd < len(result) && result[numEnd] >= '0' && result[numEnd] <= '9' {
-					numEnd++
-				}
-				// Check if followed by this suffix
-				if numEnd+len(longSuffix) <= len(result) {
-					potentialSuffix := result[numEnd : numEnd+len(longSuffix)]
-					if strings.EqualFold(potentialSuffix, longSuffix) {
-						// Make sure it's not part of a longer word
-						afterSuffix := numEnd + len(longSuffix)
-						if afterSuffix >= len(result) || !isIdentChar(result[afterSuffix]) {
-							// Replace with short suffix
-							b.WriteString(result[lastCopied:numEnd])
-							b.WriteString(shortSuffix)
-							lastCopied = afterSuffix
-							i = afterSuffix - 1 // -1 because the for loop increments
-							changed = true
-							continue
-						}
-					}
-				}
-			}
+	protected := protectedKQLBytes(query, nil)
+	var b strings.Builder
+	b.Grow(len(query))
+	lastCopied := 0
+	for i := 0; i < len(query); i++ {
+		if protected[i] || query[i] < '0' || query[i] > '9' || i > 0 && isIdentChar(query[i-1]) {
+			continue
 		}
-		if changed {
-			b.WriteString(result[lastCopied:])
-			result = b.String()
+		numEnd := i + 1
+		for numEnd < len(query) && query[numEnd] >= '0' && query[numEnd] <= '9' {
+			numEnd++
+		}
+		for longSuffix, shortSuffix := range suffixMap {
+			if numEnd+len(longSuffix) > len(query) || !strings.EqualFold(query[numEnd:numEnd+len(longSuffix)], longSuffix) {
+				continue
+			}
+			afterSuffix := numEnd + len(longSuffix)
+			if afterSuffix < len(query) && isIdentChar(query[afterSuffix]) {
+				continue
+			}
+			b.WriteString(query[lastCopied:numEnd])
+			b.WriteString(shortSuffix)
+			lastCopied = afterSuffix
+			i = afterSuffix - 1
+			break
 		}
 	}
-	return result
+	if lastCopied == 0 {
+		return query
+	}
+	b.WriteString(query[lastCopied:])
+	return b.String()
 }
 
 // normalizeTrailingDecimals adds a zero after trailing decimal points
